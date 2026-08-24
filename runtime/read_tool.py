@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -29,13 +30,14 @@ class SkillReader:
         result: list[dict[str, str]] = []
         for path in sorted(self.root.glob("*/SKILL.md")):
             logical = path.relative_to(self.root).as_posix()
-            lines = path.read_text(encoding="utf-8").splitlines()
+            candidate = self._resolve_file(logical)
+            lines = candidate.read_text(encoding="utf-8").splitlines()
             title = next((line.lstrip("# ").strip() for line in lines if line.startswith("#")), path.parent.name)
             description = next((line.strip() for line in lines if line.strip() and not line.startswith("#")), "")
             result.append({"name": title, "description": description, "path": logical})
         return result
 
-    def read(self, logical_path: str, offset: int = 0, limit: int | None = None) -> ReadResult:
+    def _resolve_file(self, logical_path: str) -> Path:
         if not logical_path or "\x00" in logical_path:
             raise ReadToolError("path is empty or contains NUL")
         posix = PurePosixPath(logical_path)
@@ -43,9 +45,18 @@ class SkillReader:
             raise ReadToolError("only relative paths inside skills_root are allowed")
         if posix.suffix.lower() not in {".md", ".txt"}:
             raise ReadToolError("only .md and .txt files are readable")
-        candidate = (self.root / Path(*posix.parts)).resolve()
-        if not candidate.is_relative_to(self.root) or not candidate.is_file():
+        try:
+            candidate = (self.root / Path(*posix.parts)).resolve(strict=True)
+            is_regular = stat.S_ISREG(candidate.stat().st_mode)
+        except (OSError, RuntimeError):
+            raise ReadToolError("file is outside skills_root or does not exist") from None
+        if not candidate.is_relative_to(self.root) or not is_regular:
             raise ReadToolError("file is outside skills_root or does not exist")
+        return candidate
+
+    def read(self, logical_path: str, offset: int = 0, limit: int | None = None) -> ReadResult:
+        candidate = self._resolve_file(logical_path)
+        posix = PurePosixPath(logical_path)
         allowed = min(limit or self.per_call, self.per_call, self.per_job - self.consumed)
         if offset < 0 or allowed <= 0:
             raise ReadToolError("invalid offset or read budget exhausted")

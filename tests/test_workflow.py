@@ -1,9 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 
 import pytest
 
-from agent_core.models import TaskCard
-from agent_core.workflow import Workflow, capabilities
+from agent_core.models import TaskCard, digest
+from agent_core.workflow import Workflow, capabilities, stable_hash
 from configs.runtime import ManagedRuntime
 from storage.project_store import ConflictError, ProjectStore
 
@@ -24,6 +26,7 @@ def test_phase_one_happy_path(workflow: Workflow) -> None:
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
     assert card["checkpoint_id"] == manifest["checkpoint_id"]
+    assert card["provenance"]["skills_hash"] == stable_hash(card["provenance"]["skill_index"])
 
     manifest = workflow.answer_clarification(
         manifest["checkpoint_id"],
@@ -36,6 +39,7 @@ def test_phase_one_happy_path(workflow: Workflow) -> None:
     narrative = manifest["documents"]["narrative_structure"][-1]
     assert narrative["provenance"]["template_id"] == "narrative_structure"
     assert narrative["provenance"]["traces"][0]["type"] == "model_call"
+    assert narrative["provenance"]["output_hash"] == digest(narrative["markdown_body"])
     manifest = workflow.approve_document("narrative_structure", manifest["checkpoint_id"], narrative["revision_hash"])
     assert manifest["state"] == "slide_outline"
 
@@ -68,6 +72,7 @@ def test_editing_approved_narrative_invalidates_outline(workflow: Workflow) -> N
     assert manifest["state"] == "narrative_structure"
     assert manifest["documents"]["slide_outline"][-1]["status"] == "stale"
     assert manifest["documents"]["narrative_structure"][-1]["revision"] == 2
+    assert manifest["documents"]["narrative_structure"][-1]["provenance"]["output_hash"] == digest("# 新叙事")
 
 
 def test_old_question_card_is_rejected(workflow: Workflow) -> None:
@@ -86,3 +91,78 @@ def test_branch_pointer_tracks_latest_checkpoint(workflow: Workflow) -> None:
     branched = workflow.store.fork(manifest["checkpoint_id"], "alternate")
     assert branched["branch"] == "alternate"
     assert branched["branches"]["alternate"] == branched["checkpoint_id"]
+
+
+def test_concurrent_edits_from_same_checkpoint_use_atomic_cas(workflow: Workflow, monkeypatch) -> None:
+    manifest = workflow.store.read()
+    manifest = workflow.start_clarification(manifest["checkpoint_id"])
+    card = manifest["question_card"]
+    manifest = workflow.answer_clarification(
+        manifest["checkpoint_id"],
+        card["question_card_id"],
+        {question["question_id"]: "answer" for question in card["questions"]},
+    )
+    manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
+    shared_checkpoint = manifest["checkpoint_id"]
+
+    original_require = workflow._require
+    both_validated = Barrier(2)
+
+    def synchronized_require(value, capability, checkpoint_id=None):
+        original_require(value, capability, checkpoint_id)
+        if capability == "edit_narrative":
+            both_validated.wait(timeout=5)
+
+    monkeypatch.setattr(workflow, "_require", synchronized_require)
+
+    def save(markdown: str):
+        try:
+            return workflow.edit_document("narrative_structure", shared_checkpoint, markdown)
+        except ConflictError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(save, ["# 并发版本 A", "# 并发版本 B"]))
+
+    assert sum(isinstance(result, ConflictError) for result in results) == 1
+    assert str(next(result for result in results if isinstance(result, ConflictError))) == "stale_revision"
+    history = workflow.store.read()["documents"]["narrative_structure"]
+    assert [revision["revision"] for revision in history] == [1, 2]
+    assert history[1]["parent_revision_hash"] == history[0]["revision_hash"]
+
+
+def test_generation_provenance_hashes_skill_index_reads_and_output(workflow: Workflow, monkeypatch) -> None:
+    manifest = workflow.store.read()
+    manifest = workflow.start_clarification(manifest["checkpoint_id"])
+    card = manifest["question_card"]
+    manifest = workflow.answer_clarification(
+        manifest["checkpoint_id"],
+        card["question_card_id"],
+        {question["question_id"]: "answer" for question in card["questions"]},
+    )
+    traces = [
+        {"type": "model_call", "provider": "test", "model": "test-model", "usage": {}},
+        {
+            "type": "tool_call",
+            "tool": "read",
+            "path": "narrative-structure/SKILL.md",
+            "content_hash": "sha256:skill-content",
+            "offset": 0,
+            "end": 128,
+        },
+    ]
+    monkeypatch.setattr(workflow.gateway, "generate", lambda *args, **kwargs: ("# 可复现叙事", traces))
+
+    manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
+    document = manifest["documents"]["narrative_structure"][-1]
+    provenance = document["provenance"]
+
+    assert provenance["skills_hash"] == stable_hash(provenance["skill_index"])
+    assert provenance["skill_reads"] == [{
+        "path": "narrative-structure/SKILL.md",
+        "content_hash": "sha256:skill-content",
+        "offset": 0,
+        "end": 128,
+    }]
+    assert provenance["skill_reads_hash"] == stable_hash(provenance["skill_reads"])
+    assert provenance["output_hash"] == digest("# 可复现叙事")

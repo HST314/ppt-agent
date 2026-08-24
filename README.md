@@ -8,12 +8,17 @@ PPT Agent 是一个带持久化确认门的演示文稿策划工作台。一期�
 
 ## 本地启动
 
+支持 Python 3.10+。editable 安装要求 `pip>=23.1`；先升级 pip，避免旧版 pip 无法识别构建后端的 editable hook。
+
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install --upgrade "pip>=23.1"
+python -m pip install -e ".[dev]"
 python main.py
 ```
+
+如果创建出的虚拟环境没有 pip，请先安装当前 Python 对应的 `venv`/`ensurepip` 系统包，再重新创建 `.venv`；不要继续使用系统自带的旧 pip 做 editable 安装。
 
 打开 `http://127.0.0.1:8000`。仓库自带 `mock` 模型配置，可完整体验工作流且不会发起外部模型请求。
 
@@ -37,7 +42,7 @@ python main.py
 ## 测试
 
 ```bash
-pytest
+python -m pytest
 ```
 
 设计与 API 说明见 [docs/architecture.md](docs/architecture.md)。

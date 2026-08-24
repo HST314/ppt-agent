@@ -80,9 +80,18 @@ class ProjectStore:
             self._commit(manifest, "project_created", {"checkpoint_id": checkpoint})
             return manifest
 
-    def update(self, transform: Callable[[dict[str, Any]], dict[str, Any]], event: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    def update(
+        self,
+        transform: Callable[[dict[str, Any]], dict[str, Any]],
+        event: str,
+        details: dict[str, Any] | None = None,
+        *,
+        expected_checkpoint_id: str,
+    ) -> dict[str, Any]:
         with self.lock:
             manifest = self.read()
+            if manifest["checkpoint_id"] != expected_checkpoint_id:
+                raise ConflictError("stale_revision")
             candidate = deepcopy(manifest)
             candidate["checkpoint_id"] = "checkpoint_" + uuid4().hex[:24]
             updated = transform(candidate)

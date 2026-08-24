@@ -20,6 +20,34 @@ class WorkflowError(RuntimeError):
     pass
 
 
+def stable_hash(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def generation_provenance(skill_index: list[dict[str, str]], traces: list[dict[str, Any]], output: str) -> dict[str, Any]:
+    skill_reads = sorted(
+        (
+            {
+                "path": trace["path"],
+                "content_hash": trace["content_hash"],
+                "offset": trace["offset"],
+                "end": trace["end"],
+            }
+            for trace in traces
+            if trace.get("type") == "tool_call" and trace.get("tool") == "read"
+        ),
+        key=lambda item: (item["path"], item["content_hash"], item["offset"], item["end"]),
+    )
+    return {
+        "skill_index": skill_index,
+        "skills_hash": stable_hash(skill_index),
+        "skill_reads": skill_reads,
+        "skill_reads_hash": stable_hash(skill_reads),
+        "output_hash": "sha256:" + hashlib.sha256(output.encode()).hexdigest(),
+    }
+
+
 def capabilities(manifest: dict[str, Any]) -> list[str]:
     state, phase = manifest["state"], manifest["phase"]
     caps = ["inspect", "branch"]
@@ -67,6 +95,7 @@ class Workflow:
         manifest = self.store.read()
         self._require(manifest, "start_clarification", checkpoint_id)
         reader = SkillReader(self.runtime.skills_root, per_call=1000, per_job=1000)
+        skill_index = reader.index()
         template, template_hash = self._template("clarify_questions.md")
         prompt = (
             template + "\n\nGenerate concise clarification questions for this presentation task. Return JSON with a questions array. "
@@ -74,7 +103,7 @@ class Workflow:
             f"Ask no more than {self.runtime.policy.max_auto_questions}. Task:\n"
             + json.dumps(manifest["task_card"], ensure_ascii=False)
             + "\nAvailable skill index:\n"
-            + json.dumps(reader.index(), ensure_ascii=False)
+            + json.dumps(skill_index, ensure_ascii=False)
         )
         text, traces = self.gateway.generate("intake_clarify", prompt, json_mode=True)
         payload = self.gateway.parse_json(text)
@@ -85,13 +114,31 @@ class Workflow:
         card_id = "questions_" + uuid4().hex[:16]
 
         def apply(value: dict[str, Any]) -> dict[str, Any]:
-            card = QuestionCard(question_card_id=card_id, checkpoint_id=value["checkpoint_id"], questions=questions)
+            card = QuestionCard(
+                question_card_id=card_id,
+                checkpoint_id=value["checkpoint_id"],
+                questions=questions,
+                provenance={
+                    **generation_provenance(skill_index, traces, text),
+                    "model_config_hash": self.runtime.model_hash,
+                    "runtime_config_hash": self.runtime.runtime_hash,
+                    "template_id": "clarify_questions",
+                    "template_version": 1,
+                    "template_hash": template_hash,
+                    "traces": traces,
+                },
+            )
             value.update(state="intake_clarify", phase="waiting_clarification", question_card=card.model_dump())
             value["last_tool_traces"] = traces
             value["last_template"] = {"template_id": "clarify_questions", "template_version": 1, "template_hash": template_hash}
             return value
 
-        return self.store.update(apply, "clarification_generated", {"question_card_id": card_id})
+        return self.store.update(
+            apply,
+            "clarification_generated",
+            {"question_card_id": card_id},
+            expected_checkpoint_id=checkpoint_id,
+        )
 
     def answer_clarification(self, checkpoint_id: str, question_card_id: str, answers: dict[str, str]) -> dict[str, Any]:
         manifest = self.store.read()
@@ -112,7 +159,12 @@ class Workflow:
             value.update(state="narrative_structure", phase="ready_to_generate")
             return value
 
-        return self.store.update(apply, "clarification_answered", {"question_card_id": question_card_id})
+        return self.store.update(
+            apply,
+            "clarification_answered",
+            {"question_card_id": question_card_id},
+            expected_checkpoint_id=checkpoint_id,
+        )
 
     def generate_document(self, document_type: DocumentType, checkpoint_id: str, *, regenerate: bool = False) -> dict[str, Any]:
         manifest = self.store.read()
@@ -149,6 +201,7 @@ class Workflow:
             parent=parent,
             created_by="agent",
             provenance={
+                **generation_provenance(skill_index, traces, markdown),
                 "task_revision_hash": task_hash,
                 "upstream_revision_hash": upstream["revision_hash"] if upstream else None,
                 "model_config_hash": self.runtime.model_hash,
@@ -165,11 +218,17 @@ class Workflow:
             value.update(state=document_type, phase="waiting_human_approval")
             return value
 
-        return self.store.update(apply, "document_generated", {"document_type": document_type, "revision_hash": document.revision_hash})
+        return self.store.update(
+            apply,
+            "document_generated",
+            {"document_type": document_type, "revision_hash": document.revision_hash},
+            expected_checkpoint_id=checkpoint_id,
+        )
 
     def edit_document(self, document_type: DocumentType, checkpoint_id: str, markdown: str) -> dict[str, Any]:
         if not markdown.strip():
             raise ValueError("markdown must not be empty")
+        markdown = markdown.strip()
         manifest = self.store.read()
         cap = "edit_narrative" if document_type == "narrative_structure" else "edit_outline"
         self._require(manifest, cap, checkpoint_id)
@@ -182,7 +241,10 @@ class Workflow:
             revision=current["revision"] + 1,
             parent=current["revision_hash"],
             created_by="human",
-            provenance=current.get("provenance", {}),
+            provenance={
+                **current.get("provenance", {}),
+                "output_hash": "sha256:" + hashlib.sha256(markdown.encode()).hexdigest(),
+            },
         )
 
         def apply(value: dict[str, Any]) -> dict[str, Any]:
@@ -193,7 +255,12 @@ class Workflow:
             value.update(state=document_type, phase="waiting_human_approval")
             return value
 
-        return self.store.update(apply, "document_revised", {"document_type": document_type, "revision_hash": document.revision_hash})
+        return self.store.update(
+            apply,
+            "document_revised",
+            {"document_type": document_type, "revision_hash": document.revision_hash},
+            expected_checkpoint_id=checkpoint_id,
+        )
 
     def approve_document(self, document_type: DocumentType, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
         manifest = self.store.read()
@@ -211,7 +278,12 @@ class Workflow:
                 value.update(state="slide_outline", phase="completed")
             return value
 
-        return self.store.update(apply, "document_approved", {"document_type": document_type, "revision_hash": revision_hash})
+        return self.store.update(
+            apply,
+            "document_approved",
+            {"document_type": document_type, "revision_hash": revision_hash},
+            expected_checkpoint_id=checkpoint_id,
+        )
 
     @staticmethod
     def _current(manifest: dict[str, Any], document_type: DocumentType) -> dict[str, Any] | None:

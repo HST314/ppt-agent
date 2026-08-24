@@ -34,3 +34,15 @@ def test_read_rejects_symlink_escape(tmp_path: Path) -> None:
 
     with pytest.raises(ReadToolError):
         SkillReader(root, per_call=100, per_job=100).read("linked.md")
+
+
+def test_index_rejects_symlinked_skill_directory_escape(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("# Leaked\n\nsecret instructions", encoding="utf-8")
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ReadToolError):
+        SkillReader(root, per_call=100, per_job=100).index()
