@@ -1,0 +1,29 @@
+async function request(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  });
+  const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = payload?.error?.message || payload?.detail || `请求失败 (${response.status})`;
+    const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+export const api = {
+  health: () => request("/api/health"),
+  runtime: () => request("/api/runtime-context"),
+  projects: () => request("/api/projects"),
+  project: (id) => request(`/api/projects/${encodeURIComponent(id)}`),
+  create: (payload) => request("/api/projects", { method: "POST", body: JSON.stringify(payload) }),
+  startJob: (id, payload) => request(`/api/projects/${encodeURIComponent(id)}/jobs`, { method: "POST", body: JSON.stringify(payload) }),
+  job: (id) => request(`/api/jobs/${encodeURIComponent(id)}`),
+  answer: (id, payload) => request(`/api/projects/${encodeURIComponent(id)}/clarification`, { method: "POST", body: JSON.stringify(payload) }),
+  revise: (id, type, payload) => request(`/api/projects/${encodeURIComponent(id)}/documents/${type}/revisions`, { method: "POST", body: JSON.stringify(payload) }),
+  approve: (id, type, payload) => request(`/api/projects/${encodeURIComponent(id)}/documents/${type}/approve`, { method: "POST", body: JSON.stringify(payload) }),
+  timeline: (id) => request(`/api/projects/${encodeURIComponent(id)}/timeline`),
+  branches: (id) => request(`/api/projects/${encodeURIComponent(id)}/branches`),
+};

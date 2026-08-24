@@ -1,0 +1,15 @@
+format_version: 1
+states:
+  - intake
+  - intake_clarify
+  - narrative_structure
+  - slide_outline
+terminal_states:
+  - slide_outline
+  - blocked
+  - cancelled
+transitions:
+  intake: [intake_clarify]
+  intake_clarify: [narrative_structure]
+  narrative_structure: [slide_outline]
+  slide_outline: []

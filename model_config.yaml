@@ -1,0 +1,26 @@
+model_config_id: ppt-agent-local
+state_bindings:
+  - state: intake_clarify
+    model_role: reasoning_llm
+    provider: mock
+    model: deterministic-preview
+    parameters: {}
+    fallback_model: null
+    base_url: null
+    api_key_env: OPENAI_API_KEY
+  - state: narrative_structure
+    model_role: reasoning_llm
+    provider: mock
+    model: deterministic-preview
+    parameters: {}
+    fallback_model: null
+    base_url: null
+    api_key_env: OPENAI_API_KEY
+  - state: slide_outline
+    model_role: reasoning_llm
+    provider: mock
+    model: deterministic-preview
+    parameters: {}
+    fallback_model: null
+    base_url: null
+    api_key_env: OPENAI_API_KEY

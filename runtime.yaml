@@ -1,0 +1,13 @@
+max_auto_questions: 3
+stream_model_output: false
+clarification_total_budget: 10
+question_preference: proactive
+model_timeout_seconds: 180.0
+max_tool_rounds: 8
+max_read_chars_per_call: 20000
+max_read_chars_per_job: 80000
+skills_root: skills
+offline_mode: false
+source_config_revision: null
+config_hash: null
+generated_at: null
