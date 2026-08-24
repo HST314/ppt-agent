@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent_core.jobs import JobRegistry
 from agent_core.models import TaskCard
 from agent_core.workflow import Workflow, capabilities
-from configs.runtime import ManagedRuntime
+from configs.runtime import ManagedRuntime, RuntimeConfigUpdate
 from storage.project_store import ConflictError, ProjectStore, list_projects
 
 
@@ -25,6 +26,7 @@ MAX_REQUEST_BYTES = 512 * 1024
 
 app = FastAPI(title="PPT Agent Studio", version="0.1.0")
 runtime = ManagedRuntime(APP_ROOT)
+runtime_config_lock = threading.RLock()
 jobs = JobRegistry(PROJECTS_ROOT / ".jobs")
 
 
@@ -59,8 +61,12 @@ class ApproveRequest(StrictRequest):
 
 
 class BranchRequest(StrictRequest):
-    checkpoint_id: str
-    name: str = Field(min_length=2, max_length=64)
+    checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
+    name: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
+
+
+class BranchSwitchRequest(StrictRequest):
+    checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
 
 
 @app.middleware("http")
@@ -112,8 +118,27 @@ def health() -> dict[str, Any]:
 def runtime_context() -> dict[str, Any]:
     from runtime.read_tool import SkillReader
 
-    reader = SkillReader(runtime.skills_root, per_call=1000, per_job=1000)
-    return {**runtime.public_context(), "skills": reader.index()}
+    with runtime_config_lock:
+        current = runtime
+        reader = SkillReader(current.skills_root, per_call=1000, per_job=1000)
+        return {**current.public_context(), "skills": reader.index()}
+
+
+@app.put("/api/runtime-context")
+def update_runtime_context(request: RuntimeConfigUpdate) -> dict[str, Any]:
+    """Persist validated model/runtime settings without accepting credential values."""
+
+    global runtime
+    with runtime_config_lock:
+        try:
+            runtime = runtime.apply_update(request)
+        except OSError as exc:
+            raise HTTPException(status_code=409, detail=f"运行配置不可写：{exc}") from exc
+        current = runtime
+        from runtime.read_tool import SkillReader
+
+        reader = SkillReader(current.skills_root, per_call=1000, per_job=1000)
+        return {**current.public_context(), "skills": reader.index()}
 
 
 @app.get("/api/projects")
@@ -126,7 +151,9 @@ def create_project(request: CreateProjectRequest) -> dict[str, Any]:
     if not PROJECT_ID.fullmatch(request.project_id):
         raise HTTPException(status_code=422, detail="工程 ID 仅允许字母、数字、下划线和连字符")
     store = ProjectStore(PROJECTS_ROOT, request.project_id)
-    manifest = store.create(request.task_card.model_dump(), runtime.snapshot())
+    with runtime_config_lock:
+        runtime_snapshot = runtime.snapshot()
+    manifest = store.create(request.task_card.model_dump(), runtime_snapshot)
     return {**manifest, "capabilities": capabilities(manifest), "active_job": None}
 
 
@@ -138,7 +165,9 @@ def get_project(project_id: str) -> dict[str, Any]:
 @app.post("/api/projects/{project_id}/jobs", status_code=202)
 def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
     store = store_for(project_id)
-    workflow = Workflow(store, runtime)
+    with runtime_config_lock:
+        current_runtime = runtime
+    workflow = Workflow(store, current_runtime)
     actions = {
         "start_clarification": lambda: workflow.start_clarification(request.checkpoint_id),
         "generate_narrative": lambda: workflow.generate_document("narrative_structure", request.checkpoint_id),
@@ -178,21 +207,27 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 @app.post("/api/projects/{project_id}/clarification")
 def answer_clarification(project_id: str, request: ClarificationRequest) -> dict[str, Any]:
     store = store_for(project_id)
-    Workflow(store, runtime).answer_clarification(request.checkpoint_id, request.question_card_id, request.answers)
+    with runtime_config_lock:
+        current_runtime = runtime
+    Workflow(store, current_runtime).answer_clarification(request.checkpoint_id, request.question_card_id, request.answers)
     return project_view(store)
 
 
 @app.post("/api/projects/{project_id}/documents/{document_type}/revisions")
 def revise_document(project_id: str, document_type: Literal["narrative_structure", "slide_outline"], request: RevisionRequest) -> dict[str, Any]:
     store = store_for(project_id)
-    Workflow(store, runtime).edit_document(document_type, request.checkpoint_id, request.markdown_body)
+    with runtime_config_lock:
+        current_runtime = runtime
+    Workflow(store, current_runtime).edit_document(document_type, request.checkpoint_id, request.markdown_body)
     return project_view(store)
 
 
 @app.post("/api/projects/{project_id}/documents/{document_type}/approve")
 def approve_document(project_id: str, document_type: Literal["narrative_structure", "slide_outline"], request: ApproveRequest) -> dict[str, Any]:
     store = store_for(project_id)
-    Workflow(store, runtime).approve_document(document_type, request.checkpoint_id, request.revision_hash)
+    with runtime_config_lock:
+        current_runtime = runtime
+    Workflow(store, current_runtime).approve_document(document_type, request.checkpoint_id, request.revision_hash)
     return project_view(store)
 
 
@@ -204,14 +239,36 @@ def timeline(project_id: str) -> list[dict[str, Any]]:
 @app.get("/api/projects/{project_id}/branches")
 def branches(project_id: str) -> dict[str, Any]:
     store = store_for(project_id)
-    manifest = store.read()
-    return {"current": manifest["branch"], "branches": manifest.get("branches", {}), "checkpoints": store.checkpoints()}
+    return store.branches_view()
 
 
 @app.post("/api/projects/{project_id}/branches")
 def create_branch(project_id: str, request: BranchRequest) -> dict[str, Any]:
     store = store_for(project_id)
-    store.fork(request.checkpoint_id, request.name)
+    # The registry lock closes the race with job submission: either the job is
+    # visible and branching is rejected, or the branch commits before submit.
+    with jobs.lock:
+        active = jobs.latest_for_project(project_id)
+        if active and active["status"] in {"queued", "running"}:
+            raise ConflictError("active_job")
+        try:
+            store.fork(request.checkpoint_id, request.name)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="检查点不存在") from exc
+    return project_view(store)
+
+
+@app.post("/api/projects/{project_id}/branches/switch")
+def switch_branch(project_id: str, request: BranchSwitchRequest) -> dict[str, Any]:
+    store = store_for(project_id)
+    with jobs.lock:
+        active = jobs.latest_for_project(project_id)
+        if active and active["status"] in {"queued", "running"}:
+            raise ConflictError("active_job")
+        try:
+            store.switch_branch(request.checkpoint_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="检查点不存在") from exc
     return project_view(store)
 
 

@@ -93,6 +93,28 @@ def test_branch_pointer_tracks_latest_checkpoint(workflow: Workflow) -> None:
     assert branched["branches"]["alternate"] == branched["checkpoint_id"]
 
 
+def test_branch_switch_restores_branch_head_without_rewriting_history(workflow: Workflow) -> None:
+    manifest = workflow.store.read()
+    main = workflow.start_clarification(manifest["checkpoint_id"])
+    main_head = main["checkpoint_id"]
+    alternate = workflow.store.fork(main_head, "alternate")
+    alternate_head = alternate["checkpoint_id"]
+
+    switched = workflow.store.switch_branch(main_head)
+    assert switched["branch"] == "main"
+    assert switched["checkpoint_id"] == main_head
+    assert switched["branches"] == {"main": main_head, "alternate": alternate_head}
+
+    view = workflow.store.branches_view()
+    assert view["current"] == "main"
+    assert {item["name"] for item in view["items"]} == {"main", "alternate"}
+    assert next(item for item in view["items"] if item["name"] == "alternate")["head_checkpoint_id"] == alternate_head
+
+    switched_back = workflow.store.switch_branch(alternate_head)
+    assert switched_back["branch"] == "alternate"
+    assert switched_back["checkpoint_id"] == alternate_head
+
+
 def test_concurrent_edits_from_same_checkpoint_use_atomic_cas(workflow: Workflow, monkeypatch) -> None:
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])

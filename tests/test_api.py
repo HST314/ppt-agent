@@ -1,10 +1,12 @@
 import time
 from pathlib import Path
+from shutil import copy2
 
 from fastapi.testclient import TestClient
 
 import main_front
 from agent_core.jobs import JobRegistry
+from configs.runtime import ManagedRuntime
 
 
 def test_api_drives_project_to_narrative(tmp_path: Path, monkeypatch) -> None:
@@ -60,3 +62,44 @@ def test_api_rejects_unknown_request_fields(tmp_path: Path, monkeypatch) -> None
     })
 
     assert response.status_code == 422
+
+
+def test_api_updates_runtime_and_switches_branches(tmp_path: Path, monkeypatch) -> None:
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    root = Path(__file__).parents[1]
+    copy2(root / "runtime.yaml", app_root / "runtime.yaml")
+    copy2(root / "model_config.yaml", app_root / "model_config.yaml")
+    (app_root / "skills").mkdir()
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", ManagedRuntime(app_root))
+    client = TestClient(main_front.app)
+
+    context = client.get("/api/runtime-context").json()
+    context["model_bindings"][2]["model"] = "outline-preview-v2"
+    update = client.put("/api/runtime-context", json={
+        "model_config_id": "api-editable",
+        "model_bindings": context["model_bindings"],
+        "policy": context["policy"],
+    })
+    assert update.status_code == 200
+    assert update.json()["model_bindings"][2]["model"] == "outline-preview-v2"
+    assert "api_key_env" not in update.json()["model_bindings"][2]
+
+    project = client.post("/api/projects", json={
+        "project_id": "branch-demo",
+        "task_card": {"title": "分支演示", "objective": "验证切换"},
+    }).json()
+    main_head = project["checkpoint_id"]
+    created = client.post("/api/projects/branch-demo/branches", json={
+        "checkpoint_id": main_head,
+        "name": "alternate",
+    })
+    assert created.status_code == 200
+    alternate_head = created.json()["checkpoint_id"]
+    switched = client.post("/api/projects/branch-demo/branches/switch", json={"checkpoint_id": main_head})
+    assert switched.status_code == 200
+    assert switched.json()["branch"] == "main"
+    assert switched.json()["branches"]["alternate"] == alternate_head

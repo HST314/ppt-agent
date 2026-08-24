@@ -4,11 +4,13 @@
 
 - `main_front.py`：HTTP 输入校验与静态前端，不承担业务判断。
 - `agent_core/workflow.py`：阶段 capability、澄清、文档生成、修订、确认和失效规则。
-- `storage/project_store.py`：原子 Manifest、Checkpoint、事件和分支。
+- `storage/project_store.py`：原子 Manifest、Checkpoint、事件、分支创建和分支头切换。
 - `model_router/client.py`：阶段模型绑定、工具循环与输出边界。
 - `runtime/read_tool.py`：限定在 `skills_root` 内的只读 UTF-8 文件访问。
 
 前端只渲染服务端返回的 `capabilities` 和状态，不自行推断可执行动作。写请求携带当前 `checkpoint_id`；过期页面返回 `409`。
+
+工作区采用“顶部创作进度卡 + 下方当前阶段主渲染区”。分支切换只允许移动到已登记的分支头，不改写历史；后台 Job 运行时禁止创建或切换分支。设置更新不接受密钥值，服务在同一配置锁内校验并原子更新 `runtime.yaml` 与 `model_config.yaml`，后续模型调用使用热重载后的配置。
 
 ## 文档规则
 

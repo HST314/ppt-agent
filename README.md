@@ -4,7 +4,7 @@ PPT Agent 是一个带持久化确认门的演示文稿策划工作台。一期�
 
 `任务卡 → 澄清问题 → 叙事结构 → 逐页大纲`
 
-叙事结构和逐页大纲以版本化 Markdown 保存，支持安全预览、全屏编辑、浏览器草稿恢复、修订确认和上游失效传播。Agent 仅能通过标准 `read` 工具读取 `skills/` 内的 Markdown / 文本文件。
+叙事结构和逐页大纲以版本化 Markdown 保存，支持安全预览、全屏编辑、浏览器草稿恢复、修订确认和上游失效传播。工作台同时支持从任意历史检查点创建分支、切换分支头，以及按阶段配置模型。Agent 仅能通过标准 `read` 工具读取 `skills/` 内的 Markdown / 文本文件。
 
 ## 本地启动
 
@@ -24,7 +24,9 @@ python main.py
 
 ## 接入真实模型
 
-复制 `model_config.yaml`，把各阶段的 `provider` 改为非 `mock` 值，并设置 OpenAI 兼容模型的 `model`、`base_url` 和 `api_key_env`。通过只读环境变量注入配置：
+可以直接在工作台“设置”页修改三个一期阶段的 `provider`、`model`、`base_url`、备用模型、调用参数，以及 `runtime.yaml` 中的澄清/工具/读取预算。保存时服务会先完整校验，再原子写回配置文件并热重载。
+
+模型密钥不在页面中录入或返回，仍由 `model_config.yaml` 的 `api_key_env` 指定环境变量。也可以通过环境变量指定独立配置文件：
 
 ```bash
 export PPT_AGENT_MODEL_CONFIG=/absolute/path/model_config.yaml
@@ -33,7 +35,7 @@ export YOUR_API_KEY_ENV=...
 python main.py
 ```
 
-应用只在服务启动时读取配置；设置页仅展示已生效的非敏感字段。
+设置页不会读取、保存或展示密钥值。若配置文件位于受保护目录，需确保启动服务的账号对该文件有写权限。
 
 ## 数据与恢复
 

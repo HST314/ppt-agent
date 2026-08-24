@@ -10,6 +10,13 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
 
     assert all(f'data-view="{view}"' in html for view in ("workspace", "status", "settings"))
     assert all(name in app for name in ("任务卡", "澄清问题", "叙事结构", "逐页大纲", "PPT 样品", "PPT 全稿", "确认验收"))
+    assert 'id="topnav-branch"' in html
+    assert 'id="sidebar-toggle"' in html
+    assert "创作进度" in app
+    assert 'id="settings-form"' in app
+    assert all(action in app for action in ("openBranchDialog", "createBranch", "switchBranch", "updateRuntime"))
+    assert 'audience: document.querySelector("#audience").value.trim(),' in app
+    assert 'audience: document.querySelector("#audience").value.trim() || null' not in app
 
 
 def test_markdown_renderer_escapes_raw_html() -> None:

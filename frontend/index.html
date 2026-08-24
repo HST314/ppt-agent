@@ -3,34 +3,45 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#6d28d9">
   <title>PPT Agent 创作工作台</title>
   <link rel="stylesheet" href="/static/css/main.css">
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要内容</a>
-  <div class="app">
+  <div class="app" id="app">
     <header class="topnav">
       <div class="topnav__brand">
         <span class="brand__mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM9 8h6M9 12h6M9 16h4"/></svg></span>
         <strong>PPT Agent</strong>
       </div>
       <nav class="topnav__tabs" aria-label="主导航">
-        <button class="topnav__tab is-active" type="button" data-view="workspace" aria-current="page">工作区</button>
+        <button class="topnav__tab" type="button" data-view="workspace" aria-current="page">工作区</button>
         <button class="topnav__tab" type="button" data-view="status">状态</button>
         <button class="topnav__tab" type="button" data-view="settings">设置</button>
       </nav>
       <div class="topnav__context">
-        <span class="project-context" id="project-context" hidden><strong id="project-name"></strong><span class="badge badge--info" id="branch-badge">分支 main</span></span>
-        <button class="btn btn--secondary" id="refresh-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.5 9A7 7 0 0 0 6 6.5L4 11m16 2-2 4.5A7 7 0 0 1 5.5 15"/></svg><span>刷新</span></button>
-        <button class="btn btn--primary" id="new-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>新建工程</span></button>
+        <span class="topnav__project" id="topnav-project" hidden>
+          <strong id="topnav-project-name"></strong>
+          <button class="badge badge--info topnav__branch" id="topnav-branch" type="button" title="查看并切换分支">分支 main</button>
+        </span>
+        <button class="btn btn--secondary" id="refresh-button" type="button" aria-label="刷新">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.5 9A7 7 0 0 0 6 6.5L4 11m16 2-2 4.5A7 7 0 0 1 5.5 15"/></svg><span>刷新</span>
+        </button>
+        <button class="btn btn--primary" id="new-button" type="button" aria-label="新建工程">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>新建工程</span>
+        </button>
       </div>
     </header>
     <div class="app-body">
-      <aside class="sidebar" aria-label="工程导航">
-        <div class="sidebar__head"><p class="sidebar__title">最近工程</p><span class="system-state"><span class="dot" id="health-dot"></span><span id="health-text">连接中</span></span></div>
-        <nav class="project-list" id="project-list" aria-label="工程列表"></nav>
+      <aside class="sidebar" id="sidebar" aria-label="工程导航">
+        <button class="sidebar__toggle" id="sidebar-toggle" type="button" aria-expanded="false" aria-label="展开或收起工程目录">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+        </button>
+        <p class="sidebar__title">最近工程</p>
+        <nav class="project-list" id="project-list" aria-label="工程列表"><div class="sidebar__empty">正在读取工程…</div></nav>
+        <div class="sidebar__footer"><div class="system-state"><span class="dot" id="health-dot"></span><span id="health-text">正在连接服务</span></div></div>
       </aside>
       <main class="main" id="main" tabindex="-1"><div class="content" id="content" aria-live="polite"></div></main>
     </div>
@@ -39,29 +50,37 @@
 
   <dialog class="dialog" id="project-dialog" aria-labelledby="dialog-title">
     <form id="project-form">
-      <div class="dialog__head"><div><p class="eyebrow">新任务</p><h2 id="dialog-title">创建 PPT 工程</h2></div><button class="icon-btn" type="button" data-close aria-label="关闭"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+      <div class="dialog__head">
+        <div><p class="eyebrow">新任务</p><h2 id="dialog-title">创建 PPT 工程</h2></div>
+        <button class="icon-btn" type="button" data-close aria-label="关闭对话框"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </div>
       <div class="dialog__body">
-        <div class="field"><label for="project-id">工程 ID <span aria-hidden="true">*</span></label><input class="input" id="project-id" required minlength="2" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,63}" placeholder="quarterly-review"><small>仅使用字母、数字、下划线或连字符。</small></div>
+        <p class="hint"><strong>描述演示需求：</strong>系统会保存任务卡，先澄清关键问题，再生成可编辑的叙事结构与逐页大纲。</p>
+        <div class="field"><label for="project-id">工程 ID <span aria-hidden="true">*</span></label><input class="input" id="project-id" required minlength="2" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,63}" placeholder="quarterly-review" aria-describedby="project-help"><small id="project-help">仅使用字母、数字、下划线或连字符。</small></div>
         <div class="field"><label for="task-title">演示标题 <span aria-hidden="true">*</span></label><input class="input" id="task-title" required maxlength="160" placeholder="季度业务复盘"></div>
         <div class="field"><label for="objective">演示目标 <span aria-hidden="true">*</span></label><textarea class="input" id="objective" required maxlength="4000" placeholder="希望听众理解什么，并做出什么决定？"></textarea></div>
-        <div class="form-grid">
+        <div class="create-form-grid">
           <div class="field"><label for="audience">主要听众</label><input class="input" id="audience" placeholder="例如：管理层"></div>
           <div class="field"><label for="occasion">演示场合</label><input class="input" id="occasion" placeholder="例如：季度经营会"></div>
           <div class="field"><label for="slide-count">目标页数</label><input class="input" id="slide-count" placeholder="例如：10–12"></div>
           <div class="field"><label for="duration">演示时长（分钟）</label><input class="input" id="duration" type="number" min="1" max="600" placeholder="20"></div>
         </div>
         <div class="field"><label for="constraints">已知事实与约束</label><textarea class="input" id="constraints" placeholder="每行一项，可留空"></textarea></div>
-        <div class="form-error" id="form-error" role="alert"></div>
+        <div class="field-error" id="form-error" role="alert"></div>
       </div>
       <div class="dialog__foot"><button class="btn btn--secondary" type="button" data-close>取消</button><button class="btn btn--primary" id="create-button" type="submit">创建工程</button></div>
     </form>
   </dialog>
 
   <dialog class="editor-dialog" id="editor-dialog" aria-labelledby="editor-title">
-    <div class="editor-dialog__head"><div><p class="eyebrow">文档编辑</p><h2 id="editor-title">编辑文档</h2></div><button class="icon-btn" type="button" id="editor-close" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <div class="editor-dialog__head">
+      <div><p class="eyebrow">文档编辑</p><h2 id="editor-title">编辑文档</h2></div>
+      <button class="icon-btn" type="button" id="editor-close" aria-label="关闭编辑器"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+    </div>
     <textarea class="editor" id="editor" aria-label="Markdown 文档"></textarea>
     <div class="editor-dialog__foot"><span class="draft-state" id="draft-state">草稿自动保存在此浏览器</span><button class="btn btn--secondary" type="button" id="editor-cancel">取消</button><button class="btn btn--primary" type="button" id="editor-save">保存新修订</button></div>
   </dialog>
+
   <script type="module" src="/static/js/app.js"></script>
 </body>
 </html>

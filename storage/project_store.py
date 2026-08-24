@@ -14,6 +14,7 @@ from agent_core.models import utc_now
 
 
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
+CHECKPOINT_ID = re.compile(r"^checkpoint_[a-f0-9]{24}$")
 
 
 class ConflictError(RuntimeError):
@@ -65,6 +66,7 @@ class ProjectStore:
                 "title": task["title"],
                 "branch": "main",
                 "branches": {"main": checkpoint},
+                "branch_meta": {"main": {"parent": None, "from_checkpoint": None, "created_at": utc_now()}},
                 "state": "intake",
                 "phase": "ready_for_clarification",
                 "task_card": task,
@@ -105,7 +107,10 @@ class ProjectStore:
         atomic_json(self.manifest_path, manifest)
         checkpoints = self.root / "checkpoints"
         atomic_json(checkpoints / f"{manifest['checkpoint_id']}.json", manifest)
-        line = json.dumps({"at": utc_now(), "event": event, "checkpoint_id": manifest["checkpoint_id"], **details}, ensure_ascii=False)
+        self._append_event(event, manifest["checkpoint_id"], details)
+
+    def _append_event(self, event: str, checkpoint_id: str, details: dict[str, Any]) -> None:
+        line = json.dumps({"at": utc_now(), "event": event, "checkpoint_id": checkpoint_id, **details}, ensure_ascii=False)
         with (self.root / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(line + "\n")
 
@@ -122,6 +127,7 @@ class ProjectStore:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 result.append({
                     "checkpoint_id": payload["checkpoint_id"],
+                    "branch": payload.get("branch", "main"),
                     "state": payload["state"],
                     "phase": payload["phase"],
                     "updated_at": payload["updated_at"],
@@ -133,21 +139,83 @@ class ProjectStore:
     def fork(self, checkpoint_id: str, name: str) -> dict[str, Any]:
         if not PROJECT_ID.fullmatch(name):
             raise ValueError("invalid branch name")
-        snapshot_path = self.root / "checkpoints" / f"{checkpoint_id}.json"
-        if not snapshot_path.is_file():
-            raise FileNotFoundError(checkpoint_id)
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        current = self.read()
-        branches = current.get("branches", {current.get("branch", "main"): current["checkpoint_id"]})
-        if name in branches:
-            raise ConflictError("branch already exists")
-        next_checkpoint = "checkpoint_" + uuid4().hex[:24]
-        snapshot["branches"] = {**branches, name: next_checkpoint}
-        snapshot["branch"] = name
-        snapshot["checkpoint_id"] = next_checkpoint
-        snapshot["updated_at"] = utc_now()
-        self._commit(snapshot, "branch_created", {"branch": name, "from_checkpoint": checkpoint_id})
-        return snapshot
+        if not CHECKPOINT_ID.fullmatch(checkpoint_id):
+            raise ValueError("invalid checkpoint id")
+        with self.lock:
+            snapshot_path = self.root / "checkpoints" / f"{checkpoint_id}.json"
+            if not snapshot_path.is_file():
+                raise FileNotFoundError(checkpoint_id)
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            current = self.read()
+            branches = current.get("branches", {current.get("branch", "main"): current["checkpoint_id"]})
+            if name in branches:
+                raise ConflictError("branch already exists")
+            next_checkpoint = "checkpoint_" + uuid4().hex[:24]
+            parent = snapshot.get("branch", current.get("branch", "main"))
+            branch_meta = deepcopy(current.get("branch_meta", {}))
+            branch_meta.setdefault("main", {"parent": None, "from_checkpoint": None, "created_at": current.get("created_at")})
+            branch_meta[name] = {"parent": parent, "from_checkpoint": checkpoint_id, "created_at": utc_now()}
+            snapshot["branches"] = {**branches, name: next_checkpoint}
+            snapshot["branch_meta"] = branch_meta
+            snapshot["branch"] = name
+            snapshot["checkpoint_id"] = next_checkpoint
+            snapshot["updated_at"] = utc_now()
+            self._commit(snapshot, "branch_created", {"branch": name, "parent": parent, "from_checkpoint": checkpoint_id})
+            return snapshot
+
+    def branches_view(self) -> dict[str, Any]:
+        with self.lock:
+            manifest = self.read()
+            checkpoints = self.checkpoints()
+            branches = manifest.get("branches", {manifest.get("branch", "main"): manifest["checkpoint_id"]})
+            metadata = manifest.get("branch_meta", {})
+            items = []
+            for name, head_checkpoint in branches.items():
+                branch_checkpoints = [item for item in checkpoints if item["branch"] == name]
+                meta = metadata.get(name, {})
+                items.append({
+                    "name": name,
+                    "current": name == manifest.get("branch", "main"),
+                    "head_checkpoint_id": head_checkpoint,
+                    "parent": meta.get("parent"),
+                    "from_checkpoint": meta.get("from_checkpoint"),
+                    "created_at": meta.get("created_at"),
+                    "checkpoints": branch_checkpoints,
+                })
+            items.sort(key=lambda item: (not item["current"], item["created_at"] or ""))
+            return {
+                "current": manifest.get("branch", "main"),
+                "current_checkpoint_id": manifest["checkpoint_id"],
+                "branches": branches,
+                "checkpoints": checkpoints,
+                "items": items,
+            }
+
+    def switch_branch(self, checkpoint_id: str) -> dict[str, Any]:
+        """Move the active manifest to a branch head without changing its history."""
+
+        if not CHECKPOINT_ID.fullmatch(checkpoint_id):
+            raise ValueError("invalid checkpoint id")
+        with self.lock:
+            current = self.read()
+            branches = current.get("branches", {current.get("branch", "main"): current["checkpoint_id"]})
+            matches = [name for name, head in branches.items() if head == checkpoint_id]
+            if len(matches) != 1:
+                raise ConflictError("branch_head_required")
+            target_branch = matches[0]
+            snapshot_path = self.root / "checkpoints" / f"{checkpoint_id}.json"
+            if not snapshot_path.is_file():
+                raise FileNotFoundError(checkpoint_id)
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            if snapshot.get("checkpoint_id") != checkpoint_id:
+                raise ConflictError("checkpoint_corrupt")
+            snapshot["branches"] = branches
+            snapshot["branch_meta"] = deepcopy(current.get("branch_meta", {}))
+            snapshot["branch"] = target_branch
+            snapshot["updated_at"] = utc_now()
+            atomic_json(self.manifest_path, snapshot)
+            self._append_event("branch_switched", checkpoint_id, {"branch": target_branch})
+            return snapshot
 
 
 def list_projects(root: Path) -> list[dict[str, Any]]:
