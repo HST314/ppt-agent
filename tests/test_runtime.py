@@ -26,8 +26,8 @@ def test_runtime_rejects_inverted_read_budget() -> None:
         RuntimePolicy(max_read_chars_per_call=200, max_read_chars_per_job=100)
 
 
-def test_model_binding_rejects_credentials_in_parameters() -> None:
-    with pytest.raises(ValueError, match="credential fields"):
+def test_model_binding_rejects_non_whitelisted_parameters() -> None:
+    with pytest.raises(ValueError, match="unsupported model parameter fields"):
         ModelBinding(
             state="intake_clarify",
             provider="openai",

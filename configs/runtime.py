@@ -12,22 +12,32 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SENSITIVE_PARAMETER_KEYS = {"api_key", "apikey", "authorization", "access_token", "secret", "password", "cookie"}
+class _ModelCallParameters(BaseModel):
+    """Browser-editable inference controls passed to chat completions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    seed: int | None = None
+    stop: str | list[str] | None = None
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
+    verbosity: Literal["low", "medium", "high"] | None = None
+
+
+ALLOWED_MODEL_PARAMETER_KEYS = frozenset(_ModelCallParameters.model_fields)
 
 
 def _safe_parameters(value: dict[str, Any]) -> dict[str, Any]:
-    def check(item: Any) -> None:
-        if isinstance(item, dict):
-            for key, nested in item.items():
-                if str(key).lower() in SENSITIVE_PARAMETER_KEYS:
-                    raise ValueError("model parameters cannot contain credential fields")
-                check(nested)
-        elif isinstance(item, list):
-            for nested in item:
-                check(nested)
-
-    check(value)
-    return value
+    unsupported = sorted(str(key) for key in value if key not in ALLOWED_MODEL_PARAMETER_KEYS)
+    if unsupported:
+        raise ValueError(f"unsupported model parameter fields: {', '.join(unsupported)}")
+    validated = _ModelCallParameters.model_validate(value)
+    return validated.model_dump(exclude_none=True, exclude_unset=True)
 
 
 def _http_url_or_none(value: str | None) -> str | None:

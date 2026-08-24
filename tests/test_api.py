@@ -2,6 +2,7 @@ import time
 from pathlib import Path
 from shutil import copy2
 
+import pytest
 from fastapi.testclient import TestClient
 
 import main_front
@@ -103,3 +104,42 @@ def test_api_updates_runtime_and_switches_branches(tmp_path: Path, monkeypatch) 
     assert switched.status_code == 200
     assert switched.json()["branch"] == "main"
     assert switched.json()["branches"]["alternate"] == alternate_head
+
+
+@pytest.mark.parametrize(
+    "unsafe_parameters",
+    [
+        {"api-key": "audit-secret"},
+        {"Authorization ": "Bearer audit-secret"},
+        {"headers": [{"name": "Authorization", "value": "Bearer audit-secret"}]},
+    ],
+    ids=["api-key", "authorization-trailing-space", "nested-headers"],
+)
+def test_api_rejects_non_whitelisted_model_parameters(
+    tmp_path: Path,
+    monkeypatch,
+    unsafe_parameters: dict,
+) -> None:
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    root = Path(__file__).parents[1]
+    copy2(root / "runtime.yaml", app_root / "runtime.yaml")
+    copy2(root / "model_config.yaml", app_root / "model_config.yaml")
+    (app_root / "skills").mkdir()
+    monkeypatch.setattr(main_front, "runtime", ManagedRuntime(app_root))
+    client = TestClient(main_front.app)
+
+    context = client.get("/api/runtime-context").json()
+    original_parameters = context["model_bindings"][0]["parameters"]
+    context["model_bindings"][0]["parameters"] = unsafe_parameters
+
+    update = client.put("/api/runtime-context", json={
+        "model_config_id": context["model_config_id"],
+        "model_bindings": context["model_bindings"],
+        "policy": context["policy"],
+    })
+
+    assert update.status_code == 422
+    persisted = client.get("/api/runtime-context").json()
+    assert persisted["model_bindings"][0]["parameters"] == original_parameters
+    assert "audit-secret" not in str(persisted)
