@@ -12,17 +12,32 @@ from pydantic import ValidationError
 
 from agent_core.models import (
     DocumentRevision,
+    FullDeck,
+    FullDeckContentRef,
+    FullDeckDerivedFrom,
+    FullDeckOutlineRef,
+    FullDeckPageSlot,
+    FullDeckPlan,
+    FullDeckRevision,
     HtmlPptPackage,
     Question,
     QuestionCard,
     SampleRevision,
     TaskCard,
 )
+from agent_core.full_deck_composer import (
+    FullDeckComposerError,
+    normalized_page_content_graph,
+)
 from configs.runtime import ManagedRuntime
 from model_router.client import ModelGateway, ModelOutputError, SYSTEM_MESSAGE
 from runtime.package_tool import DraftPackage, PackageToolError
 from runtime.read_tool import SkillReader
-from storage.project_store import ConflictError, ProjectStore
+from storage.project_store import (
+    ConflictError,
+    ProjectStore,
+    mark_full_deck_stale,
+)
 
 
 DocumentType = Literal["narrative_structure", "slide_outline"]
@@ -210,6 +225,119 @@ def stable_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def _package_model(package: dict[str, Any]) -> HtmlPptPackage:
+    """Discard storage-only file metadata at the immutable package boundary."""
+
+    return HtmlPptPackage.model_validate({
+        key: value
+        for key, value in package.items()
+        if key in {"entrypoint", "title", "slide_count", "slides", "package_hash"}
+    } | {
+        "files": [
+            {
+                key: value
+                for key, value in item.items()
+                if key in {"path", "content", "encoding", "media_type", "origin"}
+            }
+            for item in package.get("files", [])
+        ],
+    })
+
+
+def _initialize_full_deck(
+    outline: dict[str, Any],
+    sample: dict[str, Any],
+) -> tuple[FullDeck, FullDeckRevision]:
+    package = _package_model(sample["package"])
+    outline_catalog = sorted(
+        _outline_slide_catalog(outline["markdown_body"]),
+        key=lambda item: item["source_slide_number"],
+    )
+    sample_by_number: dict[int, Any] = {}
+    for slide in package.slides:
+        number = slide.source_slide_number
+        if number is None or number in sample_by_number:
+            raise WorkflowError("sample slides must map uniquely to approved outline pages")
+        sample_by_number[number] = slide
+    outline_numbers = {item["source_slide_number"] for item in outline_catalog}
+    if not set(sample_by_number).issubset(outline_numbers):
+        raise WorkflowError("sample slides must map to existing approved outline pages")
+
+    pages: list[FullDeckPageSlot] = []
+    for position, outline_page in enumerate(outline_catalog):
+        number = outline_page["source_slide_number"]
+        slide = sample_by_number.get(number)
+        slot_id = "slot_" + hashlib.sha256(
+            f"{outline['revision_hash']}\n{number}".encode("utf-8")
+        ).hexdigest()[:24]
+        if slide is None:
+            pages.append(FullDeckPageSlot(
+                slot_id=slot_id,
+                position=position,
+                outline_ref=FullDeckOutlineRef(
+                    outline_revision_hash=outline["revision_hash"],
+                    source_slide_number=number,
+                ),
+                title=outline_page["title"],
+                status="pending",
+                source_type="pending",
+            ))
+            continue
+        graph = normalized_page_content_graph(package, slide.slide_id)
+        pages.append(FullDeckPageSlot(
+            slot_id=slot_id,
+            position=position,
+            outline_ref=FullDeckOutlineRef(
+                outline_revision_hash=outline["revision_hash"],
+                source_slide_number=number,
+            ),
+            title=outline_page["title"],
+            status="ready",
+            source_type="approved_sample",
+            content_ref=FullDeckContentRef(
+                revision_hash=sample["revision_hash"],
+                package_hash=package.package_hash or package.content_hash(),
+                slide_id=slide.slide_id,
+                slide_content_hash=graph.content_hash,
+            ),
+            derived_from=FullDeckDerivedFrom(
+                sample_revision_hash=sample["revision_hash"],
+                sample_slide_id=slide.slide_id,
+            ),
+        ))
+
+    plan = FullDeckPlan(pages=pages)
+    full_deck_id = "deck_" + uuid4().hex[:24]
+    sample_provenance = sample.get("provenance", {})
+    provenance = {
+        "outline_revision_hash": outline["revision_hash"],
+        "approved_sample_revision_hash": sample["revision_hash"],
+        "model_config_hash": sample_provenance.get("model_config_hash"),
+        "runtime_config_hash": sample_provenance.get("runtime_config_hash"),
+        "skills_hash": sample_provenance.get("skills_hash"),
+        "changed_slot_ids": [page.slot_id for page in pages if page.status == "ready"],
+    }
+    revision = FullDeckRevision.create(
+        full_deck_id=full_deck_id,
+        revision=1,
+        parent=None,
+        feedback="由已确认样品初始化",
+        plan=plan,
+        provenance=provenance,
+    )
+    root = FullDeck(
+        full_deck_id=full_deck_id,
+        approved_sample_revision_hash=sample["revision_hash"],
+        outline_revision_hash=outline["revision_hash"],
+        current_revision_hash=revision.revision_hash,
+        revision_refs=[{
+            "revision_hash": revision.revision_hash,
+            "status": revision.status,
+        }],
+    )
+    return root, revision
+
+
 def generation_provenance(skill_index: list[dict[str, str]], traces: list[dict[str, Any]], output: str) -> dict[str, Any]:
     skill_reads = sorted(
         (
@@ -233,7 +361,65 @@ def generation_provenance(skill_index: list[dict[str, str]], traces: list[dict[s
     }
 
 
-def capabilities(manifest: dict[str, Any]) -> list[str]:
+def _current_sample(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    current_hash = manifest.get("current_sample_revision_hash")
+    return next(
+        (
+            item for item in manifest.get("samples", [])
+            if item.get("revision_hash") == current_hash
+        ),
+        (manifest.get("samples") or [None])[-1],
+    )
+
+
+def _current_full_deck_revision(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    root = manifest.get("full_deck") or {}
+    current_hash = root.get("current_revision_hash")
+    return next(
+        (
+            item for item in manifest.get("full_deck_revisions", [])
+            if item.get("revision_hash") == current_hash
+        ),
+        None,
+    )
+
+
+def _sample_can_enter_full_deck(
+    sample: dict[str, Any] | None,
+    outline: dict[str, Any] | None = None,
+) -> bool:
+    if not sample or sample.get("status") == "stale" or not sample.get("package"):
+        return False
+    numbers = [
+        slide.get("source_slide_number")
+        for slide in sample["package"].get("slides", [])
+    ]
+    if not (
+        numbers
+        and all(isinstance(number, int) for number in numbers)
+        and len(numbers) == len(set(numbers))
+    ):
+        return False
+    if outline is None:
+        return True
+    if outline.get("status") != "approved":
+        return False
+    try:
+        outline_numbers = {
+            item["source_slide_number"]
+            for item in _outline_slide_catalog(outline["markdown_body"])
+        }
+    except (KeyError, WorkflowError):
+        return False
+    return set(numbers).issubset(outline_numbers)
+
+
+def capabilities(
+    manifest: dict[str, Any],
+    *,
+    active_job: bool = False,
+) -> list[str]:
+    active_job = active_job or bool(manifest.get("active_job_id"))
     state, phase = manifest["state"], manifest["phase"]
     caps = ["inspect", "branch"]
     if state == "intake" and phase == "ready_for_clarification":
@@ -257,19 +443,47 @@ def capabilities(manifest: dict[str, Any]) -> list[str]:
             caps.append("generate_sample")
         elif phase == "waiting_human_approval":
             caps.extend(["revise_sample", "approve_sample", "regenerate_sample"])
+    elif state == "ppt_full":
+        current_full_deck = _current_full_deck_revision(manifest)
+        if current_full_deck:
+            caps.append("inspect_full_deck")
+            if not active_job:
+                caps.extend([
+                    "regenerate_full_deck",
+                    "revise_full_deck",
+                    "restore_full_deck_revision",
+                    "branch_full_deck_revision",
+                ])
+                if any(
+                    page.get("status") == "pending"
+                    for page in current_full_deck.get("plan", {}).get("pages", [])
+                ):
+                    caps.append("generate_full_deck")
+                if (
+                    current_full_deck.get("status") == "pending_approval"
+                    and current_full_deck.get("package")
+                ):
+                    caps.append("approve_full_deck")
     if manifest.get("documents", {}).get("narrative_structure") and "edit_narrative" not in caps:
         caps.append("edit_narrative")
     if manifest.get("documents", {}).get("slide_outline") and "edit_outline" not in caps:
         caps.append("edit_outline")
-    current_hash = manifest.get("current_sample_revision_hash")
-    current_sample = next(
-        (item for item in manifest.get("samples", []) if item.get("revision_hash") == current_hash),
-        (manifest.get("samples") or [None])[-1],
-    )
+    current_sample = _current_sample(manifest)
     if current_sample and current_sample.get("status") != "stale":
         for capability in ("revise_sample", "regenerate_sample"):
             if capability not in caps:
                 caps.append(capability)
+    if manifest.get("full_deck") and "inspect_full_deck" not in caps:
+        caps.append("inspect_full_deck")
+    if (
+        not active_job
+        and not manifest.get("full_deck")
+        and _sample_can_enter_full_deck(
+            current_sample,
+            (manifest.get("documents", {}).get("slide_outline") or [None])[-1],
+        )
+    ):
+        caps.append("enter_full_deck")
     return caps
 
 
@@ -589,6 +803,7 @@ class Workflow:
                     prior["status"] = "stale"
             for prior in value.get("samples", []):
                 prior["status"] = "stale"
+            mark_full_deck_stale(value)
             value.update(state=document_type, phase="waiting_human_approval")
             return value
 
@@ -828,6 +1043,7 @@ class Workflow:
         if successful_prompt_call_id is None:
             raise WorkflowError("sample prompt audit is incomplete")
         def apply(value: dict[str, Any]) -> dict[str, Any]:
+            mark_full_deck_stale(value)
             value.setdefault("samples", []).append(sample.model_dump())
             value["current_sample_revision_hash"] = sample.revision_hash
             value.update(state="ppt_sample", phase="waiting_human_approval")
@@ -852,6 +1068,88 @@ class Workflow:
             output_ref=sample.revision_hash,
             output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
         )
+
+    def enter_full_deck(
+        self,
+        checkpoint_id: str,
+        sample_revision_hash: str,
+    ) -> dict[str, Any]:
+        """Approve the selected sample and initialize full-deck R1 atomically."""
+
+        manifest = self.store.read()
+        if manifest["checkpoint_id"] != checkpoint_id:
+            raise ConflictError("stale_revision:工程已更新，请刷新后重试。")
+        if manifest.get("full_deck"):
+            raise ConflictError(
+                "full_deck_already_initialized:请继续当前全稿，或从样品检查点创建新分支。"
+            )
+        current = _current_sample(manifest)
+        if not current or current.get("revision_hash") != sample_revision_hash:
+            raise ConflictError("stale_revision:当前样品已变化，请刷新后重试。")
+        if not _sample_can_enter_full_deck(current):
+            raise ConflictError(
+                "full_deck_plan_invalid:当前样品缺少可追溯的 HTML-PPT 页映射，请重新生成样品后重试。"
+            )
+        outline = self._current(manifest, "slide_outline")
+        if not outline or outline.get("status") != "approved":
+            raise ConflictError(
+                "full_deck_plan_invalid:逐页大纲尚未确认，请先确认大纲后重试。"
+            )
+        try:
+            root, revision = _initialize_full_deck(outline, current)
+        except (FullDeckComposerError, ValidationError, ValueError, WorkflowError) as exc:
+            raise ConflictError(
+                "full_deck_plan_invalid:样品页与已确认大纲无法建立完整映射，请修复样品后重试。"
+            ) from exc
+
+        was_approved = current.get("status") == "approved"
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            selected = next(
+                (
+                    item for item in value.get("samples", [])
+                    if item.get("revision_hash") == sample_revision_hash
+                ),
+                None,
+            )
+            if selected is None:
+                raise ConflictError("stale_revision")
+            selected["status"] = "approved"
+            value["current_sample_revision_hash"] = sample_revision_hash
+            value["full_deck"] = root.model_dump(mode="json")
+            value["full_deck_revisions"] = [revision.model_dump(mode="json")]
+            value.update(state="ppt_full", phase="ready_to_generate")
+            return value
+
+        ready_count = sum(page.status == "ready" for page in revision.plan.pages)
+        try:
+            return self.store.update_events(
+                apply,
+                [
+                    (
+                        "sample_approved",
+                        {
+                            "revision_hash": sample_revision_hash,
+                            "already_approved": was_approved,
+                        },
+                    ),
+                    (
+                        "full_deck_initialized",
+                        {
+                            "full_deck_id": root.full_deck_id,
+                            "revision_hash": revision.revision_hash,
+                            "page_count": len(revision.plan.pages),
+                            "ready_page_count": ready_count,
+                            "pending_page_count": len(revision.plan.pages) - ready_count,
+                        },
+                    ),
+                ],
+                expected_checkpoint_id=checkpoint_id,
+            )
+        except ConflictError as exc:
+            if str(exc) == "stale_revision":
+                raise ConflictError("stale_revision:工程已更新，请刷新后重试。") from exc
+            raise
 
     def restore_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
         """Move the current sample pointer without creating a new revision."""

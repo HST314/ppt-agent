@@ -85,11 +85,24 @@ class CheckpointRequest(StrictRequest):
     checkpoint_id: str = Field(min_length=1, max_length=128)
 
 
+class FullDeckEnterRequest(StrictRequest):
+    checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
+    sample_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
 class BranchRequest(StrictRequest):
     checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
     name: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
     mode: Literal["fork_after", "rerun_stage"] = "fork_after"
-    stage: Literal["intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"] | None = None
+    stage: Literal[
+        "intake",
+        "intake_clarify",
+        "narrative_structure",
+        "slide_outline",
+        "ppt_sample",
+        "ppt_full",
+        "acceptance",
+    ] | None = None
 
 
 class BranchSwitchRequest(StrictRequest):
@@ -141,6 +154,7 @@ def store_for(project_id: str) -> ProjectStore:
 def project_view(store: ProjectStore) -> dict[str, Any]:
     manifest = store.read(latest_sample_only=True)
     latest_job = jobs.latest_for_project(store.project_id)
+    active_job = latest_job if latest_job and latest_job["status"] in {"queued", "running"} else None
     with runtime_config_lock:
         sample_page_count = runtime.policy.sample_page_count
     samples = manifest.get("samples", [])
@@ -158,8 +172,26 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
                 {"page_id": slide["slide_id"], "title": slide["title"]}
                 for slide in package.get("slides", [])
             ]
+    full_deck_revisions = manifest.get("full_deck_revisions", [])
+    full_deck_root = manifest.get("full_deck") or {}
+    current_full_deck_hash = full_deck_root.get("current_revision_hash")
+    current_full_deck = next(
+        (
+            deepcopy(item) for item in full_deck_revisions
+            if item.get("revision_hash") == current_full_deck_hash
+        ),
+        None,
+    )
+    if current_full_deck and current_full_deck.get("package"):
+        current_full_deck["package"]["files"] = [{
+            key: item[key]
+            for key in ("path", "artifact_id", "sha256", "size", "media_type", "origin")
+            if key in item
+        } for item in current_full_deck["package"].get("files", [])]
+    public_manifest = deepcopy(manifest)
+    public_manifest.pop("full_deck_revisions", None)
     return {
-        **manifest,
+        **public_manifest,
         # Revision history stays durable in the manifest/checkpoints; the UI
         # only needs the current package metadata and should not download
         # every prior sample on each poll.
@@ -167,8 +199,24 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
         "sample_revisions": history,
         "sample_attempts": store.sample_attempts(),
         "sample_page_count": sample_page_count,
-        "capabilities": capabilities(manifest),
-        "active_job": latest_job if latest_job and latest_job["status"] in {"queued", "running"} else None,
+        "full_deck_revision": current_full_deck,
+        "full_deck_revisions": [
+            {
+                "full_deck_id": item["full_deck_id"],
+                "revision": item["revision"],
+                "revision_hash": item["revision_hash"],
+                "parent_revision_hash": item.get("parent_revision_hash"),
+                "feedback": item.get("feedback"),
+                "status": item["status"],
+                "created_at": item["created_at"],
+                "page_count": len(item.get("plan", {}).get("pages", [])),
+                "current": item.get("revision_hash") == current_full_deck_hash,
+            }
+            for item in reversed(full_deck_revisions)
+        ],
+        "full_deck_attempts": [],
+        "capabilities": capabilities(manifest, active_job=active_job is not None),
+        "active_job": active_job,
         "progress_snapshots": store.progress_snapshots(),
     }
 
@@ -339,6 +387,21 @@ def approve_sample(project_id: str, request: ApproveRequest) -> dict[str, Any]:
     with runtime_config_lock:
         current_runtime = runtime
     Workflow(store, current_runtime).approve_sample(request.checkpoint_id, request.revision_hash)
+    return project_view(store)
+
+
+@app.post("/api/projects/{project_id}/full-deck/enter")
+def enter_full_deck(project_id: str, request: FullDeckEnterRequest) -> dict[str, Any]:
+    store = store_for(project_id)
+    with jobs.project_guard(project_id) as active:
+        if active:
+            raise ConflictError("active_job:请等待当前任务结束后再进入全稿。")
+        with runtime_config_lock:
+            current_runtime = runtime
+        Workflow(store, current_runtime).enter_full_deck(
+            request.checkpoint_id,
+            request.sample_revision_hash,
+        )
     return project_view(store)
 
 
