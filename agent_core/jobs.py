@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -396,6 +398,15 @@ class JobRegistry:
             )
         except Exception as exc:
             record.update(status="failed", error=public_job_error(exc))
+            print(
+                f"job {record['job_id']} ({record['operation']}) failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exception(
+                type(exc), exc, exc.__traceback__, file=sys.stderr
+            )
         record["cancel_requested"] = self._cancel_requested(record["job_id"])
         record["finished_at"] = utc_now()
         self._write(record)

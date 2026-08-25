@@ -960,3 +960,86 @@ def test_full_deck_generation_pause_and_retry_api_are_versioned_and_idempotent(
         for package in audited_session["packages"]
         for file in package["files"]
     )
+
+
+def test_full_deck_finalization_failure_reports_reason_and_retry_publishes(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    registry = JobRegistry(project_root / ".jobs")
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", registry)
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    workflow, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-finalize-diagnosis",
+    )
+    client = TestClient(main_front.app)
+
+    import agent_core.full_deck_session as session_module
+
+    original_compose = session_module.compose_full_deck
+
+    def failing_compose(spec):
+        raise ValueError("injected final Composer failure")
+
+    monkeypatch.setattr(session_module, "compose_full_deck", failing_compose)
+
+    start = client.post(
+        "/api/projects/session-finalize-diagnosis/full-deck/generation-sessions",
+        json={
+            "checkpoint_id": entered["checkpoint_id"],
+            "revision_hash": entered["full_deck"]["current_revision_hash"],
+        },
+    )
+    assert start.status_code == 202, start.text
+    session_id = start.json()["session"]["session_id"]
+    failed_job = wait_for_terminal_job(
+        lambda job_id: client.get(f"/api/jobs/{job_id}").json(),
+        start.json()["job"]["job_id"],
+    )
+    assert failed_job["status"] == "failed"
+    assert failed_job["error"]["code"] == "full_deck_finalization_failed"
+
+    failed = client.get(
+        f"/api/projects/session-finalize-diagnosis/full-deck/generation-sessions/"
+        f"{session_id}"
+    ).json()
+    assert failed["status"] == "failed"
+    assert failed["error"]["code"] == "full_deck_finalization_failed"
+    assert failed["error"]["detail"] == (
+        "生成会话最终发布失败：injected final Composer failure"
+    )
+    assert "retry" in failed["capabilities"]
+
+    monkeypatch.setattr(session_module, "compose_full_deck", original_compose)
+    retry_url = (
+        f"/api/projects/session-finalize-diagnosis/full-deck/generation-sessions/"
+        f"{session_id}/retry"
+    )
+    retried = client.post(
+        retry_url,
+        json={"session_version": failed["session_version"]},
+    )
+    assert retried.status_code == 202, retried.text
+    retry_job = wait_for_terminal_job(
+        lambda job_id: client.get(f"/api/jobs/{job_id}").json(),
+        retried.json()["job"]["job_id"],
+    )
+    assert retry_job["status"] == "succeeded"
+
+    completed = client.get(
+        f"/api/projects/session-finalize-diagnosis/full-deck/generation-sessions/"
+        f"{session_id}"
+    ).json()
+    assert completed["status"] == "completed"
+    assert completed["published_revision_hash"]
+    export_url = (
+        "/api/projects/session-finalize-diagnosis/full-deck/revisions/"
+        f"{completed['published_revision_hash']}/export"
+    )
+    exported = client.get(export_url)
+    assert exported.status_code == 200

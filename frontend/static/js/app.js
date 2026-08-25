@@ -134,9 +134,13 @@ const ERROR_MESSAGES = {
 };
 
 function userErrorMessage(error, fallback = "操作未完成，请稍后重试。") {
-  if (error?.code && ERROR_MESSAGES[error.code]) return ERROR_MESSAGES[error.code];
+  const mapped = error?.code && ERROR_MESSAGES[error.code] ? ERROR_MESSAGES[error.code] : "";
   const message = typeof error?.message === "string" ? error.message.replace(/\s+/g, " ").trim() : "";
-  return message && /[\u3400-\u9fff]/.test(message) && message.length <= 96 ? message : fallback;
+  const base = mapped || (message && /[\u3400-\u9fff]/.test(message) && message.length <= 96 ? message : "");
+  const detail = typeof error?.detail === "string" ? error.detail.replace(/\s+/g, " ").trim().slice(0, 160) : "";
+  if (base && detail) return `${base}（${detail}）`;
+  if (base) return base;
+  return fallback;
 }
 
 function announceWorkspace(message) {

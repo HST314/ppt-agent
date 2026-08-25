@@ -140,6 +140,53 @@ def test_composer_is_deterministic_namespaces_assets_and_traces_each_page() -> N
     assert 'aria-live="polite"' in outer
 
 
+def test_content_graph_is_independent_of_source_file_order() -> None:
+    """Graph hashes must not depend on how a package ordered its file list."""
+
+    def ordered_package(reversed_files: bool) -> HtmlPptPackage:
+        base = _segment_package("gamma", (1, 2), "#17324d")
+        files = list(base.files)
+        if reversed_files:
+            files.reverse()
+        return HtmlPptPackage.model_validate({
+            **base.model_dump(mode="json"),
+            "files": [item.model_dump(mode="json") for item in files],
+        })
+
+    forward = ordered_package(False)
+    backward = ordered_package(True)
+    assert [item.path for item in backward.files] == [
+        "assets/shared.svg", "assets/deck.js", "assets/deck.css", "index.html",
+    ]
+
+    graph_forward = normalized_page_content_graph(forward, "gamma-1")
+    graph_backward = normalized_page_content_graph(backward, "gamma-1")
+    assert graph_forward.content_hash == graph_backward.content_hash
+
+    spec = FullDeckComposerInput(
+        title="文件顺序无关验证",
+        sources=[ComposerSource(source_id="segment_gamma", package=backward)],
+        pages=[
+            ComposerPage(
+                slide_id=f"slide-{number}",
+                title=f"第 {number} 页",
+                source_slide_number=number,
+                source_id="segment_gamma",
+                source_slide_id=f"gamma-{number}",
+            )
+            for number in (1, 2)
+        ],
+    )
+    composition = compose_full_deck(spec)
+    for number, slide in enumerate(composition.manifest.slides, start=1):
+        expected = normalized_page_content_graph(backward, f"gamma-{number}")
+        assert slide.source_slide_content_hash == expected.content_hash
+        assert slide.composed_slide_content_hash == expected.content_hash
+    for source in composition.manifest.sources:
+        paths = [resource.source_path for resource in source.resources]
+        assert paths == sorted(paths)
+
+
 def test_page_content_graph_handles_current_html_ppt_skill_template() -> None:
     template = (
         ROOT / "skills/guizang-ppt-skill/assets/template-swiss.html"

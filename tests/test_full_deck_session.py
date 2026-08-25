@@ -292,6 +292,10 @@ def test_finalization_retry_reuses_every_successful_segment(
     assert failed["status"] == "failed"
     assert failed["completed_batches"] == 4
     assert all(batch["status"] == "succeeded" for batch in failed["batches"])
+    assert failed["error"]["code"] == "full_deck_finalization_failed"
+    assert failed["error"]["detail"] == (
+        "生成会话最终发布失败：injected final Composer failure"
+    )
     assert len(workflow.store.read(include_sample_html=False)["full_deck_revisions"]) == 1
 
     restarted = Workflow(

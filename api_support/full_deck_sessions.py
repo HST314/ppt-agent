@@ -156,16 +156,23 @@ def _public_error(error: Any) -> dict[str, str] | None:
         return None
     code = error.get("code")
     if code == "full_deck_generation_worker_interrupted":
-        return {
+        value = {
             "code": "full_deck_batch_failed",
             "message": "服务已重启，请重试当前批。",
         }
-    if not isinstance(code, str) or code not in _PUBLIC_ERROR_MESSAGES:
-        return {
+    elif isinstance(code, str) and code in _PUBLIC_ERROR_MESSAGES:
+        value = {"code": code, "message": _PUBLIC_ERROR_MESSAGES[code]}
+    else:
+        value = {
             "code": "full_deck_batch_failed",
             "message": _PUBLIC_ERROR_MESSAGES["full_deck_batch_failed"],
         }
-    return {"code": code, "message": _PUBLIC_ERROR_MESSAGES[code]}
+    detail = error.get("detail")
+    if isinstance(detail, str):
+        bounded = " ".join(detail.split())[:200]
+        if bounded:
+            value["detail"] = bounded
+    return value
 
 
 def public_session_summary(

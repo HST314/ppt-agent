@@ -62,6 +62,15 @@ class FullDeckSessionError(FullDeckGenerationError):
     """Stable generation-session failure exposed through JobRegistry."""
 
 
+def _error_detail(message: Any) -> str | None:
+    """Bound an internal failure reason to one short line for diagnosis."""
+
+    if message is None:
+        return None
+    text = " ".join(str(message).split())
+    return text[:200] or None
+
+
 def _session_baseline(
     manifest: dict[str, Any],
     session: dict[str, Any],
@@ -562,7 +571,11 @@ def _execute_claimed_batch(
             workflow,
             session_id,
             batch_index,
-            error={"code": failure.public_code, "message": failure.public_message},
+            error={
+                "code": failure.public_code,
+                "message": failure.public_message,
+                "detail": _error_detail(failure.repair_reason),
+            },
             prompt_call_ids=prompt_call_ids,
             applied_directive_ids=applied_directive_ids,
             segment_package=segment_to_store,
@@ -865,7 +878,11 @@ def finalize_full_deck_generation_session(
                 refreshed["session_version"],
                 status="failed",
                 completed_batches=refreshed["completed_batches"],
-                error={"code": failure.public_code, "message": failure.public_message},
+                error={
+                    "code": failure.public_code,
+                    "message": failure.public_message,
+                    "detail": _error_detail(failure.repair_reason),
+                },
             )
         raise failure from exc
 
@@ -971,7 +988,13 @@ def run_full_deck_generation_session(
                     workflow,
                     session_id,
                     int(batch["batch_index"]),
-                    error={"code": public_code, "message": public_message},
+                    error={
+                        "code": public_code,
+                        "message": public_message,
+                        "detail": _error_detail(
+                            f"批次 {batch['batch_index']} 生成或校验失败：{exc}"
+                        ),
+                    },
                     prompt_call_ids=(
                         list(current_batch["prompt_call_ids"])
                         + list(getattr(exc, "prompt_call_ids", []))

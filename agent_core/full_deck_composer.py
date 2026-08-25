@@ -360,6 +360,9 @@ def compose_full_deck(spec: FullDeckComposerInput) -> FullDeckComposition:
                 output_path=output_path,
                 content_hash=_hash_bytes(item.content_bytes()),
             ))
+        # Content graphs hash resources in path order regardless of how the
+        # source package happened to order its file list.
+        resources.sort(key=lambda item: item.source_path)
         source_graph_resources[source.source_id] = [
             ContentGraphResource(path=item.source_path, content_hash=item.content_hash)
             for item in resources

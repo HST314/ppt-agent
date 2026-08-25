@@ -65,7 +65,13 @@ export function createFullDeckWorkspaceController({
         return;
       }
       if (session.status === "paused") notify("全稿已在批次边界安全暂停。");
-      if (session.status === "failed") notify(session.error?.message || "当前批未完成，可重试当前批。", true);
+      if (session.status === "failed") {
+        const failedMessage = session.error?.message || "当前批未完成，可重试当前批。";
+        const failedDetail = typeof session.error?.detail === "string"
+          ? session.error.detail.replace(/\s+/g, " ").trim().slice(0, 160)
+          : "";
+        notify(failedDetail ? `${failedMessage}（${failedDetail}）` : failedMessage, true);
+      }
       if (session.status === "cancelled") notify("全稿生成已取消，已成功页面仍然保留。");
       if (session.status === "stale") notify("工程基线已变化，此生成会话不能继续。", true);
     },
