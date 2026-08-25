@@ -11,6 +11,7 @@ import tinycss2
 
 HTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
 SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/"
 
 HTML_TAGS = {
     "a", "abbr", "article", "aside", "b", "bdi", "bdo", "blockquote", "br",
@@ -21,8 +22,9 @@ HTML_TAGS = {
     "td", "tfoot", "th", "thead", "tr", "u", "ul",
 }
 SVG_TAGS = {
-    "circle", "clipPath", "defs", "ellipse", "g", "line", "linearGradient", "path",
-    "pattern", "polygon", "polyline", "radialGradient", "rect", "stop", "svg", "text", "tspan",
+    "circle", "clipPath", "defs", "desc", "ellipse", "g", "line", "linearGradient",
+    "path", "pattern", "polygon", "polyline", "radialGradient", "rect", "stop", "svg",
+    "text", "title", "tspan",
 }
 VOID_TAGS = {"br", "hr", "img"}
 
@@ -173,16 +175,28 @@ def _sanitize_stylesheet(value: str) -> str:
     return "".join(sanitized)
 
 
-def _sanitize_attribute(namespace: str, tag: str, raw_name: str, value: str) -> tuple[str, str]:
+def _sanitize_attribute(
+    namespace: str, tag: str, raw_name: str, value: str
+) -> tuple[str, str] | None:
     attribute_namespace, name = _qualified_name(raw_name)
     if attribute_namespace:
+        if (
+            namespace == SVG_NAMESPACE
+            and tag == "svg"
+            and attribute_namespace == XMLNS_NAMESPACE
+            and name == "xmlns"
+            and value == SVG_NAMESPACE
+        ):
+            return None
         raise SampleHtmlError("namespaced attributes are not allowed")
     allowed = (
         SVG_ATTRIBUTES
         if namespace == SVG_NAMESPACE
         else GLOBAL_ATTRIBUTES | HTML_ATTRIBUTES.get(tag, set())
     )
-    if name not in allowed and not (namespace == HTML_NAMESPACE and name.startswith("aria-")):
+    if name not in allowed and not (
+        namespace in {HTML_NAMESPACE, SVG_NAMESPACE} and name.startswith("aria-")
+    ):
         raise SampleHtmlError(f"unsupported attribute: {name}")
     if name == "style":
         value = _sanitize_style_attribute(value)
@@ -210,10 +224,11 @@ def _serialize_element(element: Element, *, depth: int = 0) -> str:
     else:
         raise SampleHtmlError("unsupported markup namespace")
 
-    attributes = [
-        _sanitize_attribute(namespace, tag, name, value)
-        for name, value in element.attrib.items()
-    ]
+    attributes: list[tuple[str, str]] = []
+    for name, value in element.attrib.items():
+        attribute = _sanitize_attribute(namespace, tag, name, value)
+        if attribute is not None:
+            attributes.append(attribute)
     rendered_attributes = "".join(
         f' {name}="{html.escape(value, quote=True)}"' for name, value in attributes
     )

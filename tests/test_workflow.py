@@ -101,6 +101,10 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
         '<style>body{background-image:url("\\68 ttps://example.com/tracker.png")}</style>',
         '<style>body{b\\61ckground-image:url("https://example.com/tracker.png")}</style>',
         '<svg><rect fill="u\\72l(https://example.com/paint.svg#gradient)"></rect></svg>',
+        '<svg xmlns="https://example.com/evil"><rect></rect></svg>',
+        '<svg xmlns=" http://www.w3.org/2000/svg"><rect></rect></svg>',
+        '<svg xmlns:xlink="http://www.w3.org/1999/xlink"><rect></rect></svg>',
+        '<div xmlns="http://www.w3.org/2000/svg">wrong owner</div>',
         '<div data-remote="https://example.com">unsafe attribute</div>',
     ],
 )
@@ -130,6 +134,48 @@ def test_sample_page_allows_passive_inline_content() -> None:
     assert "<!--" not in page.html
     assert "linear-gradient" in page.html
     assert 'fill="url(#paint)"' in page.html
+
+
+def test_sample_page_allows_svg_namespace_declaration_and_drops_it() -> None:
+    page = SamplePage(
+        page_id="sample_1",
+        title="Namespaced SVG",
+        html=(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+            '<rect width="10" height="10"></rect></svg>'
+        ),
+    )
+
+    assert '<svg viewBox="0 0 10 10">' in page.html
+    assert "xmlns" not in page.html
+
+
+def test_sample_page_allows_svg_aria_attributes() -> None:
+    page = SamplePage(
+        page_id="sample_1",
+        title="Accessible SVG",
+        html=(
+            '<svg viewBox="0 0 10 10" aria-label="chart" aria-hidden="false">'
+            '<rect width="10" height="10"></rect></svg>'
+        ),
+    )
+
+    assert 'aria-label="chart"' in page.html
+    assert 'aria-hidden="false"' in page.html
+
+
+def test_sample_page_allows_svg_title_and_desc_elements() -> None:
+    page = SamplePage(
+        page_id="sample_1",
+        title="Described SVG",
+        html=(
+            '<svg viewBox="0 0 10 10"><title>chart</title><desc>summary</desc>'
+            '<rect width="10" height="10"></rect></svg>'
+        ),
+    )
+
+    assert "<title>chart</title>" in page.html
+    assert "<desc>summary</desc>" in page.html
 
 
 def test_sample_page_rejects_comment_capture_payload() -> None:
