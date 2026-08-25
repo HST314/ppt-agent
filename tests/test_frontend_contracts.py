@@ -29,7 +29,7 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert "本次生成尝试" in samples
     assert "已发布为 PPT 样品" in samples
     assert "source_slide_number" in samples
-    assert 'toolRoundsInput.max = "100"' in app
+    assert 'id="max-tool-rounds" name="max_tool_rounds" type="number" min="0" max="100"' in app
     assert "不会创建新修订" in samples
     assert 'data-action="branch_sample_revision"' in samples
     assert 'data-sample-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"' in samples
@@ -46,7 +46,7 @@ def test_sample_preview_is_sandboxed_and_never_inserted_into_parent_dom() -> Non
     assert 'frame.src = sample.preview_url' in samples
     assert "script-src 'self' 'unsafe-inline' data: blob:" in server
     assert "connect-src 'none'" in server
-    assert "frame-src 'none'" in server
+    assert "frame-src 'self'" in server
     assert "innerHTML = page.html" not in app + samples
 
 

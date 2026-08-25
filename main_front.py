@@ -380,7 +380,7 @@ PACKAGE_CSP = (
     "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline' data: blob:; "
     "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
     "font-src 'self' data:; media-src 'self' data: blob:; connect-src 'none'; "
-    "frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; "
+    "frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; "
     "worker-src blob:; manifest-src 'none'"
 )
 

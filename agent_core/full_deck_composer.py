@@ -1,0 +1,433 @@
+from __future__ import annotations
+
+import html
+import json
+from copy import deepcopy
+from hashlib import sha256
+from typing import Any, Literal
+
+import html5lib
+from pydantic import Field, model_validator
+
+from agent_core.models import HtmlPptPackage, PackageFile, PackageSlide, StrictModel
+
+
+COMPOSER_VERSION = "full-deck-composer-v1"
+PAGE_CONTENT_GRAPH_VERSION = "page-content-graph-v1"
+
+
+class FullDeckComposerError(ValueError):
+    """A deterministic composition input or transformation is invalid."""
+
+
+class ComposerSource(StrictModel):
+    source_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    package: HtmlPptPackage
+
+
+class ComposerPage(StrictModel):
+    slide_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    title: str = Field(min_length=1, max_length=160)
+    source_slide_number: int = Field(ge=1, le=1000)
+    source_id: str = Field(min_length=1, max_length=80)
+    source_slide_id: str = Field(min_length=1, max_length=80)
+
+
+class FullDeckComposerInput(StrictModel):
+    composer_version: Literal[COMPOSER_VERSION] = COMPOSER_VERSION
+    title: str = Field(min_length=1, max_length=160)
+    sources: list[ComposerSource] = Field(min_length=1, max_length=80)
+    pages: list[ComposerPage] = Field(min_length=1, max_length=80)
+
+    @model_validator(mode="after")
+    def validate_references(self) -> "FullDeckComposerInput":
+        source_ids = [source.source_id for source in self.sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("composer source_id values must be unique")
+        slide_ids = [page.slide_id for page in self.pages]
+        if len(slide_ids) != len(set(slide_ids)):
+            raise ValueError("composed slide_id values must be unique")
+        source_numbers = [page.source_slide_number for page in self.pages]
+        if len(source_numbers) != len(set(source_numbers)):
+            raise ValueError("composed source_slide_number values must be unique")
+
+        source_index = {source.source_id: source.package for source in self.sources}
+        for page in self.pages:
+            package = source_index.get(page.source_id)
+            if package is None:
+                raise ValueError(f"composer source does not exist: {page.source_id}")
+            declared = next(
+                (slide for slide in package.slides if slide.slide_id == page.source_slide_id),
+                None,
+            )
+            if declared is None:
+                raise ValueError(
+                    f"source slide does not exist: {page.source_id}/{page.source_slide_id}"
+                )
+            if (
+                declared.source_slide_number is not None
+                and declared.source_slide_number != page.source_slide_number
+            ):
+                raise ValueError(
+                    "composer page number does not match the source package declaration"
+                )
+        return self
+
+
+class ContentGraphResource(StrictModel):
+    path: str
+    content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class PageContentGraph(StrictModel):
+    graph_version: Literal[PAGE_CONTENT_GRAPH_VERSION] = PAGE_CONTENT_GRAPH_VERSION
+    slide_id: str
+    document_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    resources: list[ContentGraphResource]
+    content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class CompositionResource(StrictModel):
+    source_path: str
+    output_path: str
+    content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class CompositionSource(StrictModel):
+    source_id: str
+    source_package_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    namespace: str
+    resources: list[CompositionResource]
+
+
+class CompositionSlide(StrictModel):
+    slide_id: str
+    title: str
+    source_slide_number: int
+    source_id: str
+    source_slide_id: str
+    source_package_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    document_path: str
+    source_slide_content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    composed_slide_content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class CompositionManifest(StrictModel):
+    composer_version: Literal[COMPOSER_VERSION] = COMPOSER_VERSION
+    page_content_graph_version: Literal[PAGE_CONTENT_GRAPH_VERSION] = PAGE_CONTENT_GRAPH_VERSION
+    input_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    title: str
+    slide_count: int
+    sources: list[CompositionSource]
+    slides: list[CompositionSlide]
+
+
+class FullDeckComposition(StrictModel):
+    composer_version: Literal[COMPOSER_VERSION] = COMPOSER_VERSION
+    manifest: CompositionManifest
+    package: HtmlPptPackage
+
+
+def _hash_bytes(value: bytes) -> str:
+    return "sha256:" + sha256(value).hexdigest()
+
+
+def _stable_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _hash_bytes(encoded)
+
+
+def _file_bytes(package: HtmlPptPackage) -> dict[str, bytes]:
+    return {item.path: item.content_bytes() for item in package.files}
+
+
+def _slide_elements(document: Any) -> list[Any]:
+    return [
+        element
+        for element in document.iter()
+        if "slide" in set((element.attrib.get("class") or "").split())
+    ]
+
+
+def _single_slide_document(package: HtmlPptPackage, slide_id: str) -> str:
+    files = _file_bytes(package)
+    try:
+        source = files[package.entrypoint].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FullDeckComposerError("HTML-PPT entrypoint must be UTF-8") from exc
+
+    document = html5lib.parse(source, namespaceHTMLElements=False)
+    slides = _slide_elements(document)
+    matches = [element for element in slides if element.attrib.get("data-slide-id") == slide_id]
+    if len(matches) != 1:
+        raise FullDeckComposerError(
+            f"source slide must occur exactly once in index.html: {slide_id}"
+        )
+    selected = matches[0]
+    parent_by_child = {child: parent for parent in document.iter() for child in parent}
+    for element in slides:
+        if element is selected:
+            continue
+        parent = parent_by_child.get(element)
+        if parent is None:
+            raise FullDeckComposerError(f"source slide has no removable parent: {slide_id}")
+        parent.remove(element)
+    if _slide_elements(document) != [selected]:
+        raise FullDeckComposerError("source slide elements must not be nested")
+
+    serialized = html5lib.serialize(
+        document,
+        tree="etree",
+        alphabetical_attributes=True,
+        quote_attr_values="always",
+        omit_optional_tags=False,
+    )
+    return "<!doctype html>" + serialized
+
+
+def _content_graph(
+    *,
+    slide_id: str,
+    document: bytes,
+    resources: list[tuple[str, bytes]],
+) -> PageContentGraph:
+    resource_models = [
+        ContentGraphResource(path=path, content_hash=_hash_bytes(content))
+        for path, content in sorted(resources)
+    ]
+    return _content_graph_from_hashes(
+        slide_id=slide_id,
+        document=document,
+        resources=resource_models,
+    )
+
+
+def _content_graph_from_hashes(
+    *,
+    slide_id: str,
+    document: bytes,
+    resources: list[ContentGraphResource],
+) -> PageContentGraph:
+    document_hash = _hash_bytes(document)
+    identity = {
+        "graph_version": PAGE_CONTENT_GRAPH_VERSION,
+        "slide_id": slide_id,
+        "document_hash": document_hash,
+        "resources": [item.model_dump() for item in resources],
+    }
+    return PageContentGraph(
+        slide_id=slide_id,
+        document_hash=document_hash,
+        resources=resources,
+        content_hash=_stable_hash(identity),
+    )
+
+
+def normalized_page_content_graph(
+    package: HtmlPptPackage,
+    slide_id: str,
+) -> PageContentGraph:
+    """Hash one static slide document plus its conservatively complete resource graph.
+
+    Every non-entrypoint file is included. This intentionally favors false dependencies
+    over missing a runtime-loaded local asset; the logical source paths are retained so a
+    namespaced copy can be normalized and checked against the same graph.
+    """
+
+    document = _single_slide_document(package, slide_id).encode("utf-8")
+    resources = [
+        (item.path, item.content_bytes())
+        for item in package.files
+        if item.path != package.entrypoint
+    ]
+    return _content_graph(slide_id=slide_id, document=document, resources=resources)
+
+
+def _namespace(package: HtmlPptPackage) -> str:
+    package_hash = package.package_hash or package.content_hash()
+    return f"sources/{package_hash.removeprefix('sha256:')}"
+
+
+def _page_document_path(namespace: str, source_slide_id: str) -> str:
+    suffix = sha256(source_slide_id.encode("utf-8")).hexdigest()[:12]
+    return f"{namespace}/page-{source_slide_id}-{suffix}.html"
+
+
+def _input_hash(spec: FullDeckComposerInput) -> str:
+    return _stable_hash({
+        "composer_version": spec.composer_version,
+        "title": spec.title,
+        "sources": sorted(
+            (
+                {
+                    "source_id": source.source_id,
+                    "package_hash": source.package.package_hash,
+                }
+                for source in spec.sources
+            ),
+            key=lambda item: item["source_id"],
+        ),
+        "pages": [page.model_dump() for page in spec.pages],
+    })
+
+
+def _outer_index(spec: FullDeckComposerInput, slides: list[CompositionSlide]) -> str:
+    sections = []
+    for index, slide in enumerate(slides):
+        hidden = "" if index == 0 else " hidden"
+        sections.append(
+            f'<section class="slide" data-slide-id="{html.escape(slide.slide_id)}"{hidden}>'
+            f'<iframe src="{html.escape(slide.document_path)}" '
+            f'title="{html.escape(slide.title)}" sandbox="allow-scripts" '
+            'referrerpolicy="no-referrer"></iframe></section>'
+        )
+    return "".join((
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+        f"<title>{html.escape(spec.title)}</title>",
+        "<style>",
+        "*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#111}",
+        ".slide{position:absolute;inset:0}.slide[hidden]{display:none}.slide iframe{width:100%;height:100%;border:0;background:#fff}",
+        ".deck-nav{position:fixed;z-index:10;right:16px;bottom:14px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:999px;background:rgba(17,17,17,.78);color:#fff;font:13px/1.2 system-ui,sans-serif}",
+        ".deck-nav button{min-width:38px;min-height:38px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:#fff;color:#111;font:700 18px/1 system-ui;cursor:pointer}",
+        ".deck-nav button:focus-visible{outline:3px solid #6ee7ff;outline-offset:2px}",
+        "</style></head><body><main id=\"deck\">",
+        "".join(sections),
+        "</main><nav class=\"deck-nav\" aria-label=\"幻灯片导航\"><button id=\"prev\" type=\"button\" aria-label=\"上一页\">←</button><output id=\"counter\"></output><button id=\"next\" type=\"button\" aria-label=\"下一页\">→</button></nav>",
+        "<script>(()=>{const s=[...document.querySelectorAll('.slide')],c=document.querySelector('#counter');let i=0,x=null;const show=n=>{i=(n+s.length)%s.length;s.forEach((v,k)=>v.hidden=k!==i);c.textContent=`${i+1} / ${s.length}`};document.querySelector('#prev').addEventListener('click',()=>show(i-1));document.querySelector('#next').addEventListener('click',()=>show(i+1));addEventListener('keydown',e=>{if(e.key==='ArrowLeft'||e.key==='PageUp')show(i-1);if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' ')show(i+1)});addEventListener('touchstart',e=>{x=e.changedTouches[0].clientX},{passive:true});addEventListener('touchend',e=>{if(x===null)return;const d=e.changedTouches[0].clientX-x;if(Math.abs(d)>40)show(i+(d<0?1:-1));x=null},{passive:true});show(0)})();</script>",
+        "</body></html>",
+    ))
+
+
+def compose_full_deck(spec: FullDeckComposerInput) -> FullDeckComposition:
+    """Compose immutable source packages without entering the application workflow."""
+
+    source_by_id = {source.source_id: source.package for source in spec.sources}
+    output_files: dict[str, PackageFile] = {}
+    source_manifests: list[CompositionSource] = []
+    source_graph_resources: dict[str, list[ContentGraphResource]] = {}
+
+    for source in sorted(spec.sources, key=lambda item: item.source_id):
+        package = source.package
+        namespace = _namespace(package)
+        resources: list[CompositionResource] = []
+        for item in package.files:
+            if item.path == package.entrypoint:
+                continue
+            output_path = f"{namespace}/{item.path}"
+            copied = PackageFile(
+                path=output_path,
+                content=item.content,
+                encoding=item.encoding,
+                media_type=item.media_type,
+                origin=f"composer:{source.source_id}:{item.path}",
+            )
+            existing = output_files.get(output_path)
+            if existing is not None and existing.content_bytes() != copied.content_bytes():
+                raise FullDeckComposerError(f"namespaced resource collision: {output_path}")
+            output_files[output_path] = copied
+            resources.append(CompositionResource(
+                source_path=item.path,
+                output_path=output_path,
+                content_hash=_hash_bytes(item.content_bytes()),
+            ))
+        source_graph_resources[source.source_id] = [
+            ContentGraphResource(path=item.source_path, content_hash=item.content_hash)
+            for item in resources
+        ]
+        source_manifests.append(CompositionSource(
+            source_id=source.source_id,
+            source_package_hash=package.package_hash or package.content_hash(),
+            namespace=namespace,
+            resources=resources,
+        ))
+
+    slide_manifests: list[CompositionSlide] = []
+    for page in spec.pages:
+        package = source_by_id[page.source_id]
+        namespace = _namespace(package)
+        document = _single_slide_document(package, page.source_slide_id)
+        source_graph = _content_graph_from_hashes(
+            slide_id=page.source_slide_id,
+            document=document.encode("utf-8"),
+            resources=source_graph_resources[page.source_id],
+        )
+        document_path = _page_document_path(namespace, page.source_slide_id)
+        page_file = PackageFile(
+            path=document_path,
+            content=document,
+            encoding="utf-8",
+            media_type="text/html; charset=utf-8",
+            origin=f"composer:{page.source_id}:{page.source_slide_id}",
+        )
+        existing = output_files.get(document_path)
+        if existing is not None and existing.content_bytes() != page_file.content_bytes():
+            raise FullDeckComposerError(f"namespaced page collision: {document_path}")
+        output_files[document_path] = page_file
+
+        composed_graph = _content_graph_from_hashes(
+            slide_id=page.source_slide_id,
+            document=output_files[document_path].content_bytes(),
+            resources=source_graph_resources[page.source_id],
+        )
+        if source_graph.content_hash != composed_graph.content_hash:
+            raise FullDeckComposerError(
+                f"page content graph changed during composition: {page.source_slide_id}"
+            )
+        slide_manifests.append(CompositionSlide(
+            slide_id=page.slide_id,
+            title=page.title,
+            source_slide_number=page.source_slide_number,
+            source_id=page.source_id,
+            source_slide_id=page.source_slide_id,
+            source_package_hash=package.package_hash or package.content_hash(),
+            document_path=document_path,
+            source_slide_content_hash=source_graph.content_hash,
+            composed_slide_content_hash=composed_graph.content_hash,
+        ))
+
+    manifest = CompositionManifest(
+        input_hash=_input_hash(spec),
+        title=spec.title,
+        slide_count=len(spec.pages),
+        sources=source_manifests,
+        slides=slide_manifests,
+    )
+    output_files["composition_manifest.json"] = PackageFile(
+        path="composition_manifest.json",
+        content=json.dumps(
+            manifest.model_dump(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+        media_type="application/json; charset=utf-8",
+        origin="composer:manifest",
+    )
+    output_files["index.html"] = PackageFile(
+        path="index.html",
+        content=_outer_index(spec, slide_manifests),
+        encoding="utf-8",
+        media_type="text/html; charset=utf-8",
+        origin="composer:shell",
+    )
+    package = HtmlPptPackage(
+        title=spec.title,
+        slide_count=len(spec.pages),
+        slides=[
+            PackageSlide(
+                slide_id=page.slide_id,
+                title=page.title,
+                source_slide_number=page.source_slide_number,
+            )
+            for page in spec.pages
+        ],
+        files=[deepcopy(item) for _, item in sorted(output_files.items())],
+    )
+    return FullDeckComposition(manifest=manifest, package=package)
