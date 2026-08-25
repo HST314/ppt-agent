@@ -227,7 +227,7 @@ class ManagedRuntime:
             },
             "runtime_hash": self.runtime_hash,
             "model_hash": self.model_hash,
-            "read_permission": "skills/**/*.md (read-only)",
+            "read_permission": "Skills 文本只读；HTML-PPT 仅可写入当前隔离草稿包",
             "editable": True,
         }
 

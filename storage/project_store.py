@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 from agent_core.models import utc_now
 from agent_core.sample_html import SANITIZER_VERSION
+from runtime.package_tool import TEXT_SUFFIXES, normalize_package_path, package_media_type
 from storage.persistence import atomic_bytes, exclusive_file_lock, json_text
 from storage.prompt_audit import PromptAuditMixin
 from storage.sqlite_schema import PROJECT_SCHEMA
@@ -25,7 +27,7 @@ REVISION_HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
 ARTIFACT_ID = REVISION_HASH
 PROMPT_CALL_ID = re.compile(r"^prompt_[a-f0-9]{32}$")
 STAGE_IDS = ("intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INITIALIZATION_LOCK_TIMEOUT_SECONDS = 30
 MAX_GENERATED_HTML_FILES_PER_ATTEMPT = 12
 MAX_GENERATED_HTML_BYTES_PER_FILE = 1_000_000
@@ -51,6 +53,7 @@ class ProjectStore(PromptAuditMixin):
         self.initialization_lock_path = self.root / ".project-db-init.lock"
         self.manifest_path = self.root / "manifest.json"
         self.artifacts_root = self.root / "artifacts" / "html"
+        self.package_artifacts_root = self.root / "artifacts" / "packages"
         self.generated_html_root = self.root / "generated_html"
         self.lock = self._locks.setdefault(str(self.root), threading.RLock())
 
@@ -169,6 +172,38 @@ class ProjectStore(PromptAuditMixin):
             "created_at": utc_now(),
         }
 
+    def _package_artifact_record(
+        self,
+        logical_path: str,
+        content: bytes,
+        media_type: str,
+    ) -> dict[str, Any]:
+        path = normalize_package_path(logical_path)
+        content_checksum = "sha256:" + hashlib.sha256(content).hexdigest()
+        artifact_id = "sha256:" + hashlib.sha256(
+            path.encode("utf-8") + b"\0" + content
+        ).hexdigest()
+        suffix = Path(path).suffix.lower()
+        relative_path = f"artifacts/packages/{artifact_id.removeprefix('sha256:')}{suffix}"
+        artifact_path = (self.root / relative_path).resolve()
+        if not artifact_path.is_relative_to(self.package_artifacts_root.resolve()):
+            raise ValueError("invalid package artifact path")
+        if artifact_path.is_file():
+            if artifact_path.read_bytes() != content:
+                raise ConflictError("artifact_corrupt")
+        else:
+            atomic_bytes(artifact_path, content)
+        return {
+            "artifact_id": artifact_id,
+            "kind": "html_ppt_package_file",
+            "media_type": media_type or package_media_type(path),
+            "sha256": content_checksum,
+            "size_bytes": len(content),
+            "relative_path": relative_path,
+            "sanitizer_version": "sandbox-csp-v1",
+            "created_at": utc_now(),
+        }
+
     def save_generated_html_attempt(
         self,
         prompt_call_id: str,
@@ -196,19 +231,79 @@ class ProjectStore(PromptAuditMixin):
             relative_paths.append(relative_path)
         return relative_paths
 
+    def save_generated_package_attempt(
+        self,
+        prompt_call_id: str,
+        files: list[dict[str, Any]],
+    ) -> list[str]:
+        """Persist a bounded draft package before publication for repair diagnostics."""
+
+        if not PROMPT_CALL_ID.fullmatch(prompt_call_id):
+            raise ValueError("invalid prompt call id")
+        relative_paths: list[str] = []
+        total = 0
+        for item in files[:96]:
+            path = normalize_package_path(str(item.get("path", "")))
+            content_value = item.get("content")
+            if not isinstance(content_value, str):
+                continue
+            if item.get("encoding", "utf-8") == "base64":
+                try:
+                    content = base64.b64decode(content_value, validate=True)
+                except ValueError:
+                    continue
+            else:
+                content = content_value.encode("utf-8")
+            total += len(content)
+            if not content or len(content) > 2_000_000 or total > 15_000_000:
+                continue
+            relative_path = f"generated_html/{prompt_call_id}/package/{path}"
+            candidate = (self.root / relative_path).resolve()
+            if not candidate.is_relative_to(self.generated_html_root.resolve()):
+                raise ValueError("invalid generated package path")
+            atomic_bytes(candidate, content)
+            relative_paths.append(relative_path)
+        return relative_paths
+
     def _externalize_manifest(
         self,
         manifest: dict[str, Any],
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         projection = deepcopy(manifest)
+        if projection.get("samples") and not projection.get("current_sample_revision_hash"):
+            projection["current_sample_revision_hash"] = projection["samples"][-1]["revision_hash"]
         projection["format_version"] = SCHEMA_VERSION
         projection["storage"] = {
             "engine": "sqlite-wal",
             "database": "project.db",
-            "artifacts": "artifacts/html",
+            "artifacts": "artifacts",
         }
         artifacts: dict[str, dict[str, Any]] = {}
         for sample in projection.get("samples", []):
+            package = sample.get("package")
+            if package:
+                for item in package.get("files", []):
+                    content_value = item.pop("content", None)
+                    if content_value is not None:
+                        if item.get("encoding", "utf-8") == "base64":
+                            try:
+                                content = base64.b64decode(content_value, validate=True)
+                            except ValueError as exc:
+                                raise ConflictError("package_file_invalid") from exc
+                        else:
+                            content = content_value.encode("utf-8")
+                        record = self._package_artifact_record(
+                            item["path"], content, item.get("media_type") or package_media_type(item["path"]),
+                        )
+                        artifacts[record["artifact_id"]] = record
+                        item.update({
+                            "artifact_id": record["artifact_id"],
+                            "sha256": record["sha256"],
+                            "size": record["size_bytes"],
+                            "media_type": record["media_type"],
+                        })
+                    elif not ARTIFACT_ID.fullmatch(str(item.get("artifact_id", ""))):
+                        raise ConflictError("package_artifact_missing")
             for page in sample.get("pages", []):
                 html = page.pop("html", None)
                 if html is not None:
@@ -281,7 +376,7 @@ class ProjectStore(PromptAuditMixin):
             value["documents"][document_type] = expanded
         expanded_samples = []
         for sample in value.get("samples", []):
-            if "pages" in sample:
+            if "pages" in sample or "package" in sample:
                 expanded_samples.append(sample)
                 continue
             row = connection.execute(
@@ -290,6 +385,10 @@ class ProjectStore(PromptAuditMixin):
             ).fetchone()
             if row is None:
                 raise ConflictError("sample_revision_missing")
+            package_row = connection.execute(
+                "SELECT * FROM sample_packages WHERE revision_hash = ?",
+                (row["revision_hash"],),
+            ).fetchone()
             pages = connection.execute(
                 """
                 SELECT page_id, title, artifact_id, sha256, size_bytes, sanitizer_version
@@ -297,7 +396,7 @@ class ProjectStore(PromptAuditMixin):
                 """,
                 (row["revision_hash"],),
             ).fetchall()
-            expanded_samples.append({
+            expanded = {
                 "sample_id": row["sample_id"],
                 "revision": row["revision"],
                 "revision_hash": row["revision_hash"],
@@ -314,11 +413,70 @@ class ProjectStore(PromptAuditMixin):
                 "status": sample.get("status", row["status"]),
                 "created_at": row["created_at"],
                 "provenance": json.loads(row["provenance_json"]),
-            })
+            }
+            if package_row is not None:
+                package_files = connection.execute(
+                    """
+                    SELECT f.logical_path, f.artifact_id, a.sha256, f.size_bytes,
+                           f.media_type, f.origin
+                    FROM sample_package_files f
+                    JOIN artifacts a ON a.artifact_id = f.artifact_id
+                    WHERE f.revision_hash = ? ORDER BY f.file_index
+                    """,
+                    (row["revision_hash"],),
+                ).fetchall()
+                expanded["package"] = {
+                    "entrypoint": package_row["entrypoint"],
+                    "title": package_row["title"],
+                    "slide_count": package_row["slide_count"],
+                    "slides": json.loads(package_row["slides_json"]),
+                    "package_hash": package_row["package_hash"],
+                    "files": [{
+                        "path": item["logical_path"],
+                        "artifact_id": item["artifact_id"],
+                        "sha256": item["sha256"],
+                        "size": item["size_bytes"],
+                        "media_type": item["media_type"],
+                        "origin": item["origin"],
+                    } for item in package_files],
+                }
+            expanded_samples.append(expanded)
         value["samples"] = expanded_samples
         samples = value.get("samples", [])
-        targets = (samples[-1:] if latest_sample_only else samples) if include_sample_html else []
+        current_hash = value.get("current_sample_revision_hash")
+        if not current_hash and samples:
+            current_hash = samples[-1]["revision_hash"]
+            value["current_sample_revision_hash"] = current_hash
+        selected = [item for item in samples if item.get("revision_hash") == current_hash]
+        targets = (selected if latest_sample_only else samples) if include_sample_html else []
         for sample in targets:
+            package = sample.get("package")
+            if package:
+                for item in package.get("files", []):
+                    artifact_id = str(item.get("artifact_id", ""))
+                    row = connection.execute(
+                        "SELECT sha256, size_bytes, relative_path FROM artifacts WHERE artifact_id = ?",
+                        (artifact_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise ConflictError("package_artifact_missing")
+                    path = (self.root / row["relative_path"]).resolve()
+                    if not path.is_relative_to(self.package_artifacts_root.resolve()) or not path.is_file():
+                        raise ConflictError("package_artifact_missing")
+                    content = path.read_bytes()
+                    checksum = "sha256:" + hashlib.sha256(content).hexdigest()
+                    if checksum != row["sha256"] or len(content) != row["size_bytes"]:
+                        raise ConflictError("artifact_corrupt")
+                    if Path(item["path"]).suffix.lower() not in TEXT_SUFFIXES:
+                        item["content"] = base64.b64encode(content).decode("ascii")
+                        item["encoding"] = "base64"
+                    else:
+                        try:
+                            item["content"] = content.decode("utf-8")
+                            item["encoding"] = "utf-8"
+                        except UnicodeDecodeError:
+                            item["content"] = base64.b64encode(content).decode("ascii")
+                            item["encoding"] = "base64"
             for page in sample.get("pages", []):
                 artifact_id = str(page.get("artifact_id", ""))
                 if not ARTIFACT_ID.fullmatch(artifact_id):
@@ -422,6 +580,38 @@ class ProjectStore(PromptAuditMixin):
                         page["sanitizer_version"],
                     ),
                 )
+            package = sample.get("package")
+            if package:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO sample_packages(
+                        revision_hash, package_hash, entrypoint, title,
+                        slide_count, slides_json
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sample["revision_hash"], package["package_hash"],
+                        package["entrypoint"], package["title"], package["slide_count"],
+                        json_text(package.get("slides", [])),
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM sample_package_files WHERE revision_hash = ?",
+                    (sample["revision_hash"],),
+                )
+                for index, item in enumerate(package.get("files", [])):
+                    connection.execute(
+                        """
+                        INSERT INTO sample_package_files(
+                            revision_hash, file_index, logical_path, artifact_id,
+                            media_type, size_bytes, origin
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sample["revision_hash"], index, item["path"], item["artifact_id"],
+                            item["media_type"], item["size"], item.get("origin", "model_output"),
+                        ),
+                    )
 
     @staticmethod
     def _sync_branches(connection: sqlite3.Connection, payload: dict[str, Any]) -> None:
@@ -516,6 +706,7 @@ class ProjectStore(PromptAuditMixin):
                 "question_card": None,
                 "documents": {"narrative_structure": [], "slide_outline": []},
                 "samples": [],
+                "current_sample_revision_hash": None,
                 "checkpoint_id": checkpoint,
                 "active_job_id": None,
                 "created_at": created_at,
@@ -632,12 +823,25 @@ class ProjectStore(PromptAuditMixin):
                 ),
             )
 
-    def events(self) -> list[dict[str, Any]]:
+    def events(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         self._ensure_database()
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT at, event, checkpoint_id, details_json FROM events ORDER BY event_id"
-            ).fetchall()
+            if limit is None:
+                rows = connection.execute(
+                    "SELECT at, event, checkpoint_id, details_json FROM events ORDER BY event_id"
+                ).fetchall()
+            else:
+                if limit < 1 or limit > 2000:
+                    raise ValueError("event limit out of range")
+                rows = connection.execute(
+                    """
+                    SELECT at, event, checkpoint_id, details_json FROM (
+                        SELECT event_id, at, event, checkpoint_id, details_json
+                        FROM events ORDER BY event_id DESC LIMIT ?
+                    ) ORDER BY event_id
+                    """,
+                    (limit,),
+                ).fetchall()
         return [
             {
                 "at": row["at"], "event": row["event"], "checkpoint_id": row["checkpoint_id"],
@@ -700,7 +904,11 @@ class ProjectStore(PromptAuditMixin):
 
         active_index = STAGE_IDS.index(manifest["state"])
         outline = self._latest_document(manifest, "slide_outline")
-        sample = (manifest.get("samples") or [None])[-1]
+        current_hash = manifest.get("current_sample_revision_hash")
+        sample = next(
+            (item for item in manifest.get("samples", []) if item.get("revision_hash") == current_hash),
+            (manifest.get("samples") or [None])[-1],
+        )
         if sample and sample.get("status") == "approved":
             completed_through = 4
         elif outline and outline.get("status") == "approved":
@@ -741,7 +949,13 @@ class ProjectStore(PromptAuditMixin):
                 item for item in lineage
                 if item.get("state") == "ppt_sample"
                 and item.get("phase") == "completed"
-                and ((item.get("samples") or [None])[-1] or {}).get("status") == "approved"
+                and next(
+                    (
+                        sample for sample in item.get("samples", [])
+                        if sample.get("revision_hash") == item.get("current_sample_revision_hash")
+                    ),
+                    (item.get("samples") or [None])[-1],
+                ).get("status") == "approved"
             ]
             return matches[-1] if matches else None
 
@@ -754,11 +968,27 @@ class ProjectStore(PromptAuditMixin):
                 continue
             public_snapshot = deepcopy(snapshot)
             if public_snapshot.get("samples"):
-                current_sample = deepcopy(public_snapshot["samples"][-1])
+                snapshot_hash = public_snapshot.get("current_sample_revision_hash")
+                current_sample = deepcopy(next(
+                    (
+                        item for item in public_snapshot["samples"]
+                        if item.get("revision_hash") == snapshot_hash
+                    ),
+                    public_snapshot["samples"][-1],
+                ))
                 current_sample["pages"] = [
                     {"page_id": page["page_id"], "title": page["title"]}
                     for page in current_sample.get("pages", [])
                 ]
+                if current_sample.get("package"):
+                    current_sample["package"]["files"] = [
+                        {
+                            key: item[key] for key in (
+                                "path", "artifact_id", "sha256", "size", "media_type", "origin"
+                            ) if key in item
+                        }
+                        for item in current_sample["package"].get("files", [])
+                    ]
                 public_snapshot["samples"] = [current_sample]
             response.append({
                 "checkpoint_id": snapshot["checkpoint_id"],
@@ -785,6 +1015,7 @@ class ProjectStore(PromptAuditMixin):
                 state="intake", phase="ready_for_clarification", question_card=None,
                 clarification_answers={}, documents={"narrative_structure": [], "slide_outline": []},
                 samples=[],
+                current_sample_revision_hash=None,
             )
         elif stage == "narrative_structure":
             if not value.get("clarification_answers"):
@@ -792,6 +1023,7 @@ class ProjectStore(PromptAuditMixin):
             value.update(
                 state="narrative_structure", phase="ready_to_generate",
                 documents={"narrative_structure": [], "slide_outline": []}, samples=[],
+                current_sample_revision_hash=None,
             )
         elif stage == "slide_outline":
             narrative = self._latest_document(value, "narrative_structure")
@@ -799,12 +1031,14 @@ class ProjectStore(PromptAuditMixin):
                 raise ValueError("outline rerun requires an approved narrative")
             value["documents"]["slide_outline"] = []
             value["samples"] = []
+            value["current_sample_revision_hash"] = None
             value.update(state="slide_outline", phase="ready_to_generate")
         else:
             outline = self._latest_document(value, "slide_outline")
             if not outline or outline.get("status") != "approved":
                 raise ValueError("sample rerun requires an approved outline")
             value["samples"] = []
+            value["current_sample_revision_hash"] = None
             value.update(state="ppt_sample", phase="ready_to_generate")
         return value
 
@@ -857,6 +1091,7 @@ class ProjectStore(PromptAuditMixin):
                     if source_index is None:
                         raise FileNotFoundError(sample_revision_hash)
                     snapshot["samples"] = snapshot["samples"][: source_index + 1]
+                    snapshot["current_sample_revision_hash"] = sample_revision_hash
                     snapshot.update(state="ppt_sample", phase="waiting_human_approval")
                 branches = current.get("branches", {current.get("branch", "main"): current["checkpoint_id"]})
                 if name in branches:
@@ -953,7 +1188,9 @@ class ProjectStore(PromptAuditMixin):
                 latest_sample_only=True, include_sample_html=False,
             )
             samples = manifest.get("samples", [])
-            current_hash = samples[-1]["revision_hash"] if samples else None
+            current_hash = manifest.get("current_sample_revision_hash")
+            if current_hash is None and samples:
+                current_hash = samples[-1]["revision_hash"]
             result = []
             for sample in reversed(samples):
                 row = connection.execute(
@@ -974,8 +1211,91 @@ class ProjectStore(PromptAuditMixin):
                         {"page_id": page["page_id"], "title": page["title"]}
                         for page in sample.get("pages", [])
                     ],
+                    "package": {
+                        "package_hash": sample["package"]["package_hash"],
+                        "entrypoint": sample["package"]["entrypoint"],
+                        "title": sample["package"]["title"],
+                        "slide_count": sample["package"]["slide_count"],
+                        "slides": sample["package"].get("slides", []),
+                        "file_count": len(sample["package"].get("files", [])),
+                    } if sample.get("package") else None,
                 })
         return result
+
+    def select_sample_revision(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
+        if not REVISION_HASH.fullmatch(revision_hash):
+            raise ValueError("invalid revision hash")
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            selected = next(
+                (
+                    item for item in value.get("samples", [])
+                    if item.get("revision_hash") == revision_hash
+                ),
+                None,
+            )
+            if selected is None:
+                raise FileNotFoundError(revision_hash)
+            value["current_sample_revision_hash"] = revision_hash
+            value.update(
+                state="ppt_sample",
+                phase="completed" if selected.get("status") == "approved" else "waiting_human_approval",
+            )
+            return value
+
+        return self.update(
+            apply,
+            "sample_revision_selected",
+            {"revision_hash": revision_hash},
+            expected_checkpoint_id=checkpoint_id,
+        )
+
+    def sample_package_file(
+        self,
+        revision_hash: str,
+        logical_path: str,
+    ) -> tuple[Path, str]:
+        if not REVISION_HASH.fullmatch(revision_hash):
+            raise ValueError("invalid revision hash")
+        path = normalize_package_path(logical_path)
+        self._ensure_database()
+        with self._connect() as connection:
+            manifest = self._raw_current(connection)
+            if revision_hash not in {
+                item["revision_hash"] for item in manifest.get("samples", [])
+            }:
+                raise FileNotFoundError(revision_hash)
+            row = connection.execute(
+                """
+                SELECT a.relative_path, a.sha256, a.size_bytes, f.media_type
+                FROM sample_package_files f
+                JOIN artifacts a ON a.artifact_id = f.artifact_id
+                WHERE f.revision_hash = ? AND f.logical_path = ?
+                """,
+                (revision_hash, path),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(path)
+        artifact_path = (self.root / row["relative_path"]).resolve()
+        if not artifact_path.is_relative_to(self.package_artifacts_root.resolve()) or not artifact_path.is_file():
+            raise ConflictError("package_artifact_missing")
+        content = artifact_path.read_bytes()
+        if (
+            "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
+            or len(content) != row["size_bytes"]
+        ):
+            raise ConflictError("artifact_corrupt")
+        return artifact_path, row["media_type"]
+
+    def sample_package_files(self, revision_hash: str) -> list[tuple[str, Path]]:
+        sample = self.sample_revision(revision_hash)
+        package = sample.get("package")
+        if not package:
+            raise FileNotFoundError(revision_hash)
+        return [
+            (item["path"], self.sample_package_file(revision_hash, item["path"])[0])
+            for item in package.get("files", [])
+        ]
 
     def sample_revision(self, revision_hash: str) -> dict[str, Any]:
         if not REVISION_HASH.fullmatch(revision_hash):

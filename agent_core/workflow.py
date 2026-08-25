@@ -8,10 +8,17 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from agent_core.models import DocumentRevision, Question, QuestionCard, SampleOutput, SamplePage, SampleRevision, TaskCard
-from agent_core.sample_html import SampleHtmlError
+from agent_core.models import (
+    DocumentRevision,
+    HtmlPptPackage,
+    Question,
+    QuestionCard,
+    SampleRevision,
+    TaskCard,
+)
 from configs.runtime import ManagedRuntime
 from model_router.client import ModelGateway, ModelOutputError, SYSTEM_MESSAGE
+from runtime.package_tool import DraftPackage, PackageToolError
 from runtime.read_tool import SkillReader
 from storage.project_store import ConflictError, ProjectStore
 
@@ -35,34 +42,6 @@ class SampleGenerationError(WorkflowError):
         self.repair_reason = repair_reason
 
 
-def _sample_validation_error(exc: ValidationError) -> SampleGenerationError:
-    reasons: list[str] = []
-    allowlist_failure = False
-    for error in exc.errors(include_url=False):
-        location = ".".join(str(part) for part in error["loc"])
-        validation_error = error.get("ctx", {}).get("error")
-        sanitizer_error = getattr(validation_error, "__cause__", None)
-        if isinstance(sanitizer_error, SampleHtmlError):
-            allowlist_failure = True
-            message = str(sanitizer_error)
-        else:
-            message = error["msg"].removeprefix("Value error, ")
-        message = " ".join(message.split())[:180]
-        reasons.append(f"{location}: {message}" if location else message)
-    detail = "；".join(reasons[:4]) or "样品结构未通过校验"
-    if allowlist_failure:
-        return SampleGenerationError(
-            "sample_html_rejected",
-            "样品含有不支持的内容，自动修复后仍未通过，请重试。",
-            f"安全净化拒绝：{detail}",
-        )
-    return SampleGenerationError(
-        "sample_output_invalid",
-        "样品格式不正确，自动修复后仍未成功，请重试。",
-        f"输出契约校验失败：{detail}",
-    )
-
-
 def _parse_sample_output(text: str) -> dict[str, Any]:
     try:
         return ModelGateway.parse_json(text)
@@ -80,22 +59,45 @@ def _parse_sample_output(text: str) -> dict[str, Any]:
         ) from exc
 
 
-def _validate_sample_output(payload: dict[str, Any], page_count: int) -> SampleOutput:
+def _validate_package_output(
+    payload: dict[str, Any],
+    draft: DraftPackage,
+    slide_count: int,
+) -> HtmlPptPackage:
+    embedded = payload.pop("files", [])
+    if embedded:
+        if not isinstance(embedded, list):
+            raise SampleGenerationError(
+                "sample_package_invalid",
+                "HTML-PPT 包格式不正确，自动修复后仍未成功，请重试。",
+                "files 必须是文件对象数组。",
+            )
+        try:
+            draft.ingest(embedded)
+        except PackageToolError as exc:
+            raise SampleGenerationError(
+                "sample_package_invalid",
+                "HTML-PPT 包含无效文件，自动修复后仍未成功，请重试。",
+                f"包文件校验失败：{exc}",
+            ) from exc
     try:
-        output = SampleOutput.model_validate(payload)
+        output = HtmlPptPackage.model_validate({**payload, "files": draft.payload()})
     except ValidationError as exc:
-        raise _sample_validation_error(exc) from exc
-    if len(output.pages) != page_count:
+        reasons = []
+        for error in exc.errors(include_url=False):
+            location = ".".join(str(part) for part in error["loc"])
+            message = " ".join(error["msg"].removeprefix("Value error, ").split())[:180]
+            reasons.append(f"{location}: {message}" if location else message)
         raise SampleGenerationError(
-            "sample_output_invalid",
-            "样品页数不正确，自动修复后仍未成功，请重试。",
-            f"pages 必须恰好包含 {page_count} 页，实际为 {len(output.pages)} 页。",
-        )
-    if len({page.page_id for page in output.pages}) != len(output.pages):
+            "sample_package_invalid",
+            "HTML-PPT 包格式不正确，自动修复后仍未成功，请重试。",
+            "包契约校验失败：" + ("；".join(reasons[:4]) or "未知错误"),
+        ) from exc
+    if output.slide_count != slide_count:
         raise SampleGenerationError(
-            "sample_output_invalid",
-            "样品格式不正确，自动修复后仍未成功，请重试。",
-            "每个 page_id 必须唯一。",
+            "sample_package_invalid",
+            "HTML-PPT 页数不正确，自动修复后仍未成功，请重试。",
+            f"slide_count 必须为 {slide_count}，实际为 {output.slide_count}。",
         )
     return output
 
@@ -156,7 +158,11 @@ def capabilities(manifest: dict[str, Any]) -> list[str]:
         caps.append("edit_narrative")
     if manifest.get("documents", {}).get("slide_outline") and "edit_outline" not in caps:
         caps.append("edit_outline")
-    current_sample = (manifest.get("samples") or [None])[-1]
+    current_hash = manifest.get("current_sample_revision_hash")
+    current_sample = next(
+        (item for item in manifest.get("samples", []) if item.get("revision_hash") == current_hash),
+        (manifest.get("samples") or [None])[-1],
+    )
     if current_sample and current_sample.get("status") != "stale":
         for capability in ("revise_sample", "regenerate_sample"):
             if capability not in caps:
@@ -549,22 +555,32 @@ class Workflow:
         if not outline or outline["status"] != "approved":
             raise ConflictError("approved outline required")
         history = manifest.get("samples", [])
-        current = history[-1] if history else None
+        current_hash = manifest.get("current_sample_revision_hash")
+        current = next(
+            (item for item in history if item.get("revision_hash") == current_hash),
+            history[-1] if history else None,
+        )
         if normalized_feedback and not current:
             raise WorkflowError("sample not found")
 
         page_count = self.runtime.policy.sample_page_count
         skill_index = SkillReader(self.runtime.skills_root, per_call=1000, per_job=1000).index()
         template, template_hash = self._template("ppt_sample.md")
-        previous = json.dumps((current or {}).get("pages", []), ensure_ascii=False)
+        previous_package = (current or {}).get("package") or {}
+        previous = {
+            "entrypoint": previous_package.get("entrypoint"),
+            "title": previous_package.get("title"),
+            "slide_count": previous_package.get("slide_count"),
+            "slides": previous_package.get("slides", []),
+            "files": [item.get("path") for item in previous_package.get("files", [])],
+        } if current else None
         prompt = (
             template
             + f"\n\nSAMPLE_PAGE_COUNT: {page_count}\n"
             + f"SAMPLE_HTML_CHAR_BUDGET_PER_PAGE: {SAMPLE_HTML_CHAR_BUDGET}\n"
-            + "Keep every page within that character budget so the complete JSON fits the model output budget.\n"
             + f"Task card:\n{json.dumps(manifest['task_card'], ensure_ascii=False)}\n"
             + f"Approved slide outline:\n{outline['markdown_body']}\n"
-            + f"Previous sample pages:\n{previous if current else 'none'}\n"
+            + f"Previous HTML-PPT package manifest:\n{json.dumps(previous, ensure_ascii=False) if current else 'none'}\n"
             + f"Revision feedback:\n{normalized_feedback or 'none'}\n"
             + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
         )
@@ -574,7 +590,12 @@ class Workflow:
         current_prompt = prompt
         parent_prompt_call_id: str | None = None
         successful_prompt_call_id: str | None = None
+        package_output: HtmlPptPackage | None = None
+        successful_draft: DraftPackage | None = None
         for attempt in range(SAMPLE_MAX_REPAIR_ATTEMPTS + 1):
+            draft = DraftPackage(self.runtime.skills_root)
+            if current and current.get("package"):
+                draft.ingest(current["package"].get("files", []))
             prompt_call_id = self._start_prompt_audit(
                 "ppt_sample",
                 current_prompt,
@@ -587,20 +608,39 @@ class Workflow:
             prompt_call_ids.append(prompt_call_id)
             attempt_traces: list[dict[str, Any]] = []
             try:
-                text, attempt_traces = self.gateway.generate("ppt_sample", current_prompt, json_mode=True)
+                try:
+                    text, attempt_traces = self.gateway.generate(
+                        "ppt_sample", current_prompt, json_mode=True, package_draft=draft,
+                    )
+                except TypeError as exc:
+                    # Keep custom/legacy gateway adapters usable while the built-in
+                    # gateway exposes the isolated package draft capability.
+                    if "package_draft" not in str(exc):
+                        raise
+                    text, attempt_traces = self.gateway.generate(
+                        "ppt_sample", current_prompt, json_mode=True,
+                    )
             except Exception as exc:
                 self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
                 raise
             traces.extend(attempt_traces)
             try:
                 payload = _parse_sample_output(text)
-                self.store.save_generated_html_attempt(prompt_call_id, payload)
-                output = _validate_sample_output(payload, page_count)
+                if "pages" in payload:
+                    raise SampleGenerationError(
+                        "sample_package_invalid",
+                        "HTML-PPT 包格式不正确，自动修复后仍未成功，请重试。",
+                        "新样品必须返回带 index.html 的 HTML-PPT 包，不能返回旧版 pages 数组。",
+                    )
+                package_output = _validate_package_output(payload, draft, page_count)
+                self.store.save_generated_package_attempt(prompt_call_id, draft.payload())
                 repair_attempts = attempt
                 successful_prompt_call_id = prompt_call_id
+                successful_draft = draft
                 break
             except SampleGenerationError as exc:
                 self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
+                self.store.save_generated_package_attempt(prompt_call_id, draft.payload())
                 if attempt == SAMPLE_MAX_REPAIR_ATTEMPTS:
                     raise
                 parent_prompt_call_id = prompt_call_id
@@ -614,13 +654,14 @@ class Workflow:
             except Exception as exc:
                 self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
                 raise
-        serialized = json.dumps([page.model_dump() for page in output.pages], ensure_ascii=False, sort_keys=True)
-        sample = SampleRevision.create(
-            output.pages,
-            revision=len(history) + 1,
-            parent=current["revision_hash"] if current else None,
-            feedback=normalized_feedback,
-            provenance={
+        next_revision = max((item["revision"] for item in history), default=0) + 1
+        if package_output is None:
+            raise WorkflowError("sample package was not produced")
+        artifact_payload: Any = package_output.model_dump(
+            exclude={"files": {"__all__": {"content"}}}
+        )
+        serialized = json.dumps(artifact_payload, ensure_ascii=False, sort_keys=True)
+        provenance = {
                 **generation_provenance(skill_index, traces, serialized),
                 "upstream_revision_hash": outline["revision_hash"],
                 "model_config_hash": self.runtime.model_hash,
@@ -634,12 +675,22 @@ class Workflow:
                 "prompt_call_id": successful_prompt_call_id,
                 "prompt_call_ids": prompt_call_ids,
                 "traces": traces,
-            },
+            }
+        provenance["package_hash"] = package_output.package_hash
+        provenance["package_file_count"] = len(package_output.files)
+        provenance["package_total_bytes"] = successful_draft.total_bytes if successful_draft else 0
+        sample = SampleRevision.create_package(
+            package_output,
+            revision=next_revision,
+            parent=current["revision_hash"] if current else None,
+            feedback=normalized_feedback,
+            provenance=provenance,
         )
         if successful_prompt_call_id is None:
             raise WorkflowError("sample prompt audit is incomplete")
         def apply(value: dict[str, Any]) -> dict[str, Any]:
             value.setdefault("samples", []).append(sample.model_dump())
+            value["current_sample_revision_hash"] = sample.revision_hash
             value.update(state="ppt_sample", phase="waiting_human_approval")
             return value
 
@@ -648,7 +699,10 @@ class Workflow:
             lambda: self.store.update(
                 apply,
                 "sample_revised" if normalized_feedback else "sample_generated",
-                {"revision_hash": sample.revision_hash, "page_count": len(sample.pages)},
+                {
+                    "revision_hash": sample.revision_hash,
+                    "slide_count": package_output.slide_count,
+                },
                 expected_checkpoint_id=checkpoint_id,
             ),
             traces=attempt_traces,
@@ -658,64 +712,33 @@ class Workflow:
         )
 
     def restore_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
-        """Copy a reachable historical sample into a new current revision."""
+        """Move the current sample pointer without creating a new revision."""
 
-        manifest = self.store.read()
+        manifest = self.store.read(include_sample_html=False)
         self._require(manifest, "revise_sample", checkpoint_id)
-        history = manifest.get("samples", [])
-        source = next(
-            (item for item in history if item["revision_hash"] == revision_hash),
-            None,
-        )
-        if source is None:
+        if revision_hash not in {
+            item.get("revision_hash") for item in manifest.get("samples", [])
+        }:
             raise FileNotFoundError(revision_hash)
-        current = history[-1]
-        pages = [
-            SamplePage.model_validate({
-                "page_id": page["page_id"],
-                "title": page["title"],
-                "html": page["html"],
-            })
-            for page in source["pages"]
-        ]
-        outline = self._current(manifest, "slide_outline")
-        sample = SampleRevision.create(
-            pages,
-            revision=current["revision"] + 1,
-            parent=current["revision_hash"],
-            feedback=None,
-            provenance={
-                "restored_from_revision_hash": source["revision_hash"],
-                "source_provenance_hash": stable_hash(source.get("provenance", {})),
-                "upstream_revision_hash": outline["revision_hash"] if outline else None,
-            },
-        )
-
-        def apply(value: dict[str, Any]) -> dict[str, Any]:
-            value.setdefault("samples", []).append(sample.model_dump())
-            value.update(state="ppt_sample", phase="waiting_human_approval")
-            return value
-
-        return self.store.update(
-            apply,
-            "sample_restored",
-            {
-                "revision_hash": sample.revision_hash,
-                "restored_from_revision_hash": source["revision_hash"],
-                "page_count": len(sample.pages),
-            },
-            expected_checkpoint_id=checkpoint_id,
-        )
+        return self.store.select_sample_revision(checkpoint_id, revision_hash)
 
     def approve_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
         manifest = self.store.read()
         self._require(manifest, "approve_sample", checkpoint_id)
-        current = (manifest.get("samples") or [None])[-1]
+        current_hash = manifest.get("current_sample_revision_hash")
+        current = next(
+            (item for item in manifest.get("samples", []) if item.get("revision_hash") == current_hash),
+            (manifest.get("samples") or [None])[-1],
+        )
         if not current or current["revision_hash"] != revision_hash:
             raise ConflictError("stale_revision")
 
         def apply(value: dict[str, Any]) -> dict[str, Any]:
-            value["samples"][-1]["status"] = "approved"
+            for item in value["samples"]:
+                if item["revision_hash"] == revision_hash:
+                    item["status"] = "approved"
+                    break
+            value["current_sample_revision_hash"] = revision_hash
             value.update(state="ppt_sample", phase="completed")
             return value
 

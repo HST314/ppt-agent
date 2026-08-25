@@ -89,6 +89,25 @@ CREATE TABLE IF NOT EXISTS sample_pages (
     sanitizer_version TEXT NOT NULL,
     PRIMARY KEY (revision_hash, page_index)
 );
+CREATE TABLE IF NOT EXISTS sample_packages (
+    revision_hash TEXT PRIMARY KEY REFERENCES sample_revisions(revision_hash) ON DELETE CASCADE,
+    package_hash TEXT NOT NULL,
+    entrypoint TEXT NOT NULL,
+    title TEXT NOT NULL,
+    slide_count INTEGER NOT NULL,
+    slides_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sample_package_files (
+    revision_hash TEXT NOT NULL REFERENCES sample_packages(revision_hash) ON DELETE CASCADE,
+    file_index INTEGER NOT NULL,
+    logical_path TEXT NOT NULL,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    origin TEXT NOT NULL,
+    PRIMARY KEY (revision_hash, logical_path),
+    UNIQUE (revision_hash, file_index)
+);
 CREATE TABLE IF NOT EXISTS prompt_calls (
     prompt_call_id TEXT PRIMARY KEY,
     parent_prompt_call_id TEXT,

@@ -282,6 +282,42 @@ class JobRegistry:
             ).fetchone()
         return self._record(row) if row else None
 
+    def list_for_project(self, project_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 500:
+            raise ValueError("job limit out of range")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM jobs WHERE project_id = ?
+                ORDER BY created_at DESC, job_id DESC LIMIT ?
+                """,
+                (project_id, limit),
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
+    def events_for_project(self, project_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 2000:
+            raise ValueError("job event limit out of range")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.event_id, e.job_id, e.at, e.status, e.operation, e.error_json
+                FROM job_events e
+                JOIN jobs j ON j.job_id = e.job_id
+                WHERE j.project_id = ?
+                ORDER BY e.event_id DESC LIMIT ?
+                """,
+                (project_id, limit),
+            ).fetchall()
+        return [{
+            "event_id": row["event_id"],
+            "job_id": row["job_id"],
+            "at": row["at"],
+            "status": row["status"],
+            "operation": row["operation"],
+            "error": json.loads(row["error_json"]) if row["error_json"] else None,
+        } for row in rows]
+
     def cancel(self, job_id: str) -> dict[str, Any]:
         record = self.get(job_id)
         if record["status"] not in {"queued", "running"}:

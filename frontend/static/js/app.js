@@ -1,6 +1,6 @@
 import { api } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
-import { hydrateSampleFrame as hydrateFrame, readySampleBody, sampleBody, selectSamplePage as selectPage } from "./samples.js";
+import { hydrateSampleFrame as hydrateFrame, readySampleBody, sampleBody } from "./samples.js";
 
 const icons = {
   file: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 13h6M9 17h5"/></svg>',
@@ -51,7 +51,7 @@ const EVENT_LABELS = {
   sample_stage_started: "进入样品阶段",
   sample_generated: "生成 PPT 样品",
   sample_revised: "根据意见修改样品",
-  sample_restored: "恢复样品修订",
+  sample_revision_selected: "切换当前样品版本",
   sample_approved: "确认 PPT 样品",
   branch_created: "创建分支",
   branch_switched: "切换分支",
@@ -59,7 +59,8 @@ const EVENT_LABELS = {
 
 const state = {
   projects: [], project: null, branches: null, runtime: null,
-  view: "workspace", busy: false, focusStage: null, samplePageIndex: 0, samplePreview: null,
+  view: "workspace", busy: false, focusStage: null,
+  statusFilter: "all", statusQuery: "", statusOrder: "newest", expandedEventId: null,
 };
 
 const content = document.querySelector("#content");
@@ -71,6 +72,8 @@ let editorContext = null;
 let sidebarPinned = false;
 let renderGeneration = 0;
 let trackedJobId = null;
+let statusPollTimer = null;
+let statusSearchTimer = null;
 
 const escapeHtml = (value = "") => String(value)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -87,6 +90,7 @@ const ERROR_MESSAGES = {
   sample_json_incomplete: "样品输出不完整，自动修复后仍未成功，请重试。",
   sample_html_rejected: "样品含有不支持的内容，自动修复后仍未通过，请重试。",
   sample_output_invalid: "样品格式不正确，自动修复后仍未成功，请重试。",
+  sample_package_invalid: "HTML-PPT 包格式不正确，自动修复后仍未成功，请重试。",
   invalid_model_output: "模型返回的内容格式不正确，请重试。",
   process_restarted: "服务已重启，请从上一成功点重试。",
   job_failed: "任务暂未完成，请重试。",
@@ -120,10 +124,6 @@ function setBusy(busy) {
 function currentDocument(type) {
   const history = state.project?.documents?.[type] || [];
   return history.at(-1) || null;
-}
-
-function currentSample() {
-  return state.samplePreview || headSample();
 }
 
 function headSample() {
@@ -260,25 +260,17 @@ function readySampleView() {
 }
 
 function hydrateSampleFrame() {
-  hydrateFrame(content, currentSample(), state.samplePageIndex);
-}
-
-function selectSamplePage(index) {
-  const sample = currentSample();
-  if (selectPage(content, sample, index)) state.samplePageIndex = index;
+  hydrateFrame(content, headSample());
 }
 
 function sampleView() {
-  const sample = currentSample();
+  const sample = headSample();
   if (!sample) return readySampleView();
-  const current = headSample();
-  const view = sampleBody(sample, state.samplePageIndex, escapeHtml, {
+  const view = sampleBody(sample, escapeHtml, {
     history: state.project.sample_revisions || [],
     selectedHash: sample.revision_hash,
-    isCurrent: sample.revision_hash === current?.revision_hash,
   });
-  state.samplePageIndex = view.pageIndex;
-  return stagePanel("PPT 样品", "在大画框中检查代表性页面，再用自然语言让 AI 调整", view.body, view.status);
+  return stagePanel("HTML-PPT", "在通用安全预览器中检查完整文件包，再用自然语言让 AI 调整", view.body, view.status);
 }
 
 function loadingPanel(message) {
@@ -290,7 +282,7 @@ function workspaceMarkup() {
   let stage;
   if (state.focusStage === "narrative_structure" && currentDocument("narrative_structure")) stage = documentView("narrative_structure");
   else if (state.focusStage === "slide_outline" && currentDocument("slide_outline")) stage = documentView("slide_outline");
-  else if (state.focusStage === "ppt_sample" && currentSample()) stage = sampleView();
+  else if (state.focusStage === "ppt_sample" && headSample()) stage = sampleView();
   else if (state.project.active_job) stage = loadingPanel(`正在${jobLabel(state.project.active_job.operation)}…`);
   else if (state.project.state === "intake") stage = intakeView();
   else if (state.project.state === "intake_clarify") stage = clarificationView();
@@ -350,10 +342,81 @@ function readSettingsForm(form) {
 async function statusMarkup() {
   if (!state.project) return { markup: '<div class="empty-state"><span class="empty-state__icon">' + icons.file + '</span><h2>尚未打开工程</h2><p>从左侧目录打开一个工程后，这里会显示运行状态、分支和事件记录。</p></div>', branches: null };
   const p = state.project;
-  const [events, branches] = await Promise.all([api.timeline(p.project_id), api.branches(p.project_id)]);
-  const job = p.active_job;
-  const timeline = events.slice().reverse().map((event) => `<li><time>${escapeHtml(formatDate(event.at))}</time><div><strong>${escapeHtml(EVENT_LABELS[event.event] || "记录进度")}</strong><div class="code">${escapeHtml(event.checkpoint_id)}</div></div></li>`).join("") || "<li>暂无事件</li>";
-  return { markup: `<div class="page-head"><div><p class="eyebrow">Project status</p><h1>${escapeHtml(p.title)}</h1><p class="lede">集中查看 Agent 状态、工程信息、分支与真实事件记录。</p></div><span class="badge ${job ? "badge--info" : "badge--success"}">${job ? "运行中" : "已同步"}</span></div><section class="panel section ia-section"><div class="section__head"><div><h2>Agent 运行状态</h2><p>来自后台任务与当前检查点。</p></div></div><div class="metric-grid"><div class="metric"><span>当前阶段</span><strong>${escapeHtml(STATE_LABELS[p.state] || p.state)}</strong></div><div class="metric"><span>当前分支</span><strong>${escapeHtml(branches.current)}</strong></div><div class="metric"><span>分支数量</span><strong>${branches.items.length}</strong></div></div>${job ? `<div class="job-progress"><span class="spinner"></span>正在${escapeHtml(jobLabel(job.operation))}…</div>` : ""}</section><div class="status-grid"><section class="panel section ia-section"><div class="section__head"><div><h2>事件日志</h2><p>所有修改、确认和分支操作均保留记录。</p></div></div><ol class="timeline">${timeline}</ol></section><div class="status-side"><section class="panel section ia-section"><div class="section__head"><div><h2>工程信息</h2></div></div><div class="task-summary" style="grid-template-columns:1fr"><div class="summary-item"><span>工程 ID</span><strong>${escapeHtml(p.project_id)}</strong></div><div class="summary-item"><span>当前阶段</span><strong>${escapeHtml(PHASE_LABELS[p.phase] || p.phase)}</strong></div><div class="summary-item"><span>当前检查点</span><strong class="code">${escapeHtml(p.checkpoint_id)}</strong></div></div></section><section class="panel section ia-section"><div class="section__head"><div><h2>原始任务</h2></div></div>${taskSummary(p.task_card)}</section></div></div>`, branches };
+  const [activity, branches] = await Promise.all([api.activity(p.project_id), api.branches(p.project_id)]);
+  const summary = activity.summary;
+  const job = summary.active_job;
+  const counts = activity.events.reduce((result, event) => {
+    result[event.kind] = (result[event.kind] || 0) + 1;
+    return result;
+  }, {});
+  const query = state.statusQuery.trim().toLocaleLowerCase();
+  let filtered = activity.events.filter((event) => {
+    if (state.statusFilter !== "all" && event.kind !== state.statusFilter) return false;
+    if (!query) return true;
+    return JSON.stringify([event.title, event.summary, event.details]).toLocaleLowerCase().includes(query);
+  });
+  filtered.sort((a, b) => state.statusOrder === "oldest"
+    ? String(a.at).localeCompare(String(b.at))
+    : String(b.at).localeCompare(String(a.at)));
+  const failures = activity.events.filter((event) => event.kind === "error").slice(0, 3);
+  const kindLabels = { all: "全部", job: "任务", model: "模型", skill: "Skill", validation: "校验", artifact: "产物", project: "工程", error: "失败" };
+  const filters = Object.entries(kindLabels).map(([kind, label]) => `<button class="status-filter${state.statusFilter === kind ? " is-active" : ""}" type="button" data-status-filter="${kind}" aria-pressed="${state.statusFilter === kind}">${label}<span>${kind === "all" ? activity.events.length : counts[kind] || 0}</span></button>`).join("");
+  const duration = job?.started_at ? Math.max(0, Math.floor((Date.now() - new Date(job.started_at).getTime()) / 1000)) : null;
+  const elapsed = duration === null ? "—" : duration < 60 ? `${duration}s` : `${Math.floor(duration / 60)}m ${duration % 60}s`;
+  const density = activity.events.slice(0, 64).reverse().map((event) => `<span class="event-density__mark is-${escapeHtml(event.kind)}" title="${escapeHtml(`${kindLabels[event.kind] || event.kind} · ${formatDate(event.at)}`)}"></span>`).join("") || '<span class="event-density__empty">暂无事件</span>';
+
+  const eventMarkup = (event, pinned = false) => {
+    const expanded = state.expandedEventId === event.id;
+    const title = EVENT_LABELS[event.title]
+      || MODEL_STATE_LABELS[event.title]
+      || (event.kind === "job" || event.kind === "error" ? jobLabel(event.title) : event.title);
+    return `<article class="activity-event is-${escapeHtml(event.kind)}${pinned ? " is-pinned" : ""}"><button class="activity-event__summary" type="button" data-event-expand="${escapeHtml(event.id)}" aria-expanded="${expanded}"><span class="activity-event__dot" aria-hidden="true"></span><span class="activity-event__main"><span class="activity-event__line"><strong>${escapeHtml(title)}</strong><span class="badge">${escapeHtml(kindLabels[event.kind] || event.kind)}</span>${pinned ? '<span class="badge badge--danger">固定可见</span>' : ""}</span><span>${escapeHtml(event.summary || "无摘要")}</span></span><time datetime="${escapeHtml(event.at)}">${escapeHtml(formatDate(event.at))}</time><span class="activity-event__chevron" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></svg></span></button>${expanded ? `<div class="activity-event__detail"><pre>${escapeHtml(JSON.stringify(event.details, null, 2))}</pre><button class="btn btn--secondary" type="button" data-copy-event="${escapeHtml(event.id)}">复制详情</button></div>` : ""}</article>`;
+  };
+  const errorTray = failures.length
+    ? `<section class="status-errors" aria-labelledby="status-errors-title"><div><h2 id="status-errors-title">需要关注</h2><p>失败事件不受筛选与搜索影响，便于快速定位。</p></div><div class="activity-list">${failures.map((event) => eventMarkup(event, true)).join("")}</div></section>`
+    : "";
+  const eventsMarkup = filtered.length
+    ? filtered.map((event) => eventMarkup(event)).join("")
+    : `<div class="status-empty"><strong>没有匹配的事件</strong><p>尝试清空搜索词，或切换到“全部”类型。</p><button class="btn btn--secondary" type="button" data-status-reset>清除筛选</button></div>`;
+  const markup = `<div class="page-head"><div><p class="eyebrow">Agent observability</p><h1>${escapeHtml(p.title)}</h1><p class="lede">实时汇总后台任务、模型调用、Skill 读取、校验、产物保存和错误。</p></div><span class="badge ${job ? "badge--info" : "badge--success"}">${job ? "实时运行中" : "已同步"}</span></div><section class="panel section ia-section status-overview"><div class="metric-grid metric-grid--status"><div class="metric"><span>当前任务</span><strong>${escapeHtml(job ? jobLabel(job.operation) : "暂无运行任务")}</strong></div><div class="metric"><span>阶段 / 耗时</span><strong>${escapeHtml(STATE_LABELS[summary.stage] || summary.stage)} · ${elapsed}</strong></div><div class="metric"><span>模型</span><strong>${escapeHtml(summary.model || "尚未调用")}</strong><small>${escapeHtml(summary.provider || "")}</small></div><div class="metric"><span>事件 / 失败</span><strong>${summary.event_count} / ${summary.error_count}</strong></div></div>${job ? `<div class="job-progress" role="status"><span class="spinner" aria-hidden="true"></span><strong>正在${escapeHtml(jobLabel(job.operation))}</strong><span>状态台每 2 秒自动更新。</span></div>` : ""}<div class="event-density" aria-label="最近 ${Math.min(activity.events.length, 64)} 条事件的类型密度"><span>事件密度</span><div>${density}</div></div></section>${errorTray}<section class="panel section ia-section"><div class="section__head"><div><h2>统一事件流</h2><p>展开事件可查看经过脱敏的结构化详情并复制。</p></div><div class="status-sort"><label for="status-order">排序</label><select class="input" id="status-order"><option value="newest" ${state.statusOrder === "newest" ? "selected" : ""}>最新在前</option><option value="oldest" ${state.statusOrder === "oldest" ? "selected" : ""}>时间顺序</option></select></div></div><div class="status-controls"><div class="status-filters" aria-label="按事件类型筛选">${filters}</div><div class="status-search"><label class="sr-only" for="status-search">搜索事件</label><input class="input" id="status-search" type="search" value="${escapeHtml(state.statusQuery)}" placeholder="搜索操作、文件、模型或错误…"><span>${filtered.length} 条</span></div></div><div class="activity-list">${eventsMarkup}</div></section>`;
+  return { markup, branches, activity };
+}
+
+function wireStatus(activity) {
+  content.querySelectorAll("[data-status-filter]").forEach((button) => button.addEventListener("click", async () => {
+    state.statusFilter = button.dataset.statusFilter;
+    await render();
+  }));
+  content.querySelector("#status-order")?.addEventListener("change", async (event) => {
+    state.statusOrder = event.target.value;
+    await render();
+  });
+  content.querySelector("#status-search")?.addEventListener("input", (event) => {
+    state.statusQuery = event.target.value;
+    if (statusSearchTimer) window.clearTimeout(statusSearchTimer);
+    statusSearchTimer = window.setTimeout(async () => {
+      statusSearchTimer = null;
+      await render();
+      const input = content.querySelector("#status-search");
+      input?.focus();
+      input?.setSelectionRange(input.value.length, input.value.length);
+    }, 180);
+  });
+  content.querySelector("[data-status-reset]")?.addEventListener("click", async () => {
+    state.statusFilter = "all";
+    state.statusQuery = "";
+    await render();
+  });
+  content.querySelectorAll("[data-event-expand]").forEach((button) => button.addEventListener("click", async () => {
+    state.expandedEventId = state.expandedEventId === button.dataset.eventExpand ? null : button.dataset.eventExpand;
+    await render();
+  }));
+  content.querySelectorAll("[data-copy-event]").forEach((button) => button.addEventListener("click", async () => {
+    const item = activity.events.find((event) => event.id === button.dataset.copyEvent);
+    if (!item) return;
+    try { await navigator.clipboard.writeText(JSON.stringify(item.details, null, 2)); toast("事件详情已复制。"); }
+    catch { toast("浏览器未允许复制，请手动选择详情。", true); }
+  }));
 }
 
 async function render() {
@@ -374,6 +437,7 @@ async function render() {
       if (generation !== renderGeneration) return;
       if (result.branches) state.branches = result.branches;
       content.innerHTML = result.markup;
+      wireStatus(result.activity);
       return;
     }
     state.runtime ||= await api.runtime();
@@ -412,12 +476,11 @@ async function loadProjects() {
 
 async function openProject(id) {
   try {
+    if (statusPollTimer) { window.clearInterval(statusPollTimer); statusPollTimer = null; }
     const [project, branches] = await Promise.all([api.project(id), api.branches(id)]);
     state.project = project;
     state.branches = branches;
     state.focusStage = null;
-    state.samplePageIndex = 0;
-    state.samplePreview = null;
     state.view = "workspace";
     sidebarPinned = false;
     applySidebar(false);
@@ -432,7 +495,6 @@ async function refreshCurrent() {
   const [project, branches] = await Promise.all([api.project(state.project.project_id), api.branches(state.project.project_id)]);
   state.project = project;
   state.branches = branches;
-  state.samplePreview = null;
   await loadProjects();
   await render();
 }
@@ -471,7 +533,6 @@ async function runJob(operation, extra = {}) {
 }
 
 function wireWorkspace() {
-  content.querySelectorAll("[data-sample-page]").forEach((button) => button.addEventListener("click", () => selectSamplePage(Number(button.dataset.samplePage))));
   content.querySelectorAll("[data-sample-revision]").forEach((button) => button.addEventListener("click", () => selectSampleRevision(button.dataset.sampleRevision)));
   content.querySelectorAll("[data-snapshot-stage]").forEach((button) => button.addEventListener("click", () => {
     openSnapshotDialog(button.dataset.snapshotStage);
@@ -492,7 +553,6 @@ function wireWorkspace() {
     if (action === "approve_document") await approveDocument(button.dataset.type);
     if (action === "regenerate_sample") await runJob("regenerate_sample");
     if (action === "approve_sample") await approveSample();
-    if (action === "restore_sample") await restoreSampleRevision(button.dataset.revisionHash);
     if (action === "branch_sample_revision") await branchFromSampleRevision(button.dataset.revisionHash);
     if (action === "cancel_job" && state.project?.active_job) {
       try { await api.cancelJob(state.project.active_job.job_id); toast("已提交取消请求。"); }
@@ -564,8 +624,6 @@ async function enterSampleStage() {
   try {
     state.project = await api.enterSample(state.project.project_id, state.project.checkpoint_id);
     state.focusStage = null;
-    state.samplePageIndex = 0;
-    state.samplePreview = null;
     state.branches = await api.branches(state.project.project_id);
     await render();
   } catch (error) { toast(error.message, true); }
@@ -612,19 +670,7 @@ async function approveSample() {
 async function selectSampleRevision(revisionHash) {
   const current = headSample();
   if (!current) return;
-  setBusy(true);
-  try {
-    state.samplePreview = revisionHash === current.revision_hash
-      ? null
-      : await api.sampleRevision(state.project.project_id, revisionHash);
-    state.samplePageIndex = 0;
-    await render();
-    document.querySelector("#sample-preview-frame")?.focus();
-  } catch (error) { toast(error.message, true); }
-  finally { setBusy(false); }
-}
-
-async function restoreSampleRevision(revisionHash) {
+  if (revisionHash === current.revision_hash) return;
   setBusy(true);
   try {
     state.project = await api.restoreSample(
@@ -632,12 +678,12 @@ async function restoreSampleRevision(revisionHash) {
       revisionHash,
       state.project.checkpoint_id,
     );
-    state.samplePreview = null;
-    state.samplePageIndex = 0;
+    state.focusStage = "ppt_sample";
     state.branches = await api.branches(state.project.project_id);
     await loadProjects();
     await render();
-    toast("已恢复为新的当前修订，历史版本保持可回看。");
+    document.querySelector("#sample-preview-frame")?.focus();
+    toast("已切换当前版本；没有创建新修订。");
   } catch (error) { toast(error.message, true); }
   finally { setBusy(false); }
 }
@@ -652,8 +698,6 @@ async function branchFromSampleRevision(revisionHash) {
       checkpoint_id: state.project.checkpoint_id,
       name,
     });
-    state.samplePreview = null;
-    state.samplePageIndex = 0;
     state.branches = await api.branches(state.project.project_id);
     state.focusStage = "ppt_sample";
     await loadProjects();
@@ -725,8 +769,6 @@ async function createProject(event) {
     });
     state.branches = await api.branches(state.project.project_id);
     state.view = "workspace";
-    state.samplePageIndex = 0;
-    state.samplePreview = null;
     projectDialog.close();
     await loadProjects();
     await render();
@@ -760,7 +802,8 @@ function snapshotContent(stage, item) {
   if (stage === "ppt_sample") {
     const sample = (snapshot.samples || []).at(-1);
     if (!sample) return '<p class="snapshot-empty">该阶段的输入已保存，样品尚未生成。</p>';
-    return `<div class="sample-snapshot-summary"><strong>${sample.pages.length} 页 HTML 样品</strong><span>修订 ${sample.revision} · ${sample.status === "approved" ? "已确认" : "待确认"}</span><ol>${sample.pages.map((page) => `<li>${escapeHtml(page.title)}</li>`).join("")}</ol></div>`;
+    const slides = sample.package?.slides || sample.pages || [];
+    return `<div class="sample-snapshot-summary"><strong>${slides.length} 页 HTML-PPT 包</strong><span>修订 ${sample.revision} · ${sample.status === "approved" ? "已确认" : "待确认"}</span><ol>${slides.map((page) => `<li>${escapeHtml(page.title)}</li>`).join("")}</ol></div>`;
   }
   const document = snapshotDocument(snapshot, stage);
   if (!document) return '<p class="snapshot-empty">该阶段的输入已保存，产物尚未生成。</p>';
@@ -795,7 +838,6 @@ function openSnapshotDialog(stage) {
       });
       state.branches = await api.branches(state.project.project_id);
       state.focusStage = null;
-      state.samplePreview = null;
       dialog.close();
       await loadProjects();
       await render();
@@ -844,7 +886,6 @@ async function openBranchDialog() {
       state.project = await api.switchBranch(state.project.project_id, button.dataset.branchSwitch);
       state.branches = await api.branches(state.project.project_id);
       state.focusStage = null;
-      state.samplePreview = null;
       dialog.close();
       await loadProjects();
       await render();
@@ -855,9 +896,23 @@ async function openBranchDialog() {
 }
 
 async function setView(view) {
+  if (statusSearchTimer) {
+    window.clearTimeout(statusSearchTimer);
+    statusSearchTimer = null;
+  }
+  if (statusPollTimer) {
+    window.clearInterval(statusPollTimer);
+    statusPollTimer = null;
+  }
   state.view = view;
   await render();
   document.querySelector("#main").focus();
+  if (view === "status") {
+    statusPollTimer = window.setInterval(() => {
+      if (state.view !== "status" || document.activeElement?.id === "status-search") return;
+      void render();
+    }, 2000);
+  }
 }
 
 function bindChrome() {

@@ -39,27 +39,44 @@ def ready_for_sample(workflow: Workflow) -> dict:
     return manifest
 
 
-def realistic_sample_output(*, unsafe_css: bool = False) -> str:
-    pages = []
+def realistic_package_output(*, invalid_path: bool = False) -> str:
+    slides = []
+    sections = []
     for index in range(1, 3):
-        unsafe = "background-image:url('https://audit.invalid/pixel.png');" if unsafe_css else ""
-        pages.append({
-            "page_id": f"sample_{index}",
+        slides.append({
+            "slide_id": f"sample_{index}",
             "title": "结论先行" if index == 1 else "行动路径",
-            "html": (
-                '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
-                '<meta name="viewport" content="width=device-width,initial-scale=1">'
-                '<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%}'
-                f'.slide{{height:100%;padding:64px;display:grid;align-content:space-between;{unsafe}'
-                'background:linear-gradient(135deg,#f7f4ff,#fff);color:#171126}'
-                '.title{font-size:64px;line-height:1.08;margin:0}</style></head><body>'
-                f'<main class="slide"><h1 class="title">样品页 {index}</h1>'
-                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 10" '
-                'aria-label="进度"><title>进度</title><rect width="100" height="10" '
-                'rx="5" fill="#6d28d9"></rect></svg></main></body></html>'
-            ),
         })
-    return json.dumps({"pages": pages}, ensure_ascii=False)
+        sections.append(
+            f'<section class="slide" data-slide-id="sample_{index}">'
+            f'<h1>样品页 {index}</h1><p>结论、证据与行动建议。</p></section>'
+        )
+    html = (
+        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<link rel="stylesheet" href="assets/deck.css"></head><body>'
+        + "".join(sections)
+        + '<script src="assets/deck.js"></script></body></html>'
+    )
+    return json.dumps({
+        "entrypoint": "index.html",
+        "title": "真实形态 HTML-PPT",
+        "slide_count": 2,
+        "slides": slides,
+        "files": [
+            {"path": "index.html", "content": html, "encoding": "utf-8"},
+            {
+                "path": "../escape.css" if invalid_path else "assets/deck.css",
+                "content": ".slide{width:100vw;height:100vh;padding:64px}",
+                "encoding": "utf-8",
+            },
+            {
+                "path": "assets/deck.js",
+                "content": "addEventListener('keydown',()=>{});",
+                "encoding": "utf-8",
+            },
+        ],
+    }, ensure_ascii=False)
 
 
 def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> None:
@@ -94,7 +111,9 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
 
     manifest = workflow.generate_sample(manifest["checkpoint_id"])
     sample = manifest["samples"][-1]
-    assert len(sample["pages"]) == 2
+    assert sample["package"]["entrypoint"] == "index.html"
+    assert sample["package"]["slide_count"] == 2
+    assert [item["path"] for item in sample["package"]["files"]] == ["index.html"]
     assert sample["provenance"]["sample_page_count"] == 2
     assert {"revise_sample", "approve_sample", "regenerate_sample"} <= set(capabilities(manifest))
 
@@ -104,11 +123,20 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
     assert revised["parent_revision_hash"] == sample["revision_hash"]
     assert revised["feedback"] == "放大主标题并减少文字"
 
+    manifest = workflow.restore_sample(manifest["checkpoint_id"], sample["revision_hash"])
+    assert len(manifest["samples"]) == 2
+    assert manifest["current_sample_revision_hash"] == sample["revision_hash"]
+
+    manifest = workflow.generate_sample(manifest["checkpoint_id"], feedback="从首版继续修改")
+    selected_child = manifest["samples"][-1]
+    assert selected_child["revision"] == 3
+    assert selected_child["parent_revision_hash"] == sample["revision_hash"]
+
     workflow.runtime.policy = workflow.runtime.policy.model_copy(update={"sample_page_count": 3})
     manifest = workflow.generate_sample(manifest["checkpoint_id"], regenerate=True)
     regenerated = manifest["samples"][-1]
-    assert regenerated["revision"] == 3
-    assert len(regenerated["pages"]) == 3
+    assert regenerated["revision"] == 4
+    assert regenerated["package"]["slide_count"] == 3
 
     manifest = workflow.approve_sample(manifest["checkpoint_id"], regenerated["revision_hash"])
     assert manifest["phase"] == "completed"
@@ -128,12 +156,31 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
     assert branched["samples"] == []
 
 
-def test_realistic_sample_output_repairs_truncated_json(workflow: Workflow, monkeypatch) -> None:
+def test_selecting_approved_sample_preserves_completed_phase(workflow: Workflow) -> None:
     manifest = ready_for_sample(workflow)
-    truncated = realistic_sample_output()[:-80]
+    manifest = workflow.generate_sample(manifest["checkpoint_id"])
+    first = manifest["samples"][-1]
+    manifest = workflow.approve_sample(
+        manifest["checkpoint_id"], first["revision_hash"]
+    )
+    manifest = workflow.generate_sample(
+        manifest["checkpoint_id"], feedback="创建第二版"
+    )
+
+    selected = workflow.restore_sample(
+        manifest["checkpoint_id"], first["revision_hash"]
+    )
+
+    assert selected["current_sample_revision_hash"] == first["revision_hash"]
+    assert selected["phase"] == "completed"
+
+
+def test_realistic_package_output_repairs_truncated_json(workflow: Workflow, monkeypatch) -> None:
+    manifest = ready_for_sample(workflow)
+    truncated = realistic_package_output()[:-80]
     responses = iter([
         truncated,
-        realistic_sample_output(),
+        realistic_package_output(),
     ])
     prompts: list[str] = []
 
@@ -146,11 +193,11 @@ def test_realistic_sample_output_repairs_truncated_json(workflow: Workflow, monk
     generated = workflow.generate_sample(manifest["checkpoint_id"])
 
     sample = generated["samples"][-1]
-    assert len(sample["pages"]) == 2
+    assert sample["package"]["slide_count"] == 2
+    assert len(sample["package"]["files"]) == 3
     assert sample["provenance"]["sample_repair_attempts"] == 1
     assert sample["provenance"]["sample_html_char_budget_per_page"] == 7_000
     assert len(sample["provenance"]["traces"]) == 2
-    assert len(truncated) > 1_000
     assert "SAMPLE_HTML_CHAR_BUDGET_PER_PAGE: 7000" in prompts[0]
     assert "AUTOMATED_REPAIR_ATTEMPT: 1/2" in prompts[1]
     assert "JSON 未完整闭合" in prompts[1]
@@ -163,11 +210,11 @@ def test_realistic_sample_output_repairs_truncated_json(workflow: Workflow, monk
     assert sample_calls[1]["output_ref"] == sample["revision_hash"]
 
 
-def test_realistic_sample_output_repairs_with_exact_security_reason(
+def test_realistic_package_output_repairs_with_exact_path_reason(
     workflow: Workflow, monkeypatch
 ) -> None:
     manifest = ready_for_sample(workflow)
-    responses = iter([realistic_sample_output(unsafe_css=True), realistic_sample_output()])
+    responses = iter([realistic_package_output(invalid_path=True), realistic_package_output()])
     prompts: list[str] = []
 
     def generate(state: str, prompt: str, *, json_mode: bool = False):
@@ -180,18 +227,44 @@ def test_realistic_sample_output_repairs_with_exact_security_reason(
 
     sample = generated["samples"][-1]
     assert sample["provenance"]["sample_repair_attempts"] == 1
-    assert all("audit.invalid" not in page["html"] for page in sample["pages"])
-    assert "安全净化拒绝" in prompts[1]
-    assert "pages.0.html: external CSS URL" in prompts[1]
+    assert sample["package"]["entrypoint"] == "index.html"
+    assert "包文件校验失败" in prompts[1]
+    assert "stay inside the draft" in prompts[1]
 
 
-def test_sample_output_repair_stops_after_bounded_attempts(workflow: Workflow, monkeypatch) -> None:
+def test_new_generation_repairs_legacy_pages_contract(
+    workflow: Workflow, monkeypatch
+) -> None:
+    manifest = ready_for_sample(workflow)
+    responses = iter([
+        json.dumps({
+            "pages": [{"page_id": "sample_1", "title": "旧格式", "html": "<main>旧格式</main>"}],
+        }, ensure_ascii=False),
+        realistic_package_output(),
+    ])
+    prompts: list[str] = []
+
+    def generate(state: str, prompt: str, *, json_mode: bool = False):
+        prompts.append(prompt)
+        return next(responses), [
+            {"type": "model_call", "provider": "test", "model": "real-shape", "usage": {}}
+        ]
+
+    monkeypatch.setattr(workflow.gateway, "generate", generate)
+
+    generated = workflow.generate_sample(manifest["checkpoint_id"])
+
+    assert generated["samples"][-1]["package"]["entrypoint"] == "index.html"
+    assert "不能返回旧版 pages 数组" in prompts[1]
+
+
+def test_package_output_repair_stops_after_bounded_attempts(workflow: Workflow, monkeypatch) -> None:
     manifest = ready_for_sample(workflow)
     prompts: list[str] = []
 
     def generate(state: str, prompt: str, *, json_mode: bool = False):
         prompts.append(prompt)
-        return realistic_sample_output(unsafe_css=True), [
+        return realistic_package_output(invalid_path=True), [
             {"type": "model_call", "provider": "test", "model": "real-shape", "usage": {}}
         ]
 
@@ -200,19 +273,19 @@ def test_sample_output_repair_stops_after_bounded_attempts(workflow: Workflow, m
     with pytest.raises(SampleGenerationError) as failure:
         workflow.generate_sample(manifest["checkpoint_id"])
 
-    assert failure.value.public_code == "sample_html_rejected"
+    assert failure.value.public_code == "sample_package_invalid"
     assert len(prompts) == 3
     assert "AUTOMATED_REPAIR_ATTEMPT: 2/2" in prompts[-1]
     persisted = workflow.store.read()
     assert persisted["phase"] == "ready_to_generate"
     assert persisted["samples"] == []
-    generated_files = sorted(workflow.store.generated_html_root.glob("prompt_*/page-*.html"))
-    assert len(generated_files) == 6
-    assert all("audit.invalid" in path.read_text(encoding="utf-8") for path in generated_files)
+    generated_files = sorted(workflow.store.generated_html_root.glob("prompt_*/package/index.html"))
+    assert len(generated_files) == 3
+    assert all("data-slide-id" in path.read_text(encoding="utf-8") for path in generated_files)
     assert not list(workflow.store.artifacts_root.glob("*.html"))
 
 
-def test_generated_html_persistence_failure_closes_prompt_audit(
+def test_generated_package_persistence_failure_closes_prompt_audit(
     workflow: Workflow, monkeypatch
 ) -> None:
     manifest = ready_for_sample(workflow)
@@ -220,7 +293,7 @@ def test_generated_html_persistence_failure_closes_prompt_audit(
     def fail_persistence(*args, **kwargs):
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(workflow.store, "save_generated_html_attempt", fail_persistence)
+    monkeypatch.setattr(workflow.store, "save_generated_package_attempt", fail_persistence)
 
     with pytest.raises(OSError, match="disk unavailable"):
         workflow.generate_sample(manifest["checkpoint_id"])

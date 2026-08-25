@@ -7,7 +7,7 @@ from multiprocessing import get_context
 from pathlib import Path
 
 from agent_core.jobs import JobRegistry
-from agent_core.models import SamplePage, SampleRevision, TaskCard, utc_now
+from agent_core.models import HtmlPptPackage, SamplePage, SampleRevision, TaskCard, utc_now
 from agent_core.processes import process_is_alive
 from agent_core.workflow import Workflow
 from configs.runtime import ManagedRuntime
@@ -137,6 +137,78 @@ def test_project_store_commits_sqlite_wal_artifacts_and_parent_links(
     assert artifact_path.read_text(encoding="utf-8").startswith("<!doctype html>")
 
 
+def test_project_store_persists_and_hydrates_complete_html_ppt_package(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    store = ProjectStore(tmp_path / "projects", "package-demo")
+    manifest = store.create(
+        TaskCard(title="包测试", objective="验证多文件持久化").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    package = HtmlPptPackage.model_validate({
+        "entrypoint": "index.html",
+        "title": "多文件样品",
+        "slide_count": 1,
+        "slides": [{"slide_id": "cover", "title": "封面"}],
+        "files": [
+            {
+                "path": "index.html",
+                "content": '<link rel="stylesheet" href="assets/deck.css"><img src="assets/pixel.png">',
+                "encoding": "utf-8",
+            },
+            {
+                "path": "assets/deck.css",
+                "content": "body{margin:0}",
+                "encoding": "utf-8",
+            },
+            {
+                "path": "assets/pixel.png",
+                "content": "AAEC",
+                "encoding": "base64",
+                "media_type": "image/png",
+            },
+        ],
+    })
+    sample = SampleRevision.create_package(
+        package,
+        revision=1,
+        parent=None,
+        feedback=None,
+    )
+
+    def add_sample(value: dict) -> dict:
+        value["samples"].append(sample.model_dump())
+        value["current_sample_revision_hash"] = sample.revision_hash
+        value.update(state="ppt_sample", phase="waiting_human_approval")
+        return value
+
+    stored = store.update(
+        add_sample,
+        "sample_generated",
+        {"revision_hash": sample.revision_hash},
+        expected_checkpoint_id=manifest["checkpoint_id"],
+    )
+
+    files = stored["samples"][0]["package"]["files"]
+    assert [item["path"] for item in files] == [
+        "index.html", "assets/deck.css", "assets/pixel.png",
+    ]
+    assert files[-1]["encoding"] == "base64"
+    assert files[0]["media_type"] == "text/html; charset=utf-8"
+    assert files[1]["media_type"] == "text/css; charset=utf-8"
+    binary_path, media_type = store.sample_package_file(
+        sample.revision_hash, "assets/pixel.png"
+    )
+    assert binary_path.read_bytes() == b"\x00\x01\x02"
+    assert media_type == "image/png"
+    assert store.sample_history()[0]["package"]["file_count"] == 3
+    assert all(
+        "content" not in item
+        for item in store.read(include_sample_html=False)["samples"][0]["package"]["files"]
+    )
+
+
 def test_legacy_file_project_is_imported_without_removing_source_files(
     tmp_path: Path,
     mock_runtime: ManagedRuntime,
@@ -148,7 +220,7 @@ def test_legacy_file_project_is_imported_without_removing_source_files(
     store = ProjectStore(root, "legacy-demo")
     imported = store.read()
 
-    assert imported["format_version"] == 2
+    assert imported["format_version"] == 3
     assert imported["storage"]["engine"] == "sqlite-wal"
     assert imported["samples"][0]["pages"][0]["html"] == "<main>旧样品</main>"
     assert store.database_path.is_file()
@@ -190,6 +262,7 @@ def test_legacy_file_project_cold_start_is_safe_across_processes(
     store = ProjectStore(root, project_id)
     assert store.read()["checkpoint_id"] == checkpoint_id
     assert [event["event"] for event in store.events()].count("storage_migrated") == 1
+    assert store.events(limit=1)[0]["event"] == "storage_migrated"
 
 
 def test_prompt_call_audit_is_redacted_linked_and_exportable(

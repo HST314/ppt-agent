@@ -9,6 +9,7 @@ from typing import Any
 from openai import OpenAI
 
 from configs.runtime import ManagedRuntime
+from runtime.package_tool import DraftPackage, PackageToolError
 from runtime.read_tool import ReadToolError, SkillReader
 
 
@@ -35,7 +36,14 @@ class ModelGateway:
         self.managed = managed
         self.last_messages: list[dict[str, Any]] | None = None
 
-    def generate(self, state: str, prompt: str, *, json_mode: bool = False) -> tuple[str, list[dict[str, Any]]]:
+    def generate(
+        self,
+        state: str,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        package_draft: DraftPackage | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
         binding = self.managed.models.binding_for(state)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_MESSAGE},
@@ -60,7 +68,7 @@ class ModelGateway:
             "type": "function",
             "function": {
                 "name": "read",
-                "description": "Read a UTF-8 Markdown or text file within the presentation skills directory.",
+                "description": "Read a UTF-8 text, HTML, CSS, JS, SVG, JSON, or Markdown file within the presentation skills directory.",
                 "parameters": {
                     "type": "object",
                     "required": ["path"],
@@ -73,6 +81,76 @@ class ModelGateway:
                 },
             },
         }]
+        if package_draft is not None:
+            tools.extend([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_package_file",
+                        "description": "Read UTF-8 text from a file already present in the current isolated HTML-PPT draft package.",
+                        "parameters": {
+                            "type": "object",
+                            "required": ["path"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "offset": {"type": "integer", "minimum": 0},
+                                "limit": {"type": "integer", "minimum": 1, "maximum": 50000},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write_package_file",
+                        "description": "Create or replace one UTF-8 text file inside the current isolated HTML-PPT draft package.",
+                        "parameters": {
+                            "type": "object",
+                            "required": ["path", "content"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "replace_package_text",
+                        "description": "Replace exact text inside a UTF-8 file in the current isolated HTML-PPT draft package. Use this after copying a large Skill template.",
+                        "parameters": {
+                            "type": "object",
+                            "required": ["path", "old", "new"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "old": {"type": "string", "minLength": 1, "maxLength": 50000},
+                                "new": {"type": "string"},
+                                "replace_all": {"type": "boolean"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "copy_skill_asset",
+                        "description": "Copy one static asset from the presentation skills directory into the current isolated HTML-PPT draft package.",
+                        "parameters": {
+                            "type": "object",
+                            "required": ["source_path", "destination_path"],
+                            "properties": {
+                                "source_path": {"type": "string"},
+                                "destination_path": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            ])
         traces: list[dict[str, Any]] = []
         parameters = dict(binding.parameters)
         if json_mode:
@@ -99,14 +177,45 @@ class ModelGateway:
             for call in message.tool_calls:
                 try:
                     arguments = json.loads(call.function.arguments)
-                    result = reader.read(
-                        arguments.get("path", ""),
-                        offset=arguments.get("offset", 0),
-                        limit=arguments.get("limit"),
-                    )
-                    output = {"path": result.path, "content": result.content, "offset": result.offset, "end": result.end}
-                    traces.append({"type": "tool_call", "tool": "read", "path": result.path, "content_hash": result.content_hash, "offset": result.offset, "end": result.end})
-                except (json.JSONDecodeError, ReadToolError, TypeError) as exc:
+                    if call.function.name == "read":
+                        result = reader.read(
+                            arguments.get("path", ""),
+                            offset=arguments.get("offset", 0),
+                            limit=arguments.get("limit"),
+                        )
+                        output = {"path": result.path, "content": result.content, "offset": result.offset, "end": result.end}
+                        traces.append({"type": "tool_call", "tool": "read", "path": result.path, "content_hash": result.content_hash, "offset": result.offset, "end": result.end})
+                    elif call.function.name == "write_package_file" and package_draft is not None:
+                        output = package_draft.write(arguments.get("path", ""), arguments.get("content"))
+                        traces.append({"type": "tool_call", "tool": "write_package_file", **output})
+                    elif call.function.name == "read_package_file" and package_draft is not None:
+                        output = package_draft.read(
+                            arguments.get("path", ""),
+                            offset=arguments.get("offset", 0),
+                            limit=arguments.get("limit", 50_000),
+                        )
+                        traces.append({
+                            "type": "tool_call", "tool": "read_package_file",
+                            "path": output["path"], "content_hash": output["content_hash"],
+                            "offset": output["offset"], "end": output["end"],
+                        })
+                    elif call.function.name == "replace_package_text" and package_draft is not None:
+                        output = package_draft.replace_text(
+                            arguments.get("path", ""),
+                            arguments.get("old"),
+                            arguments.get("new"),
+                            replace_all=arguments.get("replace_all", False),
+                        )
+                        traces.append({"type": "tool_call", "tool": "replace_package_text", **output})
+                    elif call.function.name == "copy_skill_asset" and package_draft is not None:
+                        output = package_draft.copy_skill_asset(
+                            arguments.get("source_path", ""),
+                            arguments.get("destination_path", ""),
+                        )
+                        traces.append({"type": "tool_call", "tool": "copy_skill_asset", **output})
+                    else:
+                        raise ModelOutputError("unsupported tool call")
+                except (json.JSONDecodeError, ReadToolError, PackageToolError, TypeError) as exc:
                     output = {"error": str(exc)}
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(output, ensure_ascii=False)})
             self.last_messages = deepcopy(messages)
@@ -131,26 +240,41 @@ class ModelGateway:
             return "# 逐页大纲\n\n## 第 1 页｜封面\n- 本页目的：建立主题与场合\n- 核心信息：演示主题与汇报人\n- 视觉方向：克制留白与清晰标题\n\n## 第 2 页｜结论先行\n- 本页目的：让听众立即理解核心判断\n- 核心信息：一句话主结论与三项支撑\n- 视觉方向：大数字与三列摘要\n\n## 第 3 页｜背景与机会\n- 本页目的：解释为什么现在需要行动\n- 核心信息：背景变化、机会窗口、潜在风险\n- 视觉方向：简洁趋势图\n\n## 第 4 页｜行动方案\n- 本页目的：形成下一步共识\n- 核心信息：责任、节奏与成功标准\n- 视觉方向：三阶段路线图"
         match = re.search(r"SAMPLE_PAGE_COUNT:\s*(\d+)", prompt)
         page_count = int(match.group(1)) if match else 2
-        pages = []
+        slides = []
         for index in range(1, page_count + 1):
             accent = "#6d28d9" if index % 2 else "#be185d"
-            pages.append({
-                "page_id": f"sample_{index}",
+            slides.append({
+                "slide_id": f"sample_{index}",
                 "title": "核心判断" if index == 1 else f"行动方向 {index}",
-                "html": (
-                    "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
-                    "<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{"
-                    "font-family:Arial,'Microsoft YaHei',sans-serif;background:#f8f5ff;color:#171126}"
-                    ".slide{height:100%;padding:76px 88px;display:grid;align-content:space-between}"
-                    ".kicker{font-size:22px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:"
-                    + accent
-                    + "}.title{max-width:900px;font-size:68px;line-height:1.08;margin:22px 0}.rule{height:8px;width:120px;background:"
-                    + accent
-                    + ";border-radius:8px}.foot{display:flex;justify-content:space-between;font-size:20px;color:#655d72}"
-                    "</style></head><body><main class='slide'><div><div class='kicker'>PPT Agent Sample</div>"
-                    f"<h1 class='title'>{'结论先行，让每一页都推动决策' if index == 1 else '把洞察转化为清晰的行动路径'}</h1>"
-                    "<div class='rule'></div></div><div class='foot'><span>视觉样品</span>"
-                    f"<span>{index:02d}</span></div></main></body></html>"
-                ),
             })
-        return json.dumps({"pages": pages}, ensure_ascii=False)
+        sections = []
+        for index, slide in enumerate(slides, start=1):
+            accent = "#6d28d9" if index % 2 else "#be185d"
+            headline = "结论先行，让每一页都推动决策" if index == 1 else "把洞察转化为清晰的行动路径"
+            sections.append(
+                f"<section class='slide{' is-active' if index == 1 else ''}' data-slide-id='{slide['slide_id']}' "
+                f"style='--accent:{accent}'><div><div class='kicker'>PPT Agent Sample</div>"
+                f"<h1>{headline}</h1><div class='rule'></div></div><footer><span>{slide['title']}</span>"
+                f"<span>{index:02d}</span></footer></section>"
+            )
+        html = (
+            "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>PPT 样品</title><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}"
+            "body{font-family:Arial,'Microsoft YaHei',sans-serif;background:#0c0912;color:#171126}.slide{position:absolute;inset:0;display:none;"
+            "padding:8vh 7vw;background:#f8f5ff;align-content:space-between}.slide.is-active{display:grid}.kicker{font-size:clamp(14px,2vw,22px);"
+            "font-weight:700;letter-spacing:.12em;color:var(--accent)}h1{max-width:900px;font-size:clamp(36px,6vw,76px);line-height:1.08;margin:3vh 0}"
+            ".rule{height:8px;width:120px;background:var(--accent);border-radius:8px}footer{display:flex;justify-content:space-between;font-size:20px;color:#655d72}"
+            ".nav{position:fixed;right:24px;bottom:20px;display:flex;gap:8px}.nav button{width:48px;height:44px;border:0;border-radius:9px;background:#171126;color:white;font-size:20px}</style></head><body>"
+            + "".join(sections)
+            + "<nav class='nav' aria-label='幻灯片导航'><button id='prev' aria-label='上一页'>←</button><button id='next' aria-label='下一页'>→</button></nav>"
+            "<script>const s=[...document.querySelectorAll('.slide')];let i=0;function go(n){s[i].classList.remove('is-active');i=(n+s.length)%s.length;s[i].classList.add('is-active')}"
+            "prev.onclick=()=>go(i-1);next.onclick=()=>go(i+1);addEventListener('keydown',e=>{if(e.key==='ArrowLeft')go(i-1);if(e.key==='ArrowRight'||e.key===' ')go(i+1)})</script>"
+            "</body></html>"
+        )
+        return json.dumps({
+            "entrypoint": "index.html",
+            "title": "PPT 样品",
+            "slide_count": page_count,
+            "slides": slides,
+            "files": [{"path": "index.html", "content": html, "encoding": "utf-8"}],
+        }, ensure_ascii=False)

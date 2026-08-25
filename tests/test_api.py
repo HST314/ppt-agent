@@ -173,7 +173,8 @@ def test_api_drives_sample_generation_feedback_and_approval(
     )
     assert historical.status_code == 200
     assert historical.json()["revision"] == 1
-    assert all("html" in page for page in historical.json()["pages"])
+    assert all("html" not in page for page in historical.json()["pages"])
+    assert historical.json()["preview_url"].endswith("/preview/index.html")
 
     restored = client.post(
         f"/api/projects/{project_id}/samples/revisions/{first_hash}/restore",
@@ -182,9 +183,32 @@ def test_api_drives_sample_generation_feedback_and_approval(
     assert restored.status_code == 200
     project = restored.json()
     restored_sample = project["samples"][-1]
+    assert restored_sample["revision"] == 1
+    assert project["current_sample_revision_hash"] == first_hash
+    assert [item["revision"] for item in project["sample_revisions"]] == [2, 1]
+
+    finish_job(client, client.post(f"/api/projects/{project_id}/jobs", json={
+        "operation": "revise_sample",
+        "checkpoint_id": project["checkpoint_id"],
+        "feedback": "从首版继续调整",
+    }))
+    project = client.get(f"/api/projects/{project_id}").json()
+    restored_sample = project["samples"][-1]
     assert restored_sample["revision"] == 3
-    assert restored_sample["parent_revision_hash"] == revised["revision_hash"]
-    assert restored_sample["provenance"]["restored_from_revision_hash"] == first_hash
+    assert restored_sample["parent_revision_hash"] == first_hash
+
+    preview = client.get(restored_sample["preview_url"])
+    assert preview.status_code == 200
+    assert preview.headers["content-security-policy"].startswith("sandbox allow-scripts; default-src 'none'")
+    assert preview.headers["cross-origin-resource-policy"] == "cross-origin"
+    assert "<script>" in preview.text
+    exported = client.get(restored_sample["export_url"])
+    assert exported.status_code == 200
+    assert exported.headers["content-type"] == "application/zip"
+
+    activity = client.get(f"/api/projects/{project_id}/activity").json()
+    kinds = {item["kind"] for item in activity["events"]}
+    assert {"job", "model", "artifact"} <= kinds
 
     approved = client.post(f"/api/projects/{project_id}/samples/approve", json={
         "checkpoint_id": project["checkpoint_id"],
@@ -195,7 +219,11 @@ def test_api_drives_sample_generation_feedback_and_approval(
     sample_snapshot = next(
         item for item in approved.json()["progress_snapshots"] if item["stage"] == "ppt_sample"
     )
-    assert "html" not in sample_snapshot["snapshot"]["samples"][-1]["pages"][0]
+    snapshot_sample = sample_snapshot["snapshot"]["samples"][-1]
+    assert snapshot_sample["package"]["slides"]
+    assert all(
+        "content" not in item for item in snapshot_sample["package"]["files"]
+    )
 
     prompt_export = client.get(f"/api/projects/{project_id}/audit/prompt-calls.jsonl")
     assert prompt_export.status_code == 200

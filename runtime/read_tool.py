@@ -20,6 +20,11 @@ class ReadResult:
 
 
 class SkillReader:
+    READABLE_SUFFIXES = {
+        ".md", ".txt", ".html", ".htm", ".css", ".js", ".mjs",
+        ".json", ".yaml", ".yml", ".svg", ".xml",
+    }
+
     def __init__(self, root: Path, *, per_call: int, per_job: int):
         self.root = root.resolve()
         self.per_call = per_call
@@ -32,8 +37,25 @@ class SkillReader:
             logical = path.relative_to(self.root).as_posix()
             candidate = self._resolve_file(logical)
             lines = candidate.read_text(encoding="utf-8").splitlines()
-            title = next((line.lstrip("# ").strip() for line in lines if line.startswith("#")), path.parent.name)
-            description = next((line.strip() for line in lines if line.strip() and not line.startswith("#")), "")
+            frontmatter: dict[str, str] = {}
+            if lines[:1] == ["---"]:
+                for line in lines[1:]:
+                    if line == "---":
+                        break
+                    key, separator, value = line.partition(":")
+                    if separator and key.strip() in {"name", "description"}:
+                        frontmatter[key.strip()] = value.strip().strip("\"'")
+            title = frontmatter.get("name") or next(
+                (line.lstrip("# ").strip() for line in lines if line.startswith("#")),
+                path.parent.name,
+            )
+            description = frontmatter.get("description") or next(
+                (
+                    line.strip() for line in lines
+                    if line.strip() and not line.startswith("#") and line != "---"
+                ),
+                "",
+            )
             result.append({"name": title, "description": description, "path": logical})
         return result
 
@@ -43,8 +65,25 @@ class SkillReader:
         posix = PurePosixPath(logical_path)
         if posix.is_absolute() or ".." in posix.parts:
             raise ReadToolError("only relative paths inside skills_root are allowed")
-        if posix.suffix.lower() not in {".md", ".txt"}:
-            raise ReadToolError("only .md and .txt files are readable")
+        if posix.suffix.lower() not in self.READABLE_SUFFIXES:
+            raise ReadToolError("file type is not readable")
+        try:
+            candidate = (self.root / Path(*posix.parts)).resolve(strict=True)
+            is_regular = stat.S_ISREG(candidate.stat().st_mode)
+        except (OSError, RuntimeError):
+            raise ReadToolError("file is outside skills_root or does not exist") from None
+        if not candidate.is_relative_to(self.root) or not is_regular:
+            raise ReadToolError("file is outside skills_root or does not exist")
+        return candidate
+
+    def resolve_asset(self, logical_path: str) -> Path:
+        """Resolve a regular file for a bounded copy without exposing host paths."""
+
+        if not logical_path or "\x00" in logical_path:
+            raise ReadToolError("path is empty or contains NUL")
+        posix = PurePosixPath(logical_path)
+        if posix.is_absolute() or ".." in posix.parts:
+            raise ReadToolError("only relative paths inside skills_root are allowed")
         try:
             candidate = (self.root / Path(*posix.parts)).resolve(strict=True)
             is_regular = stat.S_ISREG(candidate.stat().st_mode)

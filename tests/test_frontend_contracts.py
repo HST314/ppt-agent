@@ -1,10 +1,4 @@
-import base64
-import json
 from pathlib import Path
-import shutil
-import subprocess
-
-import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -32,74 +26,41 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert 'id="sample-feedback-form"' in samples
     assert 'data-action="generate_sample"' in samples
     assert '${completion}${preview}${feedback}${historyMarkup}' in samples
-    assert 'data-action="restore_sample"' in samples
+    assert "不会创建新修订" in samples
     assert 'data-action="branch_sample_revision"' in samples
     assert 'data-sample-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"' in samples
-    assert "sampleRevision:" in (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
+    assert "restoreSample:" in (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
 
 
 def test_sample_preview_is_sandboxed_and_never_inserted_into_parent_dom() -> None:
     app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
     samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
+    server = (ROOT / "main_front.py").read_text(encoding="utf-8")
 
-    assert 'id="sample-preview-frame" sandbox="" referrerpolicy="no-referrer"' in samples
-    assert "Content-Security-Policy" in samples
-    assert "frame.srcdoc = isolatedSampleHtml(page.html)" in samples
-    assert "canvas.clientWidth / 1280" in samples
-    assert "new ResizeObserver(scaleFrame)" in samples
+    assert 'id="sample-preview-frame" sandbox="allow-scripts" referrerpolicy="no-referrer"' in samples
+    assert '"sandbox allow-scripts; default-src \'none\'' in server
+    assert 'frame.src = sample.preview_url' in samples
+    assert "script-src 'self' 'unsafe-inline' data: blob:" in server
+    assert "connect-src 'none'" in server
+    assert "frame-src 'none'" in server
     assert "innerHTML = page.html" not in app + samples
 
 
-def test_sample_preview_csp_precedes_untrusted_comment_and_document_markup() -> None:
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node.js is required for the frontend security regression")
-    samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
-    module_url = "data:text/javascript;base64," + base64.b64encode(samples.encode()).decode()
-    payload = '<!-- <head> --><html><head></head><body><p>sample</p></body></html>'
-    script = (
-        f"const module = await import({json.dumps(module_url)});"
-        f"console.log(JSON.stringify(module.isolatedSampleHtml({json.dumps(payload)})));"
-    )
+def test_status_console_supports_live_filter_search_expand_and_pinned_errors() -> None:
+    app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    css = (ROOT / "frontend/static/css/main.css").read_text(encoding="utf-8")
+    api = (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
 
-    result = subprocess.run(
-        [node, "--input-type=module", "--eval", script],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    isolated = json.loads(result.stdout)
-
-    assert isolated.startswith("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\"")
-    assert isolated.index("Content-Security-Policy") < isolated.index("<!-- <head> -->")
-    assert isolated.count("Content-Security-Policy") == 1
-
-
-def test_sample_preview_injects_csp_into_sanitized_standalone_document() -> None:
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node.js is required for the frontend security regression")
-    samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
-    module_url = "data:text/javascript;base64," + base64.b64encode(samples.encode()).decode()
-    payload = '<!doctype html><html lang="zh-CN"><head><title>sample</title></head><body>ok</body></html>'
-    script = (
-        f"const module = await import({json.dumps(module_url)});"
-        f"console.log(JSON.stringify(module.isolatedSampleHtml({json.dumps(payload)})));"
-    )
-
-    result = subprocess.run(
-        [node, "--input-type=module", "--eval", script],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    isolated = json.loads(result.stdout)
-
-    assert isolated.startswith(
-        '<!doctype html><html lang="zh-CN"><head><meta http-equiv="Content-Security-Policy"'
-    )
-    assert isolated.count("<!doctype html>") == 1
-    assert isolated.count("Content-Security-Policy") == 1
+    assert "api.activity" in app
+    assert 'id="status-search"' in app
+    assert "data-status-filter" in app
+    assert "data-event-expand" in app
+    assert "data-copy-event" in app
+    assert "固定可见" in app
+    assert "window.setInterval" in app
+    assert "/activity" in api
+    assert ".event-density" in css
+    assert ".activity-event" in css
 
 
 def test_markdown_renderer_escapes_raw_html() -> None:
@@ -124,7 +85,7 @@ def test_job_errors_use_bounded_chinese_messages() -> None:
     css = (ROOT / "frontend/static/css/main.css").read_text(encoding="utf-8")
 
     assert all(code in app for code in (
-        "sample_json_incomplete", "sample_html_rejected", "sample_output_invalid"
+        "sample_json_incomplete", "sample_html_rejected", "sample_output_invalid", "sample_package_invalid"
     ))
     assert "userErrorMessage(job.error" in app
     assert "job.error?.message" not in app
