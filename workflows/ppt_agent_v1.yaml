@@ -5,8 +5,10 @@ states:
   - narrative_structure
   - slide_outline
   - ppt_sample
+  - ppt_full
+  - acceptance
 terminal_states:
-  - ppt_sample
+  - acceptance
   - blocked
   - cancelled
 transitions:
@@ -14,4 +16,6 @@ transitions:
   intake_clarify: [narrative_structure]
   narrative_structure: [slide_outline]
   slide_outline: [ppt_sample]
-  ppt_sample: []
+  ppt_sample: [ppt_full]
+  ppt_full: [acceptance]
+  acceptance: []

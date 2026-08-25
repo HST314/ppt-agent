@@ -220,7 +220,7 @@ def test_legacy_file_project_is_imported_without_removing_source_files(
     store = ProjectStore(root, "legacy-demo")
     imported = store.read()
 
-    assert imported["format_version"] == 3
+    assert imported["format_version"] == 4
     assert imported["storage"]["engine"] == "sqlite-wal"
     assert imported["samples"][0]["pages"][0]["html"] == "<main>旧样品</main>"
     assert store.database_path.is_file()

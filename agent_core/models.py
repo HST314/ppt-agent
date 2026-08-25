@@ -197,6 +197,191 @@ class HtmlPptPackage(StrictModel):
         return "sha256:" + hasher.hexdigest()
 
 
+class FullDeckOutlineRef(StrictModel):
+    outline_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    source_slide_number: int = Field(ge=1, le=1000)
+
+
+class FullDeckContentRef(StrictModel):
+    artifact_type: Literal["html_ppt_slide"] = "html_ppt_slide"
+    revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    package_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    slide_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    slide_content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class FullDeckDerivedFrom(StrictModel):
+    sample_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    sample_slide_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+class FullDeckPageSlot(StrictModel):
+    slot_id: str = Field(min_length=1, max_length=80, pattern=r"^slot_[a-f0-9]{24}$")
+    position: int = Field(ge=0, le=999)
+    outline_ref: FullDeckOutlineRef | None = None
+    title: str = Field(min_length=1, max_length=160)
+    status: Literal["pending", "ready"]
+    source_type: Literal[
+        "approved_sample", "generated_segment", "full_deck_edit", "pending"
+    ]
+    content_ref: FullDeckContentRef | None = None
+    derived_from: FullDeckDerivedFrom | None = None
+
+    @model_validator(mode="after")
+    def validate_content_state(self) -> "FullDeckPageSlot":
+        if self.status == "pending":
+            if self.source_type != "pending" or self.content_ref is not None:
+                raise ValueError("pending full-deck pages cannot carry content")
+        elif self.source_type == "pending" or self.content_ref is None:
+            raise ValueError("ready full-deck pages require an immutable content reference")
+        if self.source_type == "approved_sample" and self.derived_from is None:
+            raise ValueError("approved sample pages require sample provenance")
+        return self
+
+
+class FullDeckPlan(StrictModel):
+    pages: list[FullDeckPageSlot] = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_order(self) -> "FullDeckPlan":
+        positions = [page.position for page in self.pages]
+        if positions != list(range(len(self.pages))):
+            raise ValueError("full-deck page positions must be ordered, unique, and contiguous")
+        slot_ids = [page.slot_id for page in self.pages]
+        if len(slot_ids) != len(set(slot_ids)):
+            raise ValueError("full-deck slot_id values must be unique")
+        outline_numbers = [
+            page.outline_ref.source_slide_number
+            for page in self.pages
+            if page.outline_ref is not None
+        ]
+        if len(outline_numbers) != len(set(outline_numbers)):
+            raise ValueError("full-deck outline slide numbers must be unique")
+        return self
+
+
+class FullDeckPackage(HtmlPptPackage):
+    composition_manifest: dict[str, Any]
+
+
+class FullDeckRevision(StrictModel):
+    full_deck_id: str = Field(pattern=r"^deck_[a-f0-9]{24}$")
+    revision: int = Field(ge=1)
+    revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    parent_revision_hash: str | None = Field(
+        default=None, pattern=r"^sha256:[a-f0-9]{64}$"
+    )
+    feedback: str | None = Field(default=None, max_length=4000)
+    status: Literal["draft", "pending_approval", "approved", "stale"] = "draft"
+    plan: FullDeckPlan
+    package: FullDeckPackage | None = None
+    created_at: str = Field(default_factory=utc_now)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_revision(self) -> "FullDeckRevision":
+        if self.status in {"pending_approval", "approved"}:
+            if self.package is None or any(page.status != "ready" for page in self.plan.pages):
+                raise ValueError("publishable full-deck revisions require a complete package")
+        identity = self.content_identity(
+            full_deck_id=self.full_deck_id,
+            revision=self.revision,
+            parent=self.parent_revision_hash,
+            feedback=self.feedback,
+            plan=self.plan,
+            package=self.package,
+            provenance=self.provenance,
+        )
+        serialized = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if self.revision_hash != digest(f"ppt_full\n{serialized}"):
+            raise ValueError("full-deck revision hash does not match its immutable content")
+        return self
+
+    @staticmethod
+    def content_identity(
+        *,
+        full_deck_id: str,
+        revision: int,
+        parent: str | None,
+        feedback: str | None,
+        plan: FullDeckPlan,
+        package: FullDeckPackage | None,
+        provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "full_deck_id": full_deck_id,
+            "revision": revision,
+            "parent_revision_hash": parent,
+            "feedback": feedback,
+            "pages": [page.model_dump(mode="json") for page in plan.pages],
+            "package_hash": package.package_hash if package else None,
+            "provenance": provenance,
+        }
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        full_deck_id: str,
+        revision: int,
+        parent: str | None,
+        feedback: str | None,
+        plan: FullDeckPlan,
+        package: FullDeckPackage | None = None,
+        status: Literal["draft", "pending_approval", "approved", "stale"] = "draft",
+        provenance: dict[str, Any] | None = None,
+    ) -> "FullDeckRevision":
+        provenance_value = provenance or {}
+        identity = cls.content_identity(
+            full_deck_id=full_deck_id,
+            revision=revision,
+            parent=parent,
+            feedback=feedback,
+            plan=plan,
+            package=package,
+            provenance=provenance_value,
+        )
+        serialized = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return cls(
+            full_deck_id=full_deck_id,
+            revision=revision,
+            revision_hash=digest(f"ppt_full\n{serialized}"),
+            parent_revision_hash=parent,
+            feedback=feedback,
+            status=status,
+            plan=plan,
+            package=package,
+            provenance=provenance_value,
+        )
+
+
+class FullDeckRevisionRef(StrictModel):
+    revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    status: Literal["draft", "pending_approval", "approved", "stale"]
+
+
+class FullDeck(StrictModel):
+    full_deck_id: str = Field(pattern=r"^deck_[a-f0-9]{24}$")
+    approved_sample_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    outline_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    current_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    revision_refs: list[FullDeckRevisionRef] = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def validate_current_revision(self) -> "FullDeck":
+        hashes = [item.revision_hash for item in self.revision_refs]
+        if len(hashes) != len(set(hashes)):
+            raise ValueError("full-deck revision references must be unique")
+        if self.current_revision_hash not in hashes:
+            raise ValueError("current full-deck revision must be referenced")
+        return self
+
+
 class SampleRevision(StrictModel):
     sample_id: str = "sample_ppt"
     revision: int

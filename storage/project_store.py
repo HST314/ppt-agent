@@ -26,8 +26,16 @@ CHECKPOINT_ID = re.compile(r"^checkpoint_[a-f0-9]{24}$")
 REVISION_HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
 ARTIFACT_ID = REVISION_HASH
 PROMPT_CALL_ID = re.compile(r"^prompt_[a-f0-9]{32}$")
-STAGE_IDS = ("intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample")
-SCHEMA_VERSION = 3
+STAGE_IDS = (
+    "intake",
+    "intake_clarify",
+    "narrative_structure",
+    "slide_outline",
+    "ppt_sample",
+    "ppt_full",
+    "acceptance",
+)
+SCHEMA_VERSION = 4
 INITIALIZATION_LOCK_TIMEOUT_SECONDS = 30
 MAX_GENERATED_HTML_FILES_PER_ATTEMPT = 12
 MAX_GENERATED_HTML_BYTES_PER_FILE = 1_000_000
@@ -35,6 +43,18 @@ MAX_GENERATED_HTML_BYTES_PER_FILE = 1_000_000
 
 class ConflictError(RuntimeError):
     pass
+
+
+def mark_full_deck_stale(manifest: dict[str, Any]) -> None:
+    """Retain downstream history while invalidating it after an upstream change."""
+
+    root = manifest.get("full_deck")
+    if not root:
+        return
+    for reference in root.get("revision_refs", []):
+        reference["status"] = "stale"
+    for revision in manifest.get("full_deck_revisions", []):
+        revision["status"] = "stale"
 
 
 class ProjectStore(PromptAuditMixin):
@@ -102,12 +122,36 @@ class ProjectStore(PromptAuditMixin):
                     journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
                     if journal_mode.lower() != "wal":
                         connection.execute("PRAGMA journal_mode = WAL")
+                    previous_row = connection.execute(
+                        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+                    ).fetchone() if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
+                    ).fetchone() else None
+                    previous_version = int(previous_row["value"]) if previous_row else 0
                     connection.executescript(PROJECT_SCHEMA)
+                    connection.execute("BEGIN IMMEDIATE")
+                    if previous_version < 4:
+                        for table in ("project_state", "checkpoints"):
+                            rows = connection.execute(
+                                f"SELECT rowid AS storage_rowid, payload_json FROM {table}"
+                            ).fetchall()
+                            for row in rows:
+                                payload = json.loads(row["payload_json"])
+                                payload["format_version"] = 4
+                                payload.setdefault("full_deck", None)
+                                payload.pop("full_deck_revisions", None)
+                                connection.execute(
+                                    f"UPDATE {table} SET payload_json = ? WHERE rowid = ?",
+                                    (json_text(payload), row["storage_rowid"]),
+                                )
                     connection.execute(
                         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', ?)",
                         (str(SCHEMA_VERSION),),
                     )
                     connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
                 finally:
                     connection.close()
                 if self.manifest_path.is_file():
@@ -326,6 +370,34 @@ class ProjectStore(PromptAuditMixin):
                         })
                 elif not ARTIFACT_ID.fullmatch(str(page.get("artifact_id", ""))):
                     raise ConflictError("sample_artifact_missing")
+        for revision in projection.get("full_deck_revisions", []):
+            package = revision.get("package")
+            if not package:
+                continue
+            for item in package.get("files", []):
+                content_value = item.pop("content", None)
+                if content_value is not None:
+                    if item.get("encoding", "utf-8") == "base64":
+                        try:
+                            content = base64.b64decode(content_value, validate=True)
+                        except ValueError as exc:
+                            raise ConflictError("package_file_invalid") from exc
+                    else:
+                        content = content_value.encode("utf-8")
+                    record = self._package_artifact_record(
+                        item["path"],
+                        content,
+                        item.get("media_type") or package_media_type(item["path"]),
+                    )
+                    artifacts[record["artifact_id"]] = record
+                    item.update({
+                        "artifact_id": record["artifact_id"],
+                        "sha256": record["sha256"],
+                        "size": record["size_bytes"],
+                        "media_type": record["media_type"],
+                    })
+                elif not ARTIFACT_ID.fullmatch(str(item.get("artifact_id", ""))):
+                    raise ConflictError("package_artifact_missing")
         payload = deepcopy(projection)
         payload["documents"] = {
             document_type: [
@@ -338,6 +410,7 @@ class ProjectStore(PromptAuditMixin):
             {"revision_hash": sample["revision_hash"], "status": sample["status"]}
             for sample in projection.get("samples", [])
         ]
+        payload.pop("full_deck_revisions", None)
         return payload, list(artifacts.values()), projection
 
     def _hydrate_manifest(
@@ -349,6 +422,12 @@ class ProjectStore(PromptAuditMixin):
         include_sample_html: bool = True,
     ) -> dict[str, Any]:
         value = deepcopy(payload)
+        value["format_version"] = SCHEMA_VERSION
+        value.setdefault("storage", {
+            "engine": "sqlite-wal",
+            "database": "project.db",
+            "artifacts": "artifacts",
+        })
         for document_type, revisions in value.get("documents", {}).items():
             expanded = []
             for revision in revisions:
@@ -442,6 +521,89 @@ class ProjectStore(PromptAuditMixin):
                 }
             expanded_samples.append(expanded)
         value["samples"] = expanded_samples
+        full_deck = value.get("full_deck")
+        expanded_full_deck_revisions = value.get("full_deck_revisions", [])
+        if full_deck and not expanded_full_deck_revisions:
+            for reference in full_deck.get("revision_refs", []):
+                row = connection.execute(
+                    "SELECT * FROM full_deck_revisions WHERE revision_hash = ?",
+                    (reference.get("revision_hash"),),
+                ).fetchone()
+                if row is None:
+                    raise ConflictError("full_deck_revision_missing")
+                page_rows = connection.execute(
+                    """
+                    SELECT position, slot_id, source_slide_number, title, status,
+                           source_type, content_ref_json, derived_from_json
+                    FROM full_deck_pages
+                    WHERE revision_hash = ? ORDER BY position
+                    """,
+                    (row["revision_hash"],),
+                ).fetchall()
+                revision = {
+                    "full_deck_id": row["full_deck_id"],
+                    "revision": row["revision"],
+                    "revision_hash": row["revision_hash"],
+                    "parent_revision_hash": row["parent_revision_hash"],
+                    "feedback": row["feedback"],
+                    "status": reference.get("status", row["status"]),
+                    "plan": {
+                        "pages": [{
+                            "slot_id": page["slot_id"],
+                            "position": page["position"],
+                            "outline_ref": {
+                                "outline_revision_hash": full_deck["outline_revision_hash"],
+                                "source_slide_number": page["source_slide_number"],
+                            } if page["source_slide_number"] is not None else None,
+                            "title": page["title"],
+                            "status": page["status"],
+                            "source_type": page["source_type"],
+                            "content_ref": json.loads(page["content_ref_json"])
+                            if page["content_ref_json"] else None,
+                            "derived_from": json.loads(page["derived_from_json"])
+                            if page["derived_from_json"] else None,
+                        } for page in page_rows],
+                    },
+                    "package": None,
+                    "created_at": row["created_at"],
+                    "provenance": json.loads(row["provenance_json"]),
+                }
+                package_row = connection.execute(
+                    "SELECT * FROM full_deck_packages WHERE revision_hash = ?",
+                    (row["revision_hash"],),
+                ).fetchone()
+                if package_row is not None:
+                    package_files = connection.execute(
+                        """
+                        SELECT f.logical_path, f.artifact_id, a.sha256, f.size_bytes,
+                               f.media_type, f.origin
+                        FROM full_deck_package_files f
+                        JOIN artifacts a ON a.artifact_id = f.artifact_id
+                        WHERE f.revision_hash = ? ORDER BY f.file_index
+                        """,
+                        (row["revision_hash"],),
+                    ).fetchall()
+                    revision["package"] = {
+                        "entrypoint": package_row["entrypoint"],
+                        "title": package_row["title"],
+                        "slide_count": package_row["slide_count"],
+                        "slides": json.loads(package_row["slides_json"]),
+                        "package_hash": package_row["package_hash"],
+                        "composition_manifest": json.loads(
+                            package_row["composition_manifest_json"]
+                        ),
+                        "files": [{
+                            "path": item["logical_path"],
+                            "artifact_id": item["artifact_id"],
+                            "sha256": item["sha256"],
+                            "size": item["size_bytes"],
+                            "media_type": item["media_type"],
+                            "origin": item["origin"],
+                        } for item in package_files],
+                    }
+                expanded_full_deck_revisions.append(revision)
+        value["full_deck"] = full_deck or None
+        value["full_deck_revisions"] = expanded_full_deck_revisions
         samples = value.get("samples", [])
         current_hash = value.get("current_sample_revision_hash")
         if not current_hash and samples:
@@ -612,6 +774,77 @@ class ProjectStore(PromptAuditMixin):
                             item["media_type"], item["size"], item.get("origin", "model_output"),
                         ),
                     )
+        for revision in payload.get("full_deck_revisions", []):
+            connection.execute(
+                """
+                INSERT INTO full_deck_revisions(
+                    revision_hash, full_deck_id, revision, parent_revision_hash,
+                    feedback, status, created_at, provenance_json, checkpoint_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(revision_hash) DO UPDATE SET status = excluded.status
+                """,
+                (
+                    revision["revision_hash"], revision["full_deck_id"],
+                    revision["revision"], revision.get("parent_revision_hash"),
+                    revision.get("feedback"), revision["status"], revision["created_at"],
+                    json_text(revision.get("provenance", {})), checkpoint_id,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM full_deck_pages WHERE revision_hash = ?",
+                (revision["revision_hash"],),
+            )
+            for page in revision.get("plan", {}).get("pages", []):
+                outline_ref = page.get("outline_ref") or {}
+                connection.execute(
+                    """
+                    INSERT INTO full_deck_pages(
+                        revision_hash, position, slot_id, source_slide_number,
+                        title, status, source_type, content_ref_json, derived_from_json
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision["revision_hash"], page["position"], page["slot_id"],
+                        outline_ref.get("source_slide_number"), page["title"], page["status"],
+                        page["source_type"],
+                        json_text(page["content_ref"]) if page.get("content_ref") else None,
+                        json_text(page["derived_from"]) if page.get("derived_from") else None,
+                    ),
+                )
+            package = revision.get("package")
+            if package:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO full_deck_packages(
+                        revision_hash, package_hash, entrypoint, title, slide_count,
+                        slides_json, composition_manifest_json
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revision["revision_hash"], package["package_hash"],
+                        package["entrypoint"], package["title"], package["slide_count"],
+                        json_text(package.get("slides", [])),
+                        json_text(package.get("composition_manifest", {})),
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM full_deck_package_files WHERE revision_hash = ?",
+                    (revision["revision_hash"],),
+                )
+                for index, item in enumerate(package.get("files", [])):
+                    connection.execute(
+                        """
+                        INSERT INTO full_deck_package_files(
+                            revision_hash, file_index, logical_path, artifact_id,
+                            media_type, size_bytes, origin
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            revision["revision_hash"], index, item["path"], item["artifact_id"],
+                            item["media_type"], item["size"],
+                            item.get("origin", "model_output"),
+                        ),
+                    )
 
     @staticmethod
     def _sync_branches(connection: sqlite3.Connection, payload: dict[str, Any]) -> None:
@@ -661,7 +894,7 @@ class ProjectStore(PromptAuditMixin):
         payload: dict[str, Any],
         projection: dict[str, Any],
         artifacts: list[dict[str, Any]],
-        event: str,
+        event: str | list[tuple[str, dict[str, Any]]],
         details: dict[str, Any],
         parent_checkpoint_id: str | None,
     ) -> None:
@@ -681,10 +914,15 @@ class ProjectStore(PromptAuditMixin):
         self._sync_revisions(connection, projection, payload["checkpoint_id"])
         self._sync_branches(connection, payload)
         self._write_project_state(connection, payload)
-        connection.execute(
-            "INSERT INTO events(at, event, checkpoint_id, details_json) VALUES(?, ?, ?, ?)",
-            (utc_now(), event, payload["checkpoint_id"], json_text(details)),
-        )
+        events = [(event, details)] if isinstance(event, str) else event
+        for event_name, event_details in events:
+            connection.execute(
+                "INSERT INTO events(at, event, checkpoint_id, details_json) VALUES(?, ?, ?, ?)",
+                (
+                    utc_now(), event_name, payload["checkpoint_id"],
+                    json_text(event_details),
+                ),
+            )
 
     def create(self, task: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
         self._ensure_database()
@@ -707,6 +945,8 @@ class ProjectStore(PromptAuditMixin):
                 "documents": {"narrative_structure": [], "slide_outline": []},
                 "samples": [],
                 "current_sample_revision_hash": None,
+                "full_deck": None,
+                "full_deck_revisions": [],
                 "checkpoint_id": checkpoint,
                 "active_job_id": None,
                 "created_at": created_at,
@@ -728,6 +968,21 @@ class ProjectStore(PromptAuditMixin):
         *,
         expected_checkpoint_id: str,
     ) -> dict[str, Any]:
+        return self.update_events(
+            transform,
+            [(event, details or {})],
+            expected_checkpoint_id=expected_checkpoint_id,
+        )
+
+    def update_events(
+        self,
+        transform: Callable[[dict[str, Any]], dict[str, Any]],
+        events: list[tuple[str, dict[str, Any]]],
+        *,
+        expected_checkpoint_id: str,
+    ) -> dict[str, Any]:
+        if not events:
+            raise ValueError("at least one project event is required")
         self._ensure_database()
         with self.lock, self._transaction() as connection:
             raw = self._raw_current(connection)
@@ -742,7 +997,7 @@ class ProjectStore(PromptAuditMixin):
             updated.setdefault("branches", {})[updated.get("branch", "main")] = updated["checkpoint_id"]
             payload, artifacts, projection = self._externalize_manifest(updated)
             self._commit_raw(
-                connection, payload, projection, artifacts, event, details or {}, parent_checkpoint_id,
+                connection, payload, projection, artifacts, events, {}, parent_checkpoint_id,
             )
             return self._hydrate_manifest(payload, connection)
 
@@ -909,7 +1164,18 @@ class ProjectStore(PromptAuditMixin):
             (item for item in manifest.get("samples", []) if item.get("revision_hash") == current_hash),
             (manifest.get("samples") or [None])[-1],
         )
-        if sample and sample.get("status") == "approved":
+        full_deck = manifest.get("full_deck") or {}
+        current_full_deck_hash = full_deck.get("current_revision_hash")
+        current_full_deck = next(
+            (
+                item for item in manifest.get("full_deck_revisions", [])
+                if item.get("revision_hash") == current_full_deck_hash
+            ),
+            None,
+        )
+        if current_full_deck and current_full_deck.get("status") == "approved":
+            completed_through = 5
+        elif sample and sample.get("status") == "approved":
             completed_through = 4
         elif outline and outline.get("status") == "approved":
             completed_through = 3
@@ -945,18 +1211,39 @@ class ProjectStore(PromptAuditMixin):
                     and (self._latest_document(item, stage) or {}).get("status") == "approved"
                 ]
                 return matches[0] if matches else None
-            matches = [
-                item for item in lineage
-                if item.get("state") == "ppt_sample"
-                and item.get("phase") == "completed"
-                and next(
-                    (
-                        sample for sample in item.get("samples", [])
-                        if sample.get("revision_hash") == item.get("current_sample_revision_hash")
-                    ),
-                    (item.get("samples") or [None])[-1],
-                ).get("status") == "approved"
-            ]
+            if stage == "ppt_sample":
+                matches = []
+                for item in lineage:
+                    selected_sample = next(
+                        (
+                            candidate for candidate in item.get("samples", [])
+                            if candidate.get("revision_hash")
+                            == item.get("current_sample_revision_hash")
+                        ),
+                        (item.get("samples") or [None])[-1],
+                    )
+                    if (
+                        item.get("state") in {"ppt_sample", "ppt_full", "acceptance"}
+                        and selected_sample
+                        and selected_sample.get("status") == "approved"
+                    ):
+                        matches.append(item)
+                return matches[0] if matches else None
+            if stage == "ppt_full":
+                matches = []
+                for item in lineage:
+                    root = item.get("full_deck") or {}
+                    selected_revision = next(
+                        (
+                            candidate for candidate in item.get("full_deck_revisions", [])
+                            if candidate.get("revision_hash") == root.get("current_revision_hash")
+                        ),
+                        None,
+                    )
+                    if selected_revision and selected_revision.get("status") == "approved":
+                        matches.append(item)
+                return matches[-1] if matches else None
+            matches = [item for item in lineage if item.get("state") == "acceptance"]
             return matches[-1] if matches else None
 
         sequence = {item["checkpoint_id"]: index for index, item in enumerate(lineage, 1)}
@@ -990,6 +1277,26 @@ class ProjectStore(PromptAuditMixin):
                         for item in current_sample["package"].get("files", [])
                     ]
                 public_snapshot["samples"] = [current_sample]
+            if public_snapshot.get("full_deck_revisions"):
+                snapshot_root = public_snapshot.get("full_deck") or {}
+                current_revision = deepcopy(next(
+                    (
+                        item for item in public_snapshot["full_deck_revisions"]
+                        if item.get("revision_hash") == snapshot_root.get("current_revision_hash")
+                    ),
+                    public_snapshot["full_deck_revisions"][-1],
+                ))
+                package = current_revision.get("package")
+                if package:
+                    package["files"] = [
+                        {
+                            key: item[key] for key in (
+                                "path", "artifact_id", "sha256", "size", "media_type", "origin"
+                            ) if key in item
+                        }
+                        for item in package.get("files", [])
+                    ]
+                public_snapshot["full_deck_revisions"] = [current_revision]
             response.append({
                 "checkpoint_id": snapshot["checkpoint_id"],
                 "branch": snapshot.get("branch", "main"),
@@ -1016,6 +1323,8 @@ class ProjectStore(PromptAuditMixin):
                 clarification_answers={}, documents={"narrative_structure": [], "slide_outline": []},
                 samples=[],
                 current_sample_revision_hash=None,
+                full_deck=None,
+                full_deck_revisions=[],
             )
         elif stage == "narrative_structure":
             if not value.get("clarification_answers"):
@@ -1024,6 +1333,7 @@ class ProjectStore(PromptAuditMixin):
                 state="narrative_structure", phase="ready_to_generate",
                 documents={"narrative_structure": [], "slide_outline": []}, samples=[],
                 current_sample_revision_hash=None,
+                full_deck=None, full_deck_revisions=[],
             )
         elif stage == "slide_outline":
             narrative = self._latest_document(value, "narrative_structure")
@@ -1032,14 +1342,57 @@ class ProjectStore(PromptAuditMixin):
             value["documents"]["slide_outline"] = []
             value["samples"] = []
             value["current_sample_revision_hash"] = None
+            value["full_deck"] = None
+            value["full_deck_revisions"] = []
             value.update(state="slide_outline", phase="ready_to_generate")
-        else:
+        elif stage == "ppt_sample":
             outline = self._latest_document(value, "slide_outline")
             if not outline or outline.get("status") != "approved":
                 raise ValueError("sample rerun requires an approved outline")
             value["samples"] = []
             value["current_sample_revision_hash"] = None
+            value["full_deck"] = None
+            value["full_deck_revisions"] = []
             value.update(state="ppt_sample", phase="ready_to_generate")
+        elif stage == "ppt_full":
+            outline = self._latest_document(value, "slide_outline")
+            current_sample_hash = value.get("current_sample_revision_hash")
+            sample = next(
+                (
+                    item for item in value.get("samples", [])
+                    if item.get("revision_hash") == current_sample_hash
+                ),
+                None,
+            )
+            root = value.get("full_deck") or {}
+            references = root.get("revision_refs", [])
+            if (
+                not outline or outline.get("status") != "approved"
+                or not sample or sample.get("status") != "approved"
+                or not references
+            ):
+                raise ValueError("full-deck rerun requires an approved outline and sample")
+            initial_hash = references[0]["revision_hash"]
+            root["current_revision_hash"] = initial_hash
+            root["revision_refs"] = references[:1]
+            value["full_deck"] = root
+            value["full_deck_revisions"] = [
+                item for item in value.get("full_deck_revisions", [])
+                if item.get("revision_hash") == initial_hash
+            ]
+            value.update(state="ppt_full", phase="ready_to_generate")
+        else:
+            root = value.get("full_deck") or {}
+            current_revision = next(
+                (
+                    item for item in value.get("full_deck_revisions", [])
+                    if item.get("revision_hash") == root.get("current_revision_hash")
+                ),
+                None,
+            )
+            if not current_revision or current_revision.get("status") != "approved":
+                raise ValueError("acceptance rerun requires an approved full deck")
+            value.update(state="acceptance", phase="ready_for_review")
         return value
 
     def _checkpoint(self, connection: sqlite3.Connection, checkpoint_id: str) -> dict[str, Any]:
@@ -1091,6 +1444,12 @@ class ProjectStore(PromptAuditMixin):
                     if source_index is None:
                         raise FileNotFoundError(sample_revision_hash)
                     snapshot["samples"] = snapshot["samples"][: source_index + 1]
+                    if (
+                        snapshot.get("full_deck")
+                        and snapshot["full_deck"].get("approved_sample_revision_hash")
+                        != sample_revision_hash
+                    ):
+                        mark_full_deck_stale(snapshot)
                     snapshot["current_sample_revision_hash"] = sample_revision_hash
                     snapshot.update(state="ppt_sample", phase="waiting_human_approval")
                 branches = current.get("branches", {current.get("branch", "main"): current["checkpoint_id"]})
@@ -1236,6 +1595,8 @@ class ProjectStore(PromptAuditMixin):
             )
             if selected is None:
                 raise FileNotFoundError(revision_hash)
+            if value.get("current_sample_revision_hash") != revision_hash:
+                mark_full_deck_stale(value)
             value["current_sample_revision_hash"] = revision_hash
             value.update(
                 state="ppt_sample",

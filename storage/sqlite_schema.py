@@ -108,6 +108,52 @@ CREATE TABLE IF NOT EXISTS sample_package_files (
     PRIMARY KEY (revision_hash, logical_path),
     UNIQUE (revision_hash, file_index)
 );
+CREATE TABLE IF NOT EXISTS full_deck_revisions (
+    revision_hash TEXT PRIMARY KEY,
+    full_deck_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    parent_revision_hash TEXT,
+    feedback TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    provenance_json TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS full_deck_revision_number_idx
+ON full_deck_revisions(full_deck_id, revision);
+CREATE TABLE IF NOT EXISTS full_deck_pages (
+    revision_hash TEXT NOT NULL REFERENCES full_deck_revisions(revision_hash) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    slot_id TEXT NOT NULL,
+    source_slide_number INTEGER,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    content_ref_json TEXT,
+    derived_from_json TEXT,
+    PRIMARY KEY (revision_hash, slot_id),
+    UNIQUE (revision_hash, position)
+);
+CREATE TABLE IF NOT EXISTS full_deck_packages (
+    revision_hash TEXT PRIMARY KEY REFERENCES full_deck_revisions(revision_hash) ON DELETE CASCADE,
+    package_hash TEXT NOT NULL,
+    entrypoint TEXT NOT NULL,
+    title TEXT NOT NULL,
+    slide_count INTEGER NOT NULL,
+    slides_json TEXT NOT NULL,
+    composition_manifest_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS full_deck_package_files (
+    revision_hash TEXT NOT NULL REFERENCES full_deck_packages(revision_hash) ON DELETE CASCADE,
+    file_index INTEGER NOT NULL,
+    logical_path TEXT NOT NULL,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    origin TEXT NOT NULL,
+    PRIMARY KEY (revision_hash, logical_path),
+    UNIQUE (revision_hash, file_index)
+);
 CREATE TABLE IF NOT EXISTS prompt_calls (
     prompt_call_id TEXT PRIMARY KEY,
     parent_prompt_call_id TEXT,
