@@ -93,6 +93,36 @@ def test_full_deck_revision_actions_expose_feedback_change_and_loading_context()
     assert 'role="alert"' in full_deck
 
 
+def test_phase5_acceptance_workspace_is_accessible_and_auditable() -> None:
+    app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    full_deck = (ROOT / "frontend/static/js/full-deck.js").read_text(encoding="utf-8")
+    api = (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
+    css = (ROOT / "frontend/static/css/main.css").read_text(encoding="utf-8")
+    server = (ROOT / "main_front.py").read_text(encoding="utf-8")
+
+    assert '{ id: "acceptance", label: "确认验收" }' in app
+    assert '{ id: "acceptance", label: "确认验收", future: true }' not in app
+    assert 'ready_for_review: "待最终验收"' in app
+    assert "function acceptanceView()" in app
+    assert 'id="acceptance-title" tabindex="-1"' in app
+    assert 'document.querySelector("#acceptance-title")?.focus()' in app
+    assert 'data-action="approve_full_deck"' in full_deck
+    assert "确认全稿并进入验收" in full_deck
+    assert "正在进入验收" in app
+    assert 'id="full-deck-approve-error" role="alert"' in full_deck
+    assert "验收基线已锁定" in full_deck
+    assert "已确认版本保持只读" in full_deck
+    assert "创建后续全稿修订" in full_deck
+    assert "导出验收审计" in full_deck
+    assert 'stage === "ppt_full" || stage === "acceptance"' in app
+    assert "已确认为验收基线" in app
+    assert "approveFullDeck:" in api
+    assert "/full-deck/approve" in api
+    assert "/audit/export" in server
+    assert ".acceptance-overview" in css
+    assert ".full-deck-approval .btn{width:100%}" in css
+
+
 def test_full_deck_preview_is_sandboxed_and_uses_package_routes() -> None:
     app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
     full_deck = (ROOT / "frontend/static/js/full-deck.js").read_text(encoding="utf-8")

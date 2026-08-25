@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_core.jobs import ActiveJobError, JobRegistry
-from agent_core.models import TaskCard
+from agent_core.models import TaskCard, utc_now
 from agent_core.workflow import Workflow, capabilities
 from agent_core.workflow_support import stable_hash
 from configs.runtime import ManagedRuntime, RuntimeConfigUpdate
@@ -290,6 +290,7 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
         "capabilities": capabilities(manifest, active_job=active_job is not None),
         "active_job": active_job,
         "progress_snapshots": store.progress_snapshots(),
+        "audit_export_url": f"/api/projects/{store.project_id}/audit/export",
     }
 
 
@@ -551,6 +552,21 @@ def enter_full_deck(project_id: str, request: FullDeckEnterRequest) -> dict[str,
         Workflow(store, current_runtime).enter_full_deck(
             request.checkpoint_id,
             request.sample_revision_hash,
+        )
+    return project_view(store)
+
+
+@app.post("/api/projects/{project_id}/full-deck/approve")
+def approve_full_deck(project_id: str, request: ApproveRequest) -> dict[str, Any]:
+    store = store_for(project_id)
+    with jobs.project_guard(project_id) as active:
+        if active:
+            raise ConflictError("active_job:请等待当前任务结束后再确认全稿。")
+        with runtime_config_lock:
+            current_runtime = runtime
+        Workflow(store, current_runtime).approve_full_deck(
+            request.checkpoint_id,
+            request.revision_hash,
         )
     return project_view(store)
 
@@ -924,6 +940,53 @@ def export_prompt_calls(project_id: str) -> PlainTextResponse:
         store.export_prompt_calls_jsonl(),
         media_type="application/x-ndjson",
         headers={"Content-Disposition": f'attachment; filename="{project_id}-prompt-calls.jsonl"'},
+    )
+
+
+@app.get("/api/projects/{project_id}/audit/export")
+def export_project_audit(project_id: str) -> JSONResponse:
+    """Export a bounded, redacted evidence bundle without package file contents."""
+
+    store = store_for(project_id)
+    manifest = store.read(latest_sample_only=True, include_sample_html=False)
+    snapshots = store.progress_snapshots()
+    payload = {
+        "format": "ppt-agent-audit-v1",
+        "exported_at": utc_now(),
+        "project": {
+            key: manifest.get(key)
+            for key in (
+                "project_id", "title", "branch", "state", "phase",
+                "checkpoint_id", "created_at", "updated_at",
+            )
+        },
+        "full_deck": manifest.get("full_deck"),
+        "full_deck_revisions": store.full_deck_history()[:500]
+        if manifest.get("full_deck") else [],
+        "limits": {
+            "full_deck_revisions": 500,
+            "timeline": 2000,
+            "prompt_calls": 500,
+        },
+        "progress_snapshots": [
+            {
+                key: item.get(key)
+                for key in (
+                    "stage", "checkpoint_id", "branch", "source_state",
+                    "phase", "updated_at", "sequence", "completed",
+                )
+            }
+            for item in snapshots
+        ],
+        "timeline": store.events(limit=2000),
+        "prompt_calls": store.prompt_calls(limit=500),
+    }
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Content-Disposition": f'attachment; filename="{project_id}-audit.json"',
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

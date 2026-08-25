@@ -89,10 +89,25 @@ function feedbackBody(revision, options) {
     ? `<button class="btn btn--secondary" type="button" data-action="regenerate_full_deck">${packageReady ? "重新生成非样品页" : "重新生成待完成页"}</button>`
     : "";
   const revise = options.canRevise
-    ? '<button class="btn btn--primary" type="submit">让 AI 修改</button>'
+    ? `<button class="btn btn--primary" type="submit">${options.acceptanceMode ? "创建后续全稿修订" : "让 AI 修改"}</button>`
     : "";
   if (!regenerate && !revise) return "";
-  return `<form class="sample-feedback full-deck-feedback" id="full-deck-feedback-form"><div class="field"><label for="full-deck-feedback">修改意见</label><textarea class="input" id="full-deck-feedback" name="feedback" maxlength="4000" required placeholder="例如：第 5 页把核心结论放进标题，并保持其余页面不变。" aria-describedby="full-deck-feedback-help"></textarea><small id="full-deck-feedback-help">AI 会从当前选中的全稿版本继续；只有声明的变更页会获得新内容引用，成功后保存为不可变子修订。</small><div class="field-error" id="full-deck-feedback-error" role="alert"></div></div><div class="sample-feedback__actions">${regenerate}${revise}</div></form>`;
+  const label = options.acceptanceMode ? "后续修改意见" : "修改意见";
+  const help = options.acceptanceMode
+    ? "已确认版本保持只读；提交后会以它为父版本创建不可变子修订，并返回全稿工作区。"
+    : "AI 会从当前选中的全稿版本继续；只有声明的变更页会获得新内容引用，成功后保存为不可变子修订。";
+  return `<form class="sample-feedback full-deck-feedback" id="full-deck-feedback-form"><div class="field"><label for="full-deck-feedback">${label}</label><textarea class="input" id="full-deck-feedback" name="feedback" maxlength="4000" required placeholder="例如：第 5 页把核心结论放进标题，并保持其余页面不变。" aria-describedby="full-deck-feedback-help"></textarea><small id="full-deck-feedback-help">${help}</small><div class="field-error" id="full-deck-feedback-error" role="alert"></div></div><div class="sample-feedback__actions">${regenerate}${revise}</div></form>`;
+}
+
+function approvalBody(options) {
+  if (!options.canApprove) return "";
+  return `<div class="sticky-actions full-deck-approval"><p>确认后将锁定当前修订为验收基线，并原子进入最终验收工作区。</p><div><button class="btn btn--primary" type="button" data-action="approve_full_deck">确认全稿并进入验收</button><div class="field-error" id="full-deck-approve-error" role="alert"></div></div></div>`;
+}
+
+function acceptanceBody(revision, options, escapeHtml) {
+  if (!options.acceptanceMode) return "";
+  const packageInfo = revision.package || {};
+  return `<section class="acceptance-overview" aria-labelledby="acceptance-overview-title"><div><span class="badge badge--success">验收基线已锁定</span><h3 id="acceptance-overview-title">修订 R${revision.revision} 已进入最终验收</h3><p>当前全稿信息与产物保持只读；如需继续调整，请在下方提交新意见创建后续修订。</p></div><dl><div><dt>页面</dt><dd>${packageInfo.slide_count || 0} 页</dd></div><div><dt>修订哈希</dt><dd class="code">${escapeHtml(revision.revision_hash)}</dd></div><div><dt>包哈希</dt><dd class="code">${escapeHtml(packageInfo.package_hash || "—")}</dd></div></dl><div class="button-row"><a class="btn btn--secondary" href="${escapeHtml(options.auditExportUrl || "#")}" download>导出验收审计</a></div></section>`;
 }
 
 export function fullDeckBody(
@@ -116,7 +131,9 @@ export function fullDeckBody(
   const callout = revision.status === "approved"
     ? '<div class="callout"><strong>当前全稿已确认。</strong> 历史版本仍可查看、切换和创建工程分支。</div>'
     : "";
+  const acceptance = acceptanceBody(revision, options, escapeHtml);
   const plan = pagePlanBody(revision, options, escapeHtml);
+  const approval = approvalBody(options);
   const feedback = feedbackBody(revision, options);
   const attempts = attemptsBody(options.attempts || [], escapeHtml);
   const history = historyBody(
@@ -126,7 +143,7 @@ export function fullDeckBody(
     escapeHtml,
   );
   return {
-    body: `${callout}${preview}${plan}${feedback}${attempts}${history}`,
+    body: `${callout}${acceptance}${preview}${plan}${approval}${feedback}${attempts}${history}`,
     status: `<div class="document-status"><span class="badge ${statusClass}">${escapeHtml(status)}</span><span class="badge badge--info">修订 ${revision.revision}</span></div>`,
   };
 }

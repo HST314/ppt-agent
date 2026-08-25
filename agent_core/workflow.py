@@ -14,7 +14,10 @@ from agent_core.full_deck_generation import (
     generate_full_deck as run_full_deck_generation,
     pending_full_deck_segments,
 )
-from agent_core.full_deck_revision import create_full_deck_revision
+from agent_core.full_deck_revision import (
+    create_full_deck_revision,
+    full_deck_package_model,
+)
 from agent_core.models import (
     DocumentRevision,
     FullDeck,
@@ -368,7 +371,7 @@ def capabilities(
             caps.append("generate_sample")
         elif phase == "waiting_human_approval":
             caps.extend(["revise_sample", "approve_sample", "regenerate_sample"])
-    elif state == "ppt_full":
+    elif state in {"ppt_full", "acceptance"}:
         current_full_deck = _current_full_deck_revision(manifest)
         if current_full_deck:
             caps.append("inspect_full_deck")
@@ -385,7 +388,8 @@ def capabilities(
                 ):
                     caps.append("generate_full_deck")
                 if (
-                    current_full_deck.get("status") == "pending_approval"
+                    state == "ppt_full"
+                    and current_full_deck.get("status") == "pending_approval"
                     and current_full_deck.get("package")
                 ):
                     caps.append("approve_full_deck")
@@ -1120,6 +1124,95 @@ class Workflow:
             revision_hash,
             operation="regenerate_full_deck",
             cancel_requested=cancel_requested,
+        )
+
+    def approve_full_deck(
+        self,
+        checkpoint_id: str,
+        revision_hash: str,
+    ) -> dict[str, Any]:
+        """Approve the complete current revision and enter acceptance atomically."""
+
+        manifest = self.store.read(include_sample_html=False)
+        if manifest["checkpoint_id"] != checkpoint_id:
+            raise ConflictError("stale_revision:工程已更新，请刷新后重试。")
+        root = manifest.get("full_deck") or {}
+        current = _current_full_deck_revision(manifest)
+        if (
+            current is None
+            or root.get("current_revision_hash") != revision_hash
+            or current.get("revision_hash") != revision_hash
+        ):
+            raise ConflictError("stale_revision:当前全稿版本已变化，请刷新后重试。")
+        if current.get("status") == "stale":
+            raise ConflictError("stale_revision:上游内容已变化，请从样品阶段重建全稿。")
+        pages = current.get("plan", {}).get("pages", [])
+        package = current.get("package")
+        try:
+            validated_package = full_deck_package_model(self, revision_hash, package or {})
+            FullDeckRevision.model_validate({
+                **current,
+                "package": validated_package.model_dump(mode="json"),
+            })
+        except (FileNotFoundError, FullDeckComposerError, ValidationError, ValueError) as exc:
+            raise ConflictError(
+                "full_deck_incomplete:当前全稿修订未通过完整性校验，请重新生成后再确认。"
+            ) from exc
+        if (
+            current.get("status") != "pending_approval"
+            or package is None
+            or not pages
+            or any(page.get("status") != "ready" for page in pages)
+            or package.get("slide_count") != len(pages)
+        ):
+            raise ConflictError(
+                "full_deck_incomplete:只有页面完整且等待确认的当前全稿修订可以进入验收。"
+            )
+        self._require(manifest, "approve_full_deck", checkpoint_id)
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            selected_root = value.get("full_deck") or {}
+            selected = _current_full_deck_revision(value)
+            if (
+                selected is None
+                or selected_root.get("current_revision_hash") != revision_hash
+                or selected.get("revision_hash") != revision_hash
+            ):
+                raise ConflictError("stale_revision")
+            if (
+                selected.get("status") != "pending_approval"
+                or not selected.get("package")
+                or any(
+                    page.get("status") != "ready"
+                    for page in selected.get("plan", {}).get("pages", [])
+                )
+            ):
+                raise ConflictError("full_deck_incomplete")
+            selected["status"] = "approved"
+            reference = next(
+                (
+                    item for item in selected_root.get("revision_refs", [])
+                    if item.get("revision_hash") == revision_hash
+                ),
+                None,
+            )
+            if reference is None:
+                raise ConflictError("full_deck_revision_not_found")
+            reference["status"] = "approved"
+            value["full_deck"] = selected_root
+            value.update(state="acceptance", phase="ready_for_review")
+            return value
+
+        return self.store.update(
+            apply,
+            "full_deck_approved",
+            {
+                "full_deck_id": root["full_deck_id"],
+                "revision_hash": revision_hash,
+                "package_hash": package["package_hash"],
+                "page_count": len(pages),
+            },
+            expected_checkpoint_id=checkpoint_id,
         )
 
     def restore_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:

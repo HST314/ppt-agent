@@ -32,6 +32,7 @@ export const api = {
   restoreSample: (id, revisionHash, checkpointId) => request(`/api/projects/${encodeURIComponent(id)}/samples/revisions/${encodeURIComponent(revisionHash)}/restore`, { method: "POST", body: JSON.stringify({ checkpoint_id: checkpointId }) }),
   branchFromSample: (id, revisionHash, payload) => request(`/api/projects/${encodeURIComponent(id)}/samples/revisions/${encodeURIComponent(revisionHash)}/branches`, { method: "POST", body: JSON.stringify(payload) }),
   enterFullDeck: (id, payload) => request(`/api/projects/${encodeURIComponent(id)}/full-deck/enter`, { method: "POST", body: JSON.stringify(payload) }),
+  approveFullDeck: (id, payload) => request(`/api/projects/${encodeURIComponent(id)}/full-deck/approve`, { method: "POST", body: JSON.stringify(payload) }),
   fullDeckRevisions: (id) => request(`/api/projects/${encodeURIComponent(id)}/full-deck/revisions`),
   fullDeckRevision: (id, revisionHash) => request(`/api/projects/${encodeURIComponent(id)}/full-deck/revisions/${encodeURIComponent(revisionHash)}`),
   restoreFullDeck: (id, revisionHash, checkpointId) => request(`/api/projects/${encodeURIComponent(id)}/full-deck/revisions/${encodeURIComponent(revisionHash)}/restore`, { method: "POST", body: JSON.stringify({ checkpoint_id: checkpointId }) }),

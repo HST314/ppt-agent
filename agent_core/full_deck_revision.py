@@ -52,7 +52,7 @@ from storage.project_store import ConflictError
 FullDeckRevisionOperation = Literal["revise_full_deck", "regenerate_full_deck"]
 
 
-def _full_deck_package_model(
+def full_deck_package_model(
     workflow: FullDeckWorkflowHost,
     revision_hash: str,
     payload: dict[str, Any],
@@ -303,7 +303,7 @@ def create_full_deck_revision(
         )
     sample_package = package_model(sample["package"])
     parent_package = (
-        _full_deck_package_model(workflow, revision_hash, current["package"])
+        full_deck_package_model(workflow, revision_hash, current["package"])
         if current.get("package")
         else None
     )

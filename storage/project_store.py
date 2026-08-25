@@ -791,7 +791,13 @@ class ProjectStore(PromptAuditMixin):
                     revision_hash, full_deck_id, revision, parent_revision_hash,
                     feedback, status, created_at, provenance_json, checkpoint_id
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(revision_hash) DO UPDATE SET status = excluded.status
+                ON CONFLICT(revision_hash) DO UPDATE SET
+                    checkpoint_id = CASE
+                        WHEN full_deck_revisions.status != excluded.status
+                        THEN excluded.checkpoint_id
+                        ELSE full_deck_revisions.checkpoint_id
+                    END,
+                    status = excluded.status
                 """,
                 (
                     revision["revision_hash"], revision["full_deck_id"],

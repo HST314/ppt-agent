@@ -17,7 +17,7 @@ const STAGES = [
   { id: "slide_outline", label: "逐页大纲" },
   { id: "ppt_sample", label: "PPT 样品" },
   { id: "ppt_full", label: "PPT 全稿" },
-  { id: "acceptance", label: "确认验收", future: true },
+  { id: "acceptance", label: "确认验收" },
 ];
 
 const STATE_LABELS = {
@@ -36,6 +36,7 @@ const PHASE_LABELS = {
   ready_to_generate: "待生成",
   waiting_human_approval: "等待确认",
   completed: "已完成",
+  ready_for_review: "待最终验收",
 };
 
 const MODEL_STATE_LABELS = {
@@ -321,8 +322,26 @@ function fullDeckView() {
     canRegenerate: capabilities.includes("regenerate_full_deck"),
     canRevise: capabilities.includes("revise_full_deck"),
     canBranch: capabilities.includes("branch_full_deck_revision"),
+    canApprove: capabilities.includes("approve_full_deck"),
   });
   return `<section class="panel section ia-section stage"><div class="section__head"><div><h2 id="full-deck-title" tabindex="-1">HTML-PPT 全稿</h2><p>浏览完整页面清单、安全预览和不可变修订历史</p></div>${view.status}</div><div class="panel__body">${view.body}</div></section>`;
+}
+
+function acceptanceView() {
+  const revision = state.project.full_deck_revision;
+  if (!revision) return loadingPanel("正在读取最终验收基线…");
+  const capabilities = state.project.capabilities || [];
+  const view = fullDeckBody(revision, escapeHtml, {
+    history: state.project.full_deck_revisions || [],
+    attempts: state.project.full_deck_attempts || [],
+    selectedHash: revision.revision_hash,
+    sample: headSample(),
+    canRevise: capabilities.includes("revise_full_deck"),
+    canBranch: capabilities.includes("branch_full_deck_revision"),
+    acceptanceMode: true,
+    auditExportUrl: state.project.audit_export_url,
+  });
+  return `<section class="panel section ia-section stage acceptance-workspace"><div class="section__head"><div><h2 id="acceptance-title" tabindex="-1">确认验收</h2><p>只读核对已确认全稿、来源记录、时间线与审计证据</p></div><div class="document-status"><span class="badge badge--success">已进入验收</span><span class="badge badge--info">修订 ${revision.revision}</span></div></div><div class="panel__body">${view.body}</div></section>`;
 }
 
 function loadingPanel(message) {
@@ -342,12 +361,13 @@ function workspaceMarkup() {
   else if (state.project.state === "narrative_structure") stage = state.project.phase === "ready_to_generate" ? readyDocumentView("narrative_structure") : documentView("narrative_structure");
   else if (state.project.state === "slide_outline") stage = state.project.phase === "ready_to_generate" ? readyDocumentView("slide_outline") : documentView("slide_outline");
   else if (state.project.state === "ppt_sample") stage = state.project.phase === "ready_to_generate" ? readySampleView() : sampleView();
+  else if (state.project.state === "acceptance") stage = acceptanceView();
   else stage = fullDeckView();
   return `${progressCard()}<div class="workspace">${stage}</div>`;
 }
 
 function welcomeMarkup() {
-  return `<div class="hero"><section class="panel hero__main"><p class="eyebrow">Presentation workspace</p><h1>从想法到完整演示</h1><p>PPT Agent 把关键决策留给你，把叙事组织、样品设计与完整页面规划交给 Agent。澄清、生成、编辑、确认和分支都保存在可恢复检查点中。</p><button class="btn btn--primary" data-action="new_project">新建 PPT 工程</button></section><aside class="panel hero__aside"><div><span class="stat-label">当前范围</span><div class="stat-value">6 个阶段</div></div><div class="hint">任务卡 → 澄清问题 → 叙事结构 → 逐页大纲 → PPT 样品 → PPT 全稿</div></aside></div>`;
+  return `<div class="hero"><section class="panel hero__main"><p class="eyebrow">Presentation workspace</p><h1>从想法到完整演示</h1><p>PPT Agent 把关键决策留给你，把叙事组织、样品设计与完整页面规划交给 Agent。澄清、生成、编辑、确认和分支都保存在可恢复检查点中。</p><button class="btn btn--primary" data-action="new_project">新建 PPT 工程</button></section><aside class="panel hero__aside"><div><span class="stat-label">当前范围</span><div class="stat-value">7 个阶段</div></div><div class="hint">任务卡 → 澄清问题 → 叙事结构 → 逐页大纲 → PPT 样品 → PPT 全稿 → 确认验收</div></aside></div>`;
 }
 
 function settingsMarkup(ctx) {
@@ -636,6 +656,7 @@ function wireWorkspace() {
     if (action === "approve_sample") await approveSample();
     if (action === "branch_sample_revision") await branchFromSampleRevision(button.dataset.revisionHash);
     if (action === "generate_full_deck") await runJob("generate_full_deck");
+    if (action === "approve_full_deck") await approveFullDeck(button);
     if (action === "regenerate_full_deck") {
       const original = button.innerHTML;
       button.innerHTML = '<span class="spinner" aria-hidden="true"></span>正在启动重新生成…';
@@ -801,8 +822,40 @@ async function submitFullDeckFeedback(event) {
   });
   if (!started && submit.isConnected) {
     submit.disabled = false;
-    submit.textContent = "让 AI 修改";
+    submit.textContent = state.project.state === "acceptance" ? "创建后续全稿修订" : "让 AI 修改";
   }
+}
+
+async function approveFullDeck(button) {
+  const revision = state.project.full_deck_revision;
+  if (!revision) return;
+  const original = button.innerHTML;
+  const errorNode = document.querySelector("#full-deck-approve-error");
+  if (errorNode) errorNode.textContent = "";
+  setBusy(true);
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner" aria-hidden="true"></span>正在进入验收…';
+  try {
+    state.project = await api.approveFullDeck(state.project.project_id, {
+      checkpoint_id: state.project.checkpoint_id,
+      revision_hash: revision.revision_hash,
+    });
+    state.focusStage = null;
+    state.branches = await api.branches(state.project.project_id);
+    await loadProjects();
+    await render();
+    document.querySelector("#acceptance-title")?.focus();
+    toast("全稿已确认并进入最终验收。");
+  } catch (error) {
+    const message = userErrorMessage(error, "暂时无法确认全稿，请刷新工程后重试。");
+    if (errorNode) errorNode.textContent = message;
+    if (button.isConnected) {
+      button.disabled = false;
+      button.innerHTML = original;
+      button.focus();
+    }
+    toast(message, true);
+  } finally { setBusy(false); }
 }
 
 async function approveSample() {
@@ -1005,7 +1058,7 @@ function snapshotContent(stage, item) {
     const slides = sample.package?.slides || sample.pages || [];
     return `<div class="sample-snapshot-summary"><strong>${slides.length} 页 HTML-PPT 包</strong><span>修订 ${sample.revision} · ${sample.status === "approved" ? "已确认" : "待确认"}</span><ol>${slides.map((page) => `<li>${escapeHtml(page.title)}</li>`).join("")}</ol></div>`;
   }
-  if (stage === "ppt_full") {
+  if (stage === "ppt_full" || stage === "acceptance") {
     const root = snapshot.full_deck || {};
     const revision = (snapshot.full_deck_revisions || []).find(
       (item) => item.revision_hash === root.current_revision_hash,
@@ -1013,7 +1066,8 @@ function snapshotContent(stage, item) {
     if (!revision) return '<p class="snapshot-empty">该阶段的页面清单尚未建立。</p>';
     const pages = revision.plan?.pages || [];
     const ready = pages.filter((page) => page.status === "ready").length;
-    return `<div class="sample-snapshot-summary"><strong>${pages.length} 页 HTML-PPT 全稿</strong><span>修订 ${revision.revision} · ${ready}/${pages.length} 页已就绪</span><ol>${pages.map((page) => `<li>第 ${page.outline_ref?.source_slide_number || page.position + 1} 页 · ${escapeHtml(page.title)} · ${page.status === "ready" ? "已就绪" : "待生成"}</li>`).join("")}</ol></div>`;
+    const stateLabel = revision.status === "approved" ? "已确认为验收基线" : `${ready}/${pages.length} 页已就绪`;
+    return `<div class="sample-snapshot-summary"><strong>${pages.length} 页 HTML-PPT 全稿</strong><span>修订 ${revision.revision} · ${stateLabel}</span><ol>${pages.map((page) => `<li>第 ${page.outline_ref?.source_slide_number || page.position + 1} 页 · ${escapeHtml(page.title)} · ${page.status === "ready" ? "已就绪" : "待生成"}</li>`).join("")}</ol></div>`;
   }
   const document = snapshotDocument(snapshot, stage);
   if (!document) return '<p class="snapshot-empty">该阶段的输入已保存，产物尚未生成。</p>';
