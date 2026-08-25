@@ -11,14 +11,69 @@ from agent_core.models import utc_now
 from storage.persistence import json_text
 
 
+_SENSITIVE_KEY_PATTERN = r"""
+    (?<![\w-])
+    [\"']?(?:[A-Za-z0-9]+[-_])*(?:
+        api[-_ ]?key
+        | authorization
+        | auth[-_ ]?token
+        | access[-_ ]?token
+        | refresh[-_ ]?token
+        | id[-_ ]?token
+        | client[-_ ]?secret
+        | private[-_ ]?key
+        | credentials?
+        | secret
+        | password
+        | passwd
+        | token
+    )[\"']?
+    \s*[:=]\s*
+    """
+_SENSITIVE_VALUE = re.compile(
+    rf"(?P<prefix>{_SENSITIVE_KEY_PATTERN})"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:(?:Bearer|Basic|Token)\s+)?[^\s,;}\]\r\n]+)",
+    re.IGNORECASE | re.VERBOSE,
+)
+_AUTHORIZATION_SCHEME = re.compile(
+    r"(?i)\b(Bearer|Basic)\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[A-Za-z0-9._~+/=-]+)"
+)
+_SENSITIVE_NORMALIZED_KEYS = {
+    "apikey",
+    "authorization",
+    "authtoken",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "clientsecret",
+    "privatekey",
+    "credential",
+    "credentials",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+}
+
+
 def _redact_text(value: str) -> str:
-    value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", value)
-    value = re.sub(
-        r"(?i)(api[-_ ]?key|authorization|access[-_ ]?token|secret|password)(\s*[:=]\s*)([^\s,;\"'}]+)",
-        r"\1\2[REDACTED]",
+    value = _SENSITIVE_VALUE.sub(
+        lambda match: match.group("prefix") + "[REDACTED]",
         value,
     )
-    return value
+    return _AUTHORIZATION_SCHEME.sub(r"\1 [REDACTED]", value)
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _SENSITIVE_NORMALIZED_KEYS or any(
+        normalized.endswith(suffix)
+        for suffix in (
+            "apikey", "authtoken", "accesstoken", "refreshtoken", "idtoken",
+            "clientsecret", "privatekey", "credential", "credentials", "secret",
+            "password", "passwd", "token",
+        )
+    )
 
 
 def redact_for_audit(value: Any) -> Any:
@@ -29,8 +84,7 @@ def redact_for_audit(value: Any) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, item in value.items():
-            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-            if normalized in {"apikey", "authorization", "accesstoken", "secret", "password"}:
+            if _is_sensitive_key(key):
                 result[str(key)] = "[REDACTED]"
             else:
                 result[str(key)] = redact_for_audit(item)
@@ -92,7 +146,7 @@ class PromptAuditMixin:
         output_hash: str | None = None,
         error: dict[str, Any] | None = None,
     ) -> None:
-        if status not in {"completed", "failed"}:
+        if status not in {"completed", "failed", "conflicted"}:
             raise ValueError("invalid prompt call status")
         completed_at = utc_now()
         tool_calls = [item for item in traces or [] if item.get("type") == "tool_call"]

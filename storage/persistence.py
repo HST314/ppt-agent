@@ -3,8 +3,32 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+
+@contextmanager
+def exclusive_file_lock(path: Path, *, timeout_seconds: float) -> Iterator[None]:
+    """Acquire a process-safe advisory lock with a bounded wait."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+    with path.open("a+b") as lock_file:
+        while True:
+            try:
+                flock(lock_file.fileno(), LOCK_EX | LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out acquiring lock: {path.name}")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            flock(lock_file.fileno(), LOCK_UN)
 
 
 def atomic_bytes(path: Path, content: bytes) -> None:

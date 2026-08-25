@@ -526,6 +526,66 @@ def test_concurrent_edits_from_same_checkpoint_use_atomic_cas(workflow: Workflow
     assert history[1]["parent_revision_hash"] == history[0]["revision_hash"]
 
 
+def test_concurrent_generation_only_completes_audit_for_committed_output(
+    workflow: Workflow,
+) -> None:
+    manifest = workflow.store.read()
+    manifest = workflow.start_clarification(manifest["checkpoint_id"])
+    card = manifest["question_card"]
+    manifest = workflow.answer_clarification(
+        manifest["checkpoint_id"],
+        card["question_card_id"],
+        {question["question_id"]: "answer" for question in card["questions"]},
+    )
+    checkpoint_id = manifest["checkpoint_id"]
+    competing = Workflow(
+        ProjectStore(workflow.store.projects_root, workflow.store.project_id),
+        workflow.runtime,
+    )
+    workflows = [workflow, competing]
+    generated_together = Barrier(2)
+
+    for index, candidate in enumerate(workflows, start=1):
+        markdown = f"# 并发生成版本 {index}"
+
+        def generate(*_args, owner=candidate, content=markdown, **_kwargs):
+            generated_together.wait(timeout=5)
+            owner.gateway.last_messages = [{"role": "assistant", "content": content}]
+            return content, [{
+                "type": "model_call",
+                "provider": "test",
+                "model": "concurrency-test",
+                "usage": {},
+            }]
+
+        candidate.gateway.generate = generate
+
+    def run(candidate: Workflow):
+        try:
+            return candidate.generate_document("narrative_structure", checkpoint_id)
+        except ConflictError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(run, workflows))
+
+    assert sum(isinstance(outcome, ConflictError) for outcome in outcomes) == 1
+    persisted = workflow.store.read()
+    revisions = persisted["documents"]["narrative_structure"]
+    assert len(revisions) == 1
+    calls = [
+        call for call in workflow.store.prompt_calls()
+        if call["state"] == "narrative_structure"
+    ]
+    assert sorted(call["status"] for call in calls) == ["completed", "conflicted"]
+    completed = next(call for call in calls if call["status"] == "completed")
+    conflicted = next(call for call in calls if call["status"] == "conflicted")
+    assert completed["output_ref"] == revisions[0]["revision_hash"]
+    assert conflicted["output_ref"] is None
+    assert conflicted["output_hash"] is None
+    assert conflicted["error"]["code"] == "stale_revision"
+
+
 def test_generation_provenance_hashes_skill_index_reads_and_output(workflow: Workflow, monkeypatch) -> None:
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])

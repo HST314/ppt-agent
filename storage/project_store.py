@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 from agent_core.models import utc_now
 from agent_core.sample_html import SANITIZER_VERSION
-from storage.persistence import atomic_bytes, json_text
+from storage.persistence import atomic_bytes, exclusive_file_lock, json_text
 from storage.prompt_audit import PromptAuditMixin
 from storage.sqlite_schema import PROJECT_SCHEMA
 
@@ -24,6 +25,7 @@ REVISION_HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
 ARTIFACT_ID = REVISION_HASH
 STAGE_IDS = ("intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample")
 SCHEMA_VERSION = 2
+INITIALIZATION_LOCK_TIMEOUT_SECONDS = 30
 
 
 class ConflictError(RuntimeError):
@@ -32,6 +34,7 @@ class ConflictError(RuntimeError):
 
 class ProjectStore(PromptAuditMixin):
     _locks: dict[str, threading.RLock] = {}
+    _initialized_databases: dict[str, int] = {}
 
     def __init__(self, root: Path, project_id: str):
         if not PROJECT_ID.fullmatch(project_id):
@@ -42,6 +45,7 @@ class ProjectStore(PromptAuditMixin):
         if not self.root.is_relative_to(self.projects_root):
             raise ValueError("invalid project root")
         self.database_path = self.root / "project.db"
+        self.initialization_lock_path = self.root / ".project-db-init.lock"
         self.manifest_path = self.root / "manifest.json"
         self.artifacts_root = self.root / "artifacts" / "html"
         self.lock = self._locks.setdefault(str(self.root), threading.RLock())
@@ -52,7 +56,6 @@ class ProjectStore(PromptAuditMixin):
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 30000")
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
         return connection
 
@@ -70,19 +73,39 @@ class ProjectStore(PromptAuditMixin):
             connection.close()
 
     def _ensure_database(self) -> None:
+        database_key = str(self.database_path)
+        process_id = os.getpid()
+        if (
+            self.database_path.is_file()
+            and self._initialized_databases.get(database_key) == process_id
+        ):
+            return
         with self.lock:
-            connection = self._connect()
-            try:
-                connection.executescript(PROJECT_SCHEMA)
-                connection.execute(
-                    "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-                connection.commit()
-            finally:
-                connection.close()
-            if self.manifest_path.is_file():
-                self._migrate_legacy_files()
+            if (
+                self.database_path.is_file()
+                and self._initialized_databases.get(database_key) == process_id
+            ):
+                return
+            with exclusive_file_lock(
+                self.initialization_lock_path,
+                timeout_seconds=INITIALIZATION_LOCK_TIMEOUT_SECONDS,
+            ):
+                connection = self._connect()
+                try:
+                    journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+                    if journal_mode.lower() != "wal":
+                        connection.execute("PRAGMA journal_mode = WAL")
+                    connection.executescript(PROJECT_SCHEMA)
+                    connection.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', ?)",
+                        (str(SCHEMA_VERSION),),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                if self.manifest_path.is_file():
+                    self._migrate_legacy_files()
+            self._initialized_databases[database_key] = process_id
 
     def exists(self) -> bool:
         if self.database_path.is_file():

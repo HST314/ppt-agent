@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -228,6 +228,45 @@ class Workflow:
             },
         )
 
+    def _commit_generated_output(
+        self,
+        prompt_call_id: str,
+        commit: Callable[[], dict[str, Any]],
+        *,
+        traces: list[dict[str, Any]],
+        messages: list[dict[str, Any]] | None,
+        output_ref: str,
+        output_hash: str,
+    ) -> dict[str, Any]:
+        """Commit a generated artifact before publishing its successful audit terminal."""
+
+        try:
+            manifest = commit()
+        except ConflictError as exc:
+            self.store.finish_prompt_call(
+                prompt_call_id,
+                status="conflicted" if str(exc) == "stale_revision" else "failed",
+                traces=traces,
+                error={
+                    "type": type(exc).__name__,
+                    "code": str(exc)[:80],
+                    "message": str(exc)[:1000],
+                },
+            )
+            raise
+        except Exception as exc:
+            self._fail_prompt_audit(prompt_call_id, exc, traces)
+            raise
+        self.store.finish_prompt_call(
+            prompt_call_id,
+            status="completed",
+            traces=traces,
+            messages=messages,
+            output_ref=output_ref,
+            output_hash=output_hash,
+        )
+        return manifest
+
     @staticmethod
     def _require(manifest: dict[str, Any], capability: str, checkpoint_id: str | None = None) -> None:
         if checkpoint_id and manifest["checkpoint_id"] != checkpoint_id:
@@ -270,15 +309,6 @@ class Workflow:
             self._fail_prompt_audit(prompt_call_id, exc, traces)
             raise
         card_id = "questions_" + uuid4().hex[:16]
-        self.store.finish_prompt_call(
-            prompt_call_id,
-            status="completed",
-            traces=traces,
-            messages=self.gateway.last_messages,
-            output_ref=card_id,
-            output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
-        )
-
         def apply(value: dict[str, Any]) -> dict[str, Any]:
             card = QuestionCard(
                 question_card_id=card_id,
@@ -300,11 +330,18 @@ class Workflow:
             value["last_template"] = {"template_id": "clarify_questions", "template_version": 1, "template_hash": template_hash}
             return value
 
-        return self.store.update(
-            apply,
-            "clarification_generated",
-            {"question_card_id": card_id},
-            expected_checkpoint_id=checkpoint_id,
+        return self._commit_generated_output(
+            prompt_call_id,
+            lambda: self.store.update(
+                apply,
+                "clarification_generated",
+                {"question_card_id": card_id},
+                expected_checkpoint_id=checkpoint_id,
+            ),
+            traces=traces,
+            messages=self.gateway.last_messages,
+            output_ref=card_id,
+            output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
         )
 
     def answer_clarification(self, checkpoint_id: str, question_card_id: str, answers: dict[str, str]) -> dict[str, Any]:
@@ -393,25 +430,23 @@ class Workflow:
                 "traces": traces,
             },
         )
-        self.store.finish_prompt_call(
-            prompt_call_id,
-            status="completed",
-            traces=traces,
-            messages=self.gateway.last_messages,
-            output_ref=document.revision_hash,
-            output_hash="sha256:" + hashlib.sha256(markdown.encode()).hexdigest(),
-        )
-
         def apply(value: dict[str, Any]) -> dict[str, Any]:
             value["documents"][document_type].append(document.model_dump())
             value.update(state=document_type, phase="waiting_human_approval")
             return value
 
-        return self.store.update(
-            apply,
-            "document_generated",
-            {"document_type": document_type, "revision_hash": document.revision_hash},
-            expected_checkpoint_id=checkpoint_id,
+        return self._commit_generated_output(
+            prompt_call_id,
+            lambda: self.store.update(
+                apply,
+                "document_generated",
+                {"document_type": document_type, "revision_hash": document.revision_hash},
+                expected_checkpoint_id=checkpoint_id,
+            ),
+            traces=traces,
+            messages=self.gateway.last_messages,
+            output_ref=document.revision_hash,
+            output_hash="sha256:" + hashlib.sha256(markdown.encode()).hexdigest(),
         )
 
     def edit_document(self, document_type: DocumentType, checkpoint_id: str, markdown: str) -> dict[str, Any]:
@@ -596,25 +631,23 @@ class Workflow:
         )
         if successful_prompt_call_id is None:
             raise WorkflowError("sample prompt audit is incomplete")
-        self.store.finish_prompt_call(
-            successful_prompt_call_id,
-            status="completed",
-            traces=attempt_traces,
-            messages=self.gateway.last_messages,
-            output_ref=sample.revision_hash,
-            output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
-        )
-
         def apply(value: dict[str, Any]) -> dict[str, Any]:
             value.setdefault("samples", []).append(sample.model_dump())
             value.update(state="ppt_sample", phase="waiting_human_approval")
             return value
 
-        return self.store.update(
-            apply,
-            "sample_revised" if normalized_feedback else "sample_generated",
-            {"revision_hash": sample.revision_hash, "page_count": len(sample.pages)},
-            expected_checkpoint_id=checkpoint_id,
+        return self._commit_generated_output(
+            successful_prompt_call_id,
+            lambda: self.store.update(
+                apply,
+                "sample_revised" if normalized_feedback else "sample_generated",
+                {"revision_hash": sample.revision_hash, "page_count": len(sample.pages)},
+                expected_checkpoint_id=checkpoint_id,
+            ),
+            traces=attempt_traces,
+            messages=self.gateway.last_messages,
+            output_ref=sample.revision_hash,
+            output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
         )
 
     def restore_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:

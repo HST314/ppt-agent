@@ -22,7 +22,7 @@
 - `project_state` 保存当前投影；`checkpoints` 保存不可变状态并用 `parent_checkpoint_id` 形成 DAG；`branches` 保存分支头。
 - `document_revisions`、`sample_revisions`、`sample_pages` 保存可查询的修订记录；`artifacts` 保存内容哈希、大小、净化器版本和受管相对路径。
 - `events` 与状态变更同事务提交。HTML 文件先用临时文件、`fsync` 和原子替换写入；提交失败最多留下可安全清理的未引用内容哈希文件，不会产生指向缺失产物的已提交状态。
-- `prompt_calls` 和 `prompt_call_events` 形成独立审计链，记录脱敏后的 messages、模板/运行/模型/Skill 哈希、模型参数、工具调用、开始/完成/失败和 output ref；JSONL 只作为导出格式。
+- `prompt_calls` 和 `prompt_call_events` 形成独立审计链，记录脱敏后的 messages、模板/运行/模型/Skill 哈希、模型参数、工具调用、开始/完成/失败/冲突和 output ref；只有已提交产物可进入 completed，CAS 冲突终态不携带 output ref，JSONL 只作为导出格式。
 - `.jobs/jobs.db` 持久化 Job 和状态事件。SQLite `BEGIN IMMEDIATE` 同时承担跨线程、跨 worker 的写入协调；后续多机部署可将表边界迁移到 PostgreSQL，并将 artifact 目录替换为对象存储。
 
 ## 安全
