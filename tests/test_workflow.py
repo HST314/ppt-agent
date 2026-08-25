@@ -90,9 +90,18 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
     [
         "<script>alert(1)</script>",
         '<img src="https://example.com/tracker.png">',
+        '<img src="&#x68;ttps://example.com/tracker.png">',
         '<img src="/relative-tracker.png">',
         '<div onclick="alert(1)">unsafe</div>',
         '<style>@import "https://example.com/theme.css";</style>',
+        '<style>@\\69mport "https://example.com/theme.css";</style>',
+        '<style>body{background-image:image-set("https://example.com/tracker.png")}</style>',
+        '<style>body{background-image:\\69mage-set("https://example.com/tracker.png")}</style>',
+        '<style>body{background-image:u\\72l("https://example.com/tracker.png")}</style>',
+        '<style>body{background-image:url("\\68 ttps://example.com/tracker.png")}</style>',
+        '<style>body{b\\61ckground-image:url("https://example.com/tracker.png")}</style>',
+        '<svg><rect fill="u\\72l(https://example.com/paint.svg#gradient)"></rect></svg>',
+        '<div data-remote="https://example.com">unsafe attribute</div>',
     ],
 )
 def test_sample_page_rejects_active_or_external_html(html: str) -> None:
@@ -104,10 +113,34 @@ def test_sample_page_allows_passive_inline_content() -> None:
     page = SamplePage(
         page_id="sample_1",
         title="Inline",
-        html='<style>.mark{background-image:url("data:image/png;base64,AA==")}</style><a href="#detail">内容</a>',
+        html=(
+            '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+            '<style>.mark{background-image:linear-gradient(135deg,#fff,#ddd)}'
+            '.dot{background-image:url("data:image/png;base64,AA==")}</style></head>'
+            '<body><!-- harmless --><a href="#detail">内容</a>'
+            '<svg viewBox="0 0 10 10"><defs><linearGradient id="paint">'
+            '<stop offset="0" stop-color="#fff"></stop></linearGradient></defs>'
+            '<rect width="10" height="10" fill="url(#paint)"></rect></svg></body></html>'
+        ),
     )
 
     assert page.page_id == "sample_1"
+    assert "<!doctype" not in page.html
+    assert "<html" not in page.html
+    assert "<!--" not in page.html
+    assert "linear-gradient" in page.html
+    assert 'fill="url(#paint)"' in page.html
+
+
+def test_sample_page_rejects_comment_capture_payload() -> None:
+    html = (
+        '<!-- <head> --><html><head></head><body><style>'
+        'body{background-image:image-set("https://audit.invalid/pixel")}'
+        '</style></body></html>'
+    )
+
+    with pytest.raises(ValueError, match="active or external"):
+        SamplePage(page_id="sample_1", title="Unsafe", html=html)
 
 
 def test_sample_output_caps_total_html_size() -> None:

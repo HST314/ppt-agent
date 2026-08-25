@@ -12,7 +12,8 @@
 
 - 严格生成指定数量的页面，`page_id` 唯一且稳定。
 - 每页按 1280×720 的 16:9 画布设计，但根元素使用 `width: 100%; height: 100%` 适配预览框；使用完整、自包含的 HTML 与内联 CSS。
-- 不使用 JavaScript、表单、iframe、object、embed、link、外链字体、外链图片、远程 URL 或 CSS `@import`。
+- 不使用 JavaScript、表单、iframe、object、embed、link、外链字体、外链图片、远程 URL、CSS `@import`、`image-set()` 或动画规则。
+- CSS 只使用常见布局、排版、颜色、边框与渐变属性；不要使用 `@media`、`@font-face`、`@keyframes` 等 at-rule。文档级样式写入 `<style>`，不要在 `<html>` 或 `<body>` 上放置属性。
 - 如需图形，使用内联 SVG、CSS 图形或 data URI；不得把 HTML 放在 Markdown 代码围栏中。
 - 保证文字可读、层级明确、内容不溢出画布，并让各样品页共享一致的设计系统。
 - 如果提供修改意见，应在保留未被否定的设计决策基础上完成针对性修订。

@@ -16,12 +16,6 @@ let frameObserver = null;
 
 export function isolatedSampleHtml(html) {
   const policy = `<meta http-equiv="Content-Security-Policy" content="${SAMPLE_CSP}">`;
-  if (/<head(?:\s[^>]*)?>/i.test(html)) {
-    return html.replace(/<head(?:\s[^>]*)?>/i, (match) => `${match}${policy}`);
-  }
-  if (/<html(?:\s[^>]*)?>/i.test(html)) {
-    return html.replace(/<html(?:\s[^>]*)?>/i, (match) => `${match}<head>${policy}</head>`);
-  }
   return `<!doctype html><html><head>${policy}</head><body>${html}</body></html>`;
 }
 

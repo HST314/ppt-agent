@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from agent_core.sample_html import SampleHtmlError, sanitize_sample_html
 
 
 def utc_now() -> str:
@@ -103,22 +104,10 @@ class SamplePage(StrictModel):
     @classmethod
     def validate_isolated_html(cls, value: str) -> str:
         """Keep model HTML passive before it reaches a sandboxed srcdoc frame."""
-
-        forbidden = re.compile(
-            r"<\s*(?:script|iframe|object|embed|form|base|link)\b"
-            r"|<\s*meta\b[^>]*http-equiv\s*="
-            r"|\son[a-z]+\s*="
-            r"|\b(?:src|href)\s*=\s*['\"]?\s*(?:https?:|//|javascript:)"
-            r"|\b(?:src|href)\s*=\s*['\"]\s*(?!data:|#)"
-            r"|\b(?:src|href)\s*=\s*(?!['\"])(?!data:|#)[^\s>]+"
-            r"|@import\b"
-            r"|url\s*\(\s*['\"]\s*(?!data:|#)"
-            r"|url\s*\(\s*(?!['\"])(?!data:|#)",
-            re.IGNORECASE,
-        )
-        if forbidden.search(value):
-            raise ValueError("sample HTML contains active or external content")
-        return value.strip()
+        try:
+            return sanitize_sample_html(value)
+        except SampleHtmlError as exc:
+            raise ValueError("sample HTML contains active or external content") from exc
 
 
 class SampleOutput(StrictModel):

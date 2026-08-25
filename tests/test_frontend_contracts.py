@@ -1,4 +1,10 @@
+import base64
+import json
 from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -37,6 +43,31 @@ def test_sample_preview_is_sandboxed_and_never_inserted_into_parent_dom() -> Non
     assert "canvas.clientWidth / 1280" in samples
     assert "new ResizeObserver(scaleFrame)" in samples
     assert "innerHTML = page.html" not in app + samples
+
+
+def test_sample_preview_csp_precedes_untrusted_comment_and_document_markup() -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the frontend security regression")
+    samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
+    module_url = "data:text/javascript;base64," + base64.b64encode(samples.encode()).decode()
+    payload = '<!-- <head> --><html><head></head><body><p>sample</p></body></html>'
+    script = (
+        f"const module = await import({json.dumps(module_url)});"
+        f"console.log(JSON.stringify(module.isolatedSampleHtml({json.dumps(payload)})));"
+    )
+
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    isolated = json.loads(result.stdout)
+
+    assert isolated.startswith("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\"")
+    assert isolated.index("Content-Security-Policy") < isolated.index("<!-- <head> -->")
+    assert isolated.count("Content-Security-Policy") == 1
 
 
 def test_markdown_renderer_escapes_raw_html() -> None:
