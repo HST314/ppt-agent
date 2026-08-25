@@ -82,11 +82,27 @@ function formatDate(value) {
   } catch { return String(value); }
 }
 
+const ERROR_MESSAGES = {
+  sample_json_incomplete: "样品输出不完整，自动修复后仍未成功，请重试。",
+  sample_html_rejected: "样品含有不支持的内容，自动修复后仍未通过，请重试。",
+  sample_output_invalid: "样品格式不正确，自动修复后仍未成功，请重试。",
+  invalid_model_output: "模型返回的内容格式不正确，请重试。",
+  process_restarted: "服务已重启，请从上一成功点重试。",
+  job_failed: "任务暂未完成，请重试。",
+};
+
+function userErrorMessage(error, fallback = "操作未完成，请稍后重试。") {
+  if (error?.code && ERROR_MESSAGES[error.code]) return ERROR_MESSAGES[error.code];
+  const message = typeof error?.message === "string" ? error.message.replace(/\s+/g, " ").trim() : "";
+  return message && /[\u3400-\u9fff]/.test(message) && message.length <= 96 ? message : fallback;
+}
+
 function toast(message, error = false) {
   const node = document.createElement("div");
   node.className = `toast${error ? " is-error" : ""}`;
   node.setAttribute("role", error ? "alert" : "status");
-  node.textContent = message;
+  const normalized = String(message || "").replace(/\s+/g, " ").trim();
+  node.textContent = normalized.length > 96 ? `${normalized.slice(0, 95)}…` : normalized;
   document.querySelector("#toasts").append(node);
   window.setTimeout(() => node.remove(), 4400);
 }
@@ -416,10 +432,10 @@ async function pollJob(jobId) {
     while (true) {
       await new Promise((resolve) => window.setTimeout(resolve, 700));
       let job;
-      try { job = await api.job(jobId); } catch (error) { toast(error.message, true); return; }
+      try { job = await api.job(jobId); } catch (error) { toast(userErrorMessage(error), true); return; }
       if (!["queued", "running"].includes(job.status)) {
         await refreshCurrent();
-        toast(job.status === "succeeded" ? "任务已完成。" : `任务未完成：${job.error?.message || job.status}`, job.status !== "succeeded");
+        toast(job.status === "succeeded" ? "任务已完成。" : userErrorMessage(job.error, "任务未完成，请重试。"), job.status !== "succeeded");
         return;
       }
       if (!state.project || state.project.active_job?.job_id !== jobId) return;
@@ -438,7 +454,7 @@ async function runJob(operation, extra = {}) {
     await render();
     void pollJob(job.job_id);
     return true;
-  } catch (error) { toast(error.message, true); return false; }
+  } catch (error) { toast(userErrorMessage(error), true); return false; }
   finally { setBusy(false); }
 }
 

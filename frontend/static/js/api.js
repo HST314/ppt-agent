@@ -8,6 +8,7 @@ async function request(path, options = {}) {
     const detail = payload?.error?.message || payload?.detail || `请求失败 (${response.status})`;
     const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
     error.status = response.status;
+    error.code = payload?.error?.code || null;
     throw error;
   }
   return payload;

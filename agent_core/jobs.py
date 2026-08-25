@@ -7,8 +7,22 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from agent_core.models import utc_now
 from storage.project_store import atomic_json
+
+
+def public_job_error(exc: Exception) -> dict[str, str]:
+    """Map internal failures to a bounded browser-safe error contract."""
+
+    public_code = getattr(exc, "public_code", None)
+    public_message = getattr(exc, "public_message", None)
+    if isinstance(public_code, str) and isinstance(public_message, str):
+        return {"code": public_code[:80], "message": public_message[:96]}
+    if isinstance(exc, ValidationError):
+        return {"code": "invalid_model_output", "message": "模型返回的内容格式不正确，请重试。"}
+    return {"code": "job_failed", "message": "任务暂未完成，请重试。"}
 
 
 class JobRegistry:
@@ -57,8 +71,8 @@ class JobRegistry:
         try:
             action()
             record["status"] = "succeeded"
-        except Exception as exc:  # error details stay server-side and are normalized
-            record.update(status="failed", error={"code": type(exc).__name__, "message": str(exc)[:500]})
+        except Exception as exc:
+            record.update(status="failed", error=public_job_error(exc))
         record["finished_at"] = utc_now()
         self._write(record)
 

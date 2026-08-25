@@ -119,7 +119,7 @@ def _validate_css_values(tokens: Iterable[object], *, depth: int = 0) -> None:
         raise SampleHtmlError("CSS nesting limit exceeded")
     for token in tokens:
         if token.type in {"at-keyword", "bad-url", "error"}:
-            raise SampleHtmlError("unsupported CSS token")
+            raise SampleHtmlError(f"unsupported CSS token: {token.type}")
         if token.type == "url":
             if not _is_safe_url(token.value):
                 raise SampleHtmlError("external CSS URL")
@@ -142,8 +142,10 @@ def _validate_css_values(tokens: Iterable[object], *, depth: int = 0) -> None:
 def _sanitize_declarations(tokens: Iterable[object]) -> str:
     declarations: list[str] = []
     for declaration in tokens:
-        if declaration.type != "declaration" or declaration.lower_name not in CSS_PROPERTIES:
-            raise SampleHtmlError("unsupported CSS declaration")
+        if declaration.type != "declaration":
+            raise SampleHtmlError(f"unsupported CSS item: {declaration.type}")
+        if declaration.lower_name not in CSS_PROPERTIES:
+            raise SampleHtmlError(f"unsupported CSS declaration: {declaration.lower_name}")
         _validate_css_values(declaration.value)
         value = tinycss2.serialize(declaration.value).strip()
         if "<" in value:
@@ -163,7 +165,8 @@ def _sanitize_stylesheet(value: str) -> str:
     sanitized: list[str] = []
     for rule in rules:
         if rule.type != "qualified-rule":
-            raise SampleHtmlError("CSS at-rules are not allowed")
+            name = getattr(rule, "at_keyword", rule.type)
+            raise SampleHtmlError(f"CSS at-rule is not allowed: {name}")
         _validate_css_values(rule.prelude)
         selector = tinycss2.serialize(rule.prelude).strip()
         if not selector or "<" in selector:

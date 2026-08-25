@@ -84,3 +84,18 @@ def test_accessibility_and_reduced_motion_contracts() -> None:
     assert 'class="skip-link"' in html
     assert ":focus-visible" in css
     assert "prefers-reduced-motion" in css
+
+
+def test_job_errors_use_bounded_chinese_messages() -> None:
+    app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    api = (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
+    css = (ROOT / "frontend/static/css/main.css").read_text(encoding="utf-8")
+
+    assert all(code in app for code in (
+        "sample_json_incomplete", "sample_html_rejected", "sample_output_invalid"
+    ))
+    assert "userErrorMessage(job.error" in app
+    assert "job.error?.message" not in app
+    assert "normalized.length > 96" in app
+    assert "overflow-wrap:anywhere" in css
+    assert "error.code = payload?.error?.code" in api

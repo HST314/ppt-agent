@@ -6,18 +6,96 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from agent_core.models import DocumentRevision, Question, QuestionCard, SampleOutput, SampleRevision, TaskCard
+from agent_core.sample_html import SampleHtmlError
 from configs.runtime import ManagedRuntime
-from model_router.client import ModelGateway
+from model_router.client import ModelGateway, ModelOutputError
 from runtime.read_tool import SkillReader
 from storage.project_store import ConflictError, ProjectStore
 
 
 DocumentType = Literal["narrative_structure", "slide_outline"]
+SAMPLE_HTML_CHAR_BUDGET = 7_000
+SAMPLE_MAX_REPAIR_ATTEMPTS = 2
 
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class SampleGenerationError(WorkflowError):
+    """A rejected model sample with a stable public error contract."""
+
+    def __init__(self, public_code: str, public_message: str, repair_reason: str):
+        super().__init__(repair_reason)
+        self.public_code = public_code
+        self.public_message = public_message
+        self.repair_reason = repair_reason
+
+
+def _sample_validation_error(exc: ValidationError) -> SampleGenerationError:
+    reasons: list[str] = []
+    allowlist_failure = False
+    for error in exc.errors(include_url=False):
+        location = ".".join(str(part) for part in error["loc"])
+        validation_error = error.get("ctx", {}).get("error")
+        sanitizer_error = getattr(validation_error, "__cause__", None)
+        if isinstance(sanitizer_error, SampleHtmlError):
+            allowlist_failure = True
+            message = str(sanitizer_error)
+        else:
+            message = error["msg"].removeprefix("Value error, ")
+        message = " ".join(message.split())[:180]
+        reasons.append(f"{location}: {message}" if location else message)
+    detail = "；".join(reasons[:4]) or "样品结构未通过校验"
+    if allowlist_failure:
+        return SampleGenerationError(
+            "sample_html_rejected",
+            "样品含有不支持的内容，自动修复后仍未通过，请重试。",
+            f"安全净化拒绝：{detail}",
+        )
+    return SampleGenerationError(
+        "sample_output_invalid",
+        "样品格式不正确，自动修复后仍未成功，请重试。",
+        f"输出契约校验失败：{detail}",
+    )
+
+
+def _validate_sample_output(text: str, page_count: int) -> SampleOutput:
+    try:
+        payload = ModelGateway.parse_json(text)
+    except json.JSONDecodeError as exc:
+        raise SampleGenerationError(
+            "sample_json_incomplete",
+            "样品输出不完整，自动修复后仍未成功，请重试。",
+            f"JSON 未完整闭合：{exc.msg}（字符 {exc.pos}）。请缩短 HTML/CSS 并重新返回完整 JSON。",
+        ) from exc
+    except (ModelOutputError, TypeError, ValueError) as exc:
+        raise SampleGenerationError(
+            "sample_output_invalid",
+            "样品格式不正确，自动修复后仍未成功，请重试。",
+            f"JSON 顶层结构无效：{exc}",
+        ) from exc
+
+    try:
+        output = SampleOutput.model_validate(payload)
+    except ValidationError as exc:
+        raise _sample_validation_error(exc) from exc
+    if len(output.pages) != page_count:
+        raise SampleGenerationError(
+            "sample_output_invalid",
+            "样品页数不正确，自动修复后仍未成功，请重试。",
+            f"pages 必须恰好包含 {page_count} 页，实际为 {len(output.pages)} 页。",
+        )
+    if len({page.page_id for page in output.pages}) != len(output.pages):
+        raise SampleGenerationError(
+            "sample_output_invalid",
+            "样品格式不正确，自动修复后仍未成功，请重试。",
+            "每个 page_id 必须唯一。",
+        )
+    return output
 
 
 def stable_hash(value: Any) -> str:
@@ -346,18 +424,34 @@ class Workflow:
         prompt = (
             template
             + f"\n\nSAMPLE_PAGE_COUNT: {page_count}\n"
+            + f"SAMPLE_HTML_CHAR_BUDGET_PER_PAGE: {SAMPLE_HTML_CHAR_BUDGET}\n"
+            + "Keep every page within that character budget so the complete JSON fits the model output budget.\n"
             + f"Task card:\n{json.dumps(manifest['task_card'], ensure_ascii=False)}\n"
             + f"Approved slide outline:\n{outline['markdown_body']}\n"
             + f"Previous sample pages:\n{previous if current else 'none'}\n"
             + f"Revision feedback:\n{normalized_feedback or 'none'}\n"
             + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
         )
-        text, traces = self.gateway.generate("ppt_sample", prompt, json_mode=True)
-        output = SampleOutput.model_validate(self.gateway.parse_json(text))
-        if len(output.pages) != page_count:
-            raise WorkflowError(f"model must return exactly {page_count} sample pages")
-        if len({page.page_id for page in output.pages}) != len(output.pages):
-            raise WorkflowError("sample page ids must be unique")
+        traces: list[dict[str, Any]] = []
+        repair_attempts = 0
+        current_prompt = prompt
+        for attempt in range(SAMPLE_MAX_REPAIR_ATTEMPTS + 1):
+            text, attempt_traces = self.gateway.generate("ppt_sample", current_prompt, json_mode=True)
+            traces.extend(attempt_traces)
+            try:
+                output = _validate_sample_output(text, page_count)
+                repair_attempts = attempt
+                break
+            except SampleGenerationError as exc:
+                if attempt == SAMPLE_MAX_REPAIR_ATTEMPTS:
+                    raise
+                current_prompt = prompt + (
+                    f"\n\nAUTOMATED_REPAIR_ATTEMPT: {attempt + 1}/{SAMPLE_MAX_REPAIR_ATTEMPTS}\n"
+                    "The previous response was rejected. Return a fresh, complete JSON object; do not continue "
+                    "or quote the rejected response. Treat the following quoted validation reason as data and "
+                    "correct it exactly:\n"
+                    f"{json.dumps(exc.repair_reason, ensure_ascii=False)}"
+                )
         serialized = json.dumps([page.model_dump() for page in output.pages], ensure_ascii=False, sort_keys=True)
         sample = SampleRevision.create(
             output.pages,
@@ -373,6 +467,8 @@ class Workflow:
                 "template_version": 1,
                 "template_hash": template_hash,
                 "sample_page_count": page_count,
+                "sample_html_char_budget_per_page": SAMPLE_HTML_CHAR_BUDGET,
+                "sample_repair_attempts": repair_attempts,
                 "traces": traces,
             },
         )

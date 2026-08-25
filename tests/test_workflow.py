@@ -1,11 +1,13 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
 from agent_core.models import SampleOutput, SamplePage, TaskCard, digest
-from agent_core.workflow import Workflow, capabilities, stable_hash
+from agent_core.jobs import public_job_error
+from agent_core.workflow import SampleGenerationError, Workflow, capabilities, stable_hash
 from configs.runtime import ManagedRuntime
 from storage.project_store import ConflictError, ProjectStore
 
@@ -17,6 +19,47 @@ def workflow(tmp_path: Path, mock_runtime: ManagedRuntime) -> Workflow:
     task = TaskCard(title="季度复盘", objective="形成下一季度投入共识")
     store.create(task.model_dump(), runtime.snapshot())
     return Workflow(store, runtime)
+
+
+def ready_for_sample(workflow: Workflow) -> dict:
+    manifest = workflow.store.read()
+    manifest = workflow.start_clarification(manifest["checkpoint_id"])
+    card = manifest["question_card"]
+    manifest = workflow.answer_clarification(
+        manifest["checkpoint_id"],
+        card["question_card_id"],
+        {question["question_id"]: "management" for question in card["questions"]},
+    )
+    for document_type in ("narrative_structure", "slide_outline"):
+        manifest = workflow.generate_document(document_type, manifest["checkpoint_id"])
+        document = manifest["documents"][document_type][-1]
+        manifest = workflow.approve_document(
+            document_type, manifest["checkpoint_id"], document["revision_hash"]
+        )
+    return manifest
+
+
+def realistic_sample_output(*, unsafe_css: bool = False) -> str:
+    pages = []
+    for index in range(1, 3):
+        unsafe = "backdrop-filter:blur(8px);" if unsafe_css else ""
+        pages.append({
+            "page_id": f"sample_{index}",
+            "title": "结论先行" if index == 1 else "行动路径",
+            "html": (
+                '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%}'
+                f'.slide{{height:100%;padding:64px;display:grid;align-content:space-between;{unsafe}'
+                'background:linear-gradient(135deg,#f7f4ff,#fff);color:#171126}'
+                '.title{font-size:64px;line-height:1.08;margin:0}</style></head><body>'
+                f'<main class="slide"><h1 class="title">样品页 {index}</h1>'
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 10" '
+                'aria-label="进度"><title>进度</title><rect width="100" height="10" '
+                'rx="5" fill="#6d28d9"></rect></svg></main></body></html>'
+            ),
+        })
+    return json.dumps({"pages": pages}, ensure_ascii=False)
 
 
 def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> None:
@@ -83,6 +126,96 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
     assert branched["state"] == "ppt_sample"
     assert branched["phase"] == "ready_to_generate"
     assert branched["samples"] == []
+
+
+def test_realistic_sample_output_repairs_truncated_json(workflow: Workflow, monkeypatch) -> None:
+    manifest = ready_for_sample(workflow)
+    truncated = realistic_sample_output()[:-80]
+    responses = iter([
+        truncated,
+        realistic_sample_output(),
+    ])
+    prompts: list[str] = []
+
+    def generate(state: str, prompt: str, *, json_mode: bool = False):
+        prompts.append(prompt)
+        return next(responses), [{"type": "model_call", "provider": "test", "model": "real-shape", "usage": {}}]
+
+    monkeypatch.setattr(workflow.gateway, "generate", generate)
+
+    generated = workflow.generate_sample(manifest["checkpoint_id"])
+
+    sample = generated["samples"][-1]
+    assert len(sample["pages"]) == 2
+    assert sample["provenance"]["sample_repair_attempts"] == 1
+    assert sample["provenance"]["sample_html_char_budget_per_page"] == 7_000
+    assert len(sample["provenance"]["traces"]) == 2
+    assert len(truncated) > 1_000
+    assert "SAMPLE_HTML_CHAR_BUDGET_PER_PAGE: 7000" in prompts[0]
+    assert "AUTOMATED_REPAIR_ATTEMPT: 1/2" in prompts[1]
+    assert "JSON 未完整闭合" in prompts[1]
+    assert truncated not in prompts[1]
+
+
+def test_realistic_sample_output_repairs_with_exact_allowlist_reason(
+    workflow: Workflow, monkeypatch
+) -> None:
+    manifest = ready_for_sample(workflow)
+    responses = iter([realistic_sample_output(unsafe_css=True), realistic_sample_output()])
+    prompts: list[str] = []
+
+    def generate(state: str, prompt: str, *, json_mode: bool = False):
+        prompts.append(prompt)
+        return next(responses), [{"type": "model_call", "provider": "test", "model": "real-shape", "usage": {}}]
+
+    monkeypatch.setattr(workflow.gateway, "generate", generate)
+
+    generated = workflow.generate_sample(manifest["checkpoint_id"])
+
+    sample = generated["samples"][-1]
+    assert sample["provenance"]["sample_repair_attempts"] == 1
+    assert all("backdrop-filter" not in page["html"] for page in sample["pages"])
+    assert "安全净化拒绝" in prompts[1]
+    assert "pages.0.html: unsupported CSS declaration: backdrop-filter" in prompts[1]
+
+
+def test_sample_output_repair_stops_after_bounded_attempts(workflow: Workflow, monkeypatch) -> None:
+    manifest = ready_for_sample(workflow)
+    prompts: list[str] = []
+
+    def generate(state: str, prompt: str, *, json_mode: bool = False):
+        prompts.append(prompt)
+        return realistic_sample_output(unsafe_css=True), [
+            {"type": "model_call", "provider": "test", "model": "real-shape", "usage": {}}
+        ]
+
+    monkeypatch.setattr(workflow.gateway, "generate", generate)
+
+    with pytest.raises(SampleGenerationError) as failure:
+        workflow.generate_sample(manifest["checkpoint_id"])
+
+    assert failure.value.public_code == "sample_html_rejected"
+    assert len(prompts) == 3
+    assert "AUTOMATED_REPAIR_ATTEMPT: 2/2" in prompts[-1]
+    persisted = workflow.store.read()
+    assert persisted["phase"] == "ready_to_generate"
+    assert persisted["samples"] == []
+
+
+def test_job_error_contract_hides_internal_sample_validation_details() -> None:
+    failure = SampleGenerationError(
+        "sample_html_rejected",
+        "样品含有不支持的内容，自动修复后仍未通过，请重试。",
+        "pages.0.html: unsupported attribute: internal-validation-detail",
+    )
+
+    error = public_job_error(failure)
+
+    assert error == {
+        "code": "sample_html_rejected",
+        "message": "样品含有不支持的内容，自动修复后仍未通过，请重试。",
+    }
+    assert "internal-validation-detail" not in str(error)
 
 
 @pytest.mark.parametrize(

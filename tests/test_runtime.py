@@ -20,6 +20,7 @@ def test_default_runtime_is_valid() -> None:
     assert {binding.base_url for binding in runtime.models.state_bindings} == {
         "https://ark.cn-beijing.volces.com/api/v3"
     }
+    assert runtime.models.binding_for("ppt_sample").parameters == {"max_tokens": 16_384}
     assert "api_key_env" not in runtime.public_context()["model_bindings"][0]
 
 
