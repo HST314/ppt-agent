@@ -1162,6 +1162,23 @@ class Workflow:
             raise FileNotFoundError(revision_hash)
         return self.store.select_sample_revision(checkpoint_id, revision_hash)
 
+    def restore_full_deck(
+        self,
+        checkpoint_id: str,
+        revision_hash: str,
+    ) -> dict[str, Any]:
+        """Move the current full-deck pointer without creating a revision."""
+
+        manifest = self.store.read(include_sample_html=False)
+        self._require(manifest, "restore_full_deck_revision", checkpoint_id)
+        root = manifest.get("full_deck") or {}
+        if revision_hash not in {
+            reference.get("revision_hash")
+            for reference in root.get("revision_refs", [])
+        }:
+            raise FileNotFoundError(revision_hash)
+        return self.store.select_full_deck_revision(checkpoint_id, revision_hash)
+
     def approve_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
         manifest = self.store.read()
         self._require(manifest, "approve_sample", checkpoint_id)

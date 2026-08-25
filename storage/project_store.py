@@ -57,6 +57,16 @@ def mark_full_deck_stale(manifest: dict[str, Any]) -> None:
         revision["status"] = "stale"
 
 
+def full_deck_phase(revision: dict[str, Any]) -> str:
+    """Project the workflow phase from the selected immutable revision."""
+
+    if revision.get("status") == "approved":
+        return "completed"
+    if revision.get("status") == "draft":
+        return "ready_to_generate"
+    return "waiting_human_approval"
+
+
 class ProjectStore(PromptAuditMixin):
     _locks: dict[str, threading.RLock] = {}
     _initialized_databases: dict[str, int] = {}
@@ -1412,6 +1422,7 @@ class ProjectStore(PromptAuditMixin):
         mode: str = "fork_after",
         stage: str | None = None,
         sample_revision_hash: str | None = None,
+        full_deck_revision_hash: str | None = None,
     ) -> dict[str, Any]:
         if not PROJECT_ID.fullmatch(name):
             raise ValueError("invalid branch name")
@@ -1423,6 +1434,12 @@ class ProjectStore(PromptAuditMixin):
             raise ValueError("rerun stage is required")
         if sample_revision_hash is not None and not REVISION_HASH.fullmatch(sample_revision_hash):
             raise ValueError("invalid revision hash")
+        if full_deck_revision_hash is not None and not REVISION_HASH.fullmatch(
+            full_deck_revision_hash
+        ):
+            raise ValueError("invalid revision hash")
+        if sample_revision_hash is not None and full_deck_revision_hash is not None:
+            raise ValueError("only one revision source may be selected")
         self._ensure_database()
         with self.lock:
             if mode == "rerun_stage":
@@ -1452,6 +1469,31 @@ class ProjectStore(PromptAuditMixin):
                         mark_full_deck_stale(snapshot)
                     snapshot["current_sample_revision_hash"] = sample_revision_hash
                     snapshot.update(state="ppt_sample", phase="waiting_human_approval")
+                if full_deck_revision_hash is not None:
+                    full_deck = snapshot.get("full_deck") or {}
+                    selected = next(
+                        (
+                            revision
+                            for revision in snapshot.get("full_deck_revisions", [])
+                            if revision.get("revision_hash") == full_deck_revision_hash
+                        ),
+                        None,
+                    )
+                    if (
+                        selected is None
+                        or full_deck_revision_hash
+                        not in {
+                            reference.get("revision_hash")
+                            for reference in full_deck.get("revision_refs", [])
+                        }
+                    ):
+                        raise FileNotFoundError(full_deck_revision_hash)
+                    full_deck["current_revision_hash"] = full_deck_revision_hash
+                    snapshot["full_deck"] = full_deck
+                    snapshot.update(
+                        state="ppt_full",
+                        phase=full_deck_phase(selected),
+                    )
                 branches = current.get("branches", {current.get("branch", "main"): current["checkpoint_id"]})
                 if name in branches:
                     raise ConflictError("branch already exists")
@@ -1465,6 +1507,7 @@ class ProjectStore(PromptAuditMixin):
                     "parent": parent, "from_checkpoint": checkpoint_id, "created_at": utc_now(),
                     "mode": mode, "source_stage": stage,
                     "source_sample_revision_hash": sample_revision_hash,
+                    "source_full_deck_revision_hash": full_deck_revision_hash,
                 }
                 snapshot["branches"] = {**branches, name: next_checkpoint}
                 snapshot["branch_meta"] = branch_meta
@@ -1478,6 +1521,7 @@ class ProjectStore(PromptAuditMixin):
                         "branch": name, "parent": parent, "from_checkpoint": checkpoint_id,
                         "mode": mode, "source_stage": stage,
                         "sample_revision_hash": sample_revision_hash,
+                        "full_deck_revision_hash": full_deck_revision_hash,
                     },
                     checkpoint_id,
                 )
@@ -1688,6 +1732,188 @@ class ProjectStore(PromptAuditMixin):
             if row is None:
                 raise FileNotFoundError(revision_hash)
             return str(row["checkpoint_id"])
+
+    def full_deck_history(self) -> list[dict[str, Any]]:
+        """Return bounded metadata for every revision on the current deck root."""
+
+        manifest = self.read(include_sample_html=False)
+        root = manifest.get("full_deck") or {}
+        current_hash = root.get("current_revision_hash")
+        self._ensure_database()
+        with self._connect() as connection:
+            checkpoints = {
+                row["revision_hash"]: row["checkpoint_id"]
+                for row in connection.execute(
+                    """
+                    SELECT revision_hash, checkpoint_id
+                    FROM full_deck_revisions WHERE full_deck_id = ?
+                    """,
+                    (root.get("full_deck_id"),),
+                ).fetchall()
+            }
+        result = []
+        for revision in reversed(manifest.get("full_deck_revisions", [])):
+            package = revision.get("package")
+            result.append({
+                "full_deck_id": revision["full_deck_id"],
+                "revision": revision["revision"],
+                "revision_hash": revision["revision_hash"],
+                "parent_revision_hash": revision.get("parent_revision_hash"),
+                "feedback": revision.get("feedback"),
+                "status": revision["status"],
+                "created_at": revision["created_at"],
+                "source_checkpoint_id": checkpoints.get(revision["revision_hash"]),
+                "current": revision["revision_hash"] == current_hash,
+                "page_count": len(revision.get("plan", {}).get("pages", [])),
+                "changed_slot_ids": revision.get("provenance", {}).get(
+                    "changed_slot_ids", []
+                ),
+                "package": {
+                    "package_hash": package["package_hash"],
+                    "entrypoint": package["entrypoint"],
+                    "title": package["title"],
+                    "slide_count": package["slide_count"],
+                    "file_count": len(package.get("files", [])),
+                } if package else None,
+            })
+        return result
+
+    def select_full_deck_revision(
+        self,
+        checkpoint_id: str,
+        revision_hash: str,
+    ) -> dict[str, Any]:
+        """Move the deck pointer while preserving immutable revision history."""
+
+        if not REVISION_HASH.fullmatch(revision_hash):
+            raise ValueError("invalid revision hash")
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            root = value.get("full_deck") or {}
+            selected = next(
+                (
+                    revision
+                    for revision in value.get("full_deck_revisions", [])
+                    if revision.get("revision_hash") == revision_hash
+                ),
+                None,
+            )
+            if (
+                selected is None
+                or revision_hash
+                not in {
+                    reference.get("revision_hash")
+                    for reference in root.get("revision_refs", [])
+                }
+            ):
+                raise FileNotFoundError(revision_hash)
+            root["current_revision_hash"] = revision_hash
+            value["full_deck"] = root
+            value.update(state="ppt_full", phase=full_deck_phase(selected))
+            return value
+
+        return self.update(
+            apply,
+            "full_deck_revision_selected",
+            {"revision_hash": revision_hash},
+            expected_checkpoint_id=checkpoint_id,
+        )
+
+    def full_deck_revision(self, revision_hash: str) -> dict[str, Any]:
+        if not REVISION_HASH.fullmatch(revision_hash):
+            raise ValueError("invalid revision hash")
+        manifest = self.read(include_sample_html=False)
+        revision = next(
+            (
+                item
+                for item in manifest.get("full_deck_revisions", [])
+                if item.get("revision_hash") == revision_hash
+            ),
+            None,
+        )
+        if revision is None:
+            raise FileNotFoundError(revision_hash)
+        return revision
+
+    def full_deck_revision_checkpoint(self, revision_hash: str) -> str:
+        if not REVISION_HASH.fullmatch(revision_hash):
+            raise ValueError("invalid revision hash")
+        self._ensure_database()
+        with self._connect() as connection:
+            manifest = self._raw_current(connection)
+            if revision_hash not in {
+                reference.get("revision_hash")
+                for reference in (manifest.get("full_deck") or {}).get(
+                    "revision_refs", []
+                )
+            }:
+                raise FileNotFoundError(revision_hash)
+            row = connection.execute(
+                "SELECT checkpoint_id FROM full_deck_revisions WHERE revision_hash = ?",
+                (revision_hash,),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(revision_hash)
+            return str(row["checkpoint_id"])
+
+    def full_deck_package_file(
+        self,
+        revision_hash: str,
+        logical_path: str,
+    ) -> tuple[Path, str]:
+        if not REVISION_HASH.fullmatch(revision_hash):
+            raise ValueError("invalid revision hash")
+        path = normalize_package_path(logical_path)
+        self._ensure_database()
+        with self._connect() as connection:
+            manifest = self._raw_current(connection)
+            if revision_hash not in {
+                reference.get("revision_hash")
+                for reference in (manifest.get("full_deck") or {}).get(
+                    "revision_refs", []
+                )
+            }:
+                raise FileNotFoundError(revision_hash)
+            row = connection.execute(
+                """
+                SELECT a.relative_path, a.sha256, a.size_bytes, f.media_type
+                FROM full_deck_package_files f
+                JOIN artifacts a ON a.artifact_id = f.artifact_id
+                WHERE f.revision_hash = ? AND f.logical_path = ?
+                """,
+                (revision_hash, path),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(path)
+        artifact_path = (self.root / row["relative_path"]).resolve()
+        if (
+            not artifact_path.is_relative_to(self.package_artifacts_root.resolve())
+            or not artifact_path.is_file()
+        ):
+            raise ConflictError("package_artifact_missing")
+        content = artifact_path.read_bytes()
+        if (
+            "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
+            or len(content) != row["size_bytes"]
+        ):
+            raise ConflictError("artifact_corrupt")
+        return artifact_path, row["media_type"]
+
+    def full_deck_package_files(
+        self,
+        revision_hash: str,
+    ) -> list[tuple[str, Path]]:
+        revision = self.full_deck_revision(revision_hash)
+        package = revision.get("package")
+        if not package:
+            raise FileNotFoundError(revision_hash)
+        return [
+            (
+                item["path"],
+                self.full_deck_package_file(revision_hash, item["path"])[0],
+            )
+            for item in package.get("files", [])
+        ]
 
 def list_projects(root: Path) -> list[dict[str, Any]]:
     if not root.exists():

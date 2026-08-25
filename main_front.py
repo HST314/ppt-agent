@@ -117,6 +117,18 @@ class SampleRevisionBranchRequest(SampleRevisionRequest):
     name: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 
 
+class FullDeckRevisionRequest(StrictRequest):
+    checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
+
+
+class FullDeckRevisionBranchRequest(FullDeckRevisionRequest):
+    name: str = Field(
+        min_length=2,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$",
+    )
+
+
 @app.middleware("http")
 async def request_size_limit(request: Request, call_next):
     length = request.headers.get("content-length")
@@ -182,12 +194,10 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
         ),
         None,
     )
-    if current_full_deck and current_full_deck.get("package"):
-        current_full_deck["package"]["files"] = [{
-            key: item[key]
-            for key in ("path", "artifact_id", "sha256", "size", "media_type", "origin")
-            if key in item
-        } for item in current_full_deck["package"].get("files", [])]
+    current_full_deck = _public_full_deck_revision(
+        store.project_id,
+        current_full_deck,
+    )
     public_manifest = deepcopy(manifest)
     public_manifest.pop("full_deck_revisions", None)
     return {
@@ -210,6 +220,14 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
                 "status": item["status"],
                 "created_at": item["created_at"],
                 "page_count": len(item.get("plan", {}).get("pages", [])),
+                "changed_slot_ids": item.get("provenance", {}).get(
+                    "changed_slot_ids", []
+                ),
+                "package": {
+                    "title": item["package"]["title"],
+                    "slide_count": item["package"]["slide_count"],
+                    "file_count": len(item["package"].get("files", [])),
+                } if item.get("package") else None,
                 "current": item.get("revision_hash") == current_full_deck_hash,
             }
             for item in reversed(full_deck_revisions)
@@ -244,6 +262,28 @@ def _public_sample(
         "page_id": slide["slide_id"],
         "title": slide["title"],
     } for slide in package.get("slides", [])]
+    return value
+
+
+def _public_full_deck_revision(
+    project_id: str,
+    revision: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if revision is None:
+        return None
+    value = deepcopy(revision)
+    package = value.get("package")
+    if not package:
+        return value
+    package["files"] = [{
+        key: item[key]
+        for key in ("path", "artifact_id", "sha256", "size", "media_type", "origin")
+        if key in item
+    } for item in package.get("files", [])]
+    revision_hash = value["revision_hash"]
+    base = f"/api/projects/{project_id}/full-deck/revisions/{revision_hash}"
+    value["preview_url"] = f"{base}/preview/{package['entrypoint']}"
+    value["export_url"] = f"{base}/export"
     return value
 
 
@@ -405,6 +445,56 @@ def enter_full_deck(project_id: str, request: FullDeckEnterRequest) -> dict[str,
     return project_view(store)
 
 
+@app.get("/api/projects/{project_id}/full-deck/revisions")
+def full_deck_revisions(project_id: str) -> list[dict[str, Any]]:
+    return store_for(project_id).full_deck_history()
+
+
+@app.get("/api/projects/{project_id}/full-deck/revisions/{revision_hash}")
+def full_deck_revision(project_id: str, revision_hash: str) -> dict[str, Any]:
+    store = store_for(project_id)
+    try:
+        revision = _public_full_deck_revision(
+            project_id,
+            store.full_deck_revision(revision_hash),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="全稿修订不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="全稿修订标识无效") from exc
+    root = store.read(latest_sample_only=True, include_sample_html=False).get(
+        "full_deck"
+    ) or {}
+    revision["current"] = root.get("current_revision_hash") == revision_hash
+    return revision
+
+
+@app.post(
+    "/api/projects/{project_id}/full-deck/revisions/{revision_hash}/restore"
+)
+def restore_full_deck_revision(
+    project_id: str,
+    revision_hash: str,
+    request: FullDeckRevisionRequest,
+) -> dict[str, Any]:
+    store = store_for(project_id)
+    with jobs.project_guard(project_id) as active:
+        if active:
+            raise ConflictError("active_job:请等待当前任务结束后再切换全稿版本。")
+        with runtime_config_lock:
+            current_runtime = runtime
+        try:
+            Workflow(store, current_runtime).restore_full_deck(
+                request.checkpoint_id,
+                revision_hash,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="全稿修订不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="全稿修订标识无效") from exc
+    return project_view(store)
+
+
 @app.get("/api/projects/{project_id}/samples/revisions")
 def sample_revisions(project_id: str) -> list[dict[str, Any]]:
     return store_for(project_id).sample_history()
@@ -448,6 +538,40 @@ PACKAGE_CSP = (
 )
 
 
+def package_file_response(path: Path, media_type: str) -> FileResponse:
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={
+            "Content-Security-Policy": PACKAGE_CSP,
+            # The iframe sandbox gives package documents an opaque origin.
+            # Package-local resources therefore need CORP cross-origin while
+            # CSP continues to deny every external source.
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=31536000, immutable",
+        },
+    )
+
+
+def package_export_response(
+    files: list[tuple[str, Path]],
+    filename: str,
+) -> Response:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for logical_path, path in files:
+            archive.writestr(logical_path, path.read_bytes())
+    return Response(
+        output.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.get("/api/projects/{project_id}/samples/revisions/{revision_hash}/preview/{logical_path:path}")
 def preview_sample_package_file(
     project_id: str,
@@ -460,19 +584,7 @@ def preview_sample_package_file(
         raise HTTPException(status_code=404, detail="HTML-PPT 包文件不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="HTML-PPT 包路径无效") from exc
-    return FileResponse(
-        path,
-        media_type=media_type,
-        headers={
-            "Content-Security-Policy": PACKAGE_CSP,
-            # A sandbox without allow-same-origin has an opaque origin. Package
-            # subresources therefore need CORP cross-origin even though their
-            # URLs share this route prefix. CSP still blocks external sources.
-            "Cross-Origin-Resource-Policy": "cross-origin",
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "private, max-age=31536000, immutable",
-        },
-    )
+    return package_file_response(path, media_type)
 
 
 @app.get("/api/projects/{project_id}/samples/revisions/{revision_hash}/export")
@@ -481,17 +593,41 @@ def export_sample_package(project_id: str, revision_hash: str) -> Response:
         files = store_for(project_id).sample_package_files(revision_hash)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="HTML-PPT 包不存在") from exc
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for logical_path, path in files:
-            archive.writestr(logical_path, path.read_bytes())
-    return Response(
-        output.getvalue(),
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{project_id}-html-ppt-{revision_hash[-8:]}.zip"',
-            "X-Content-Type-Options": "nosniff",
-        },
+    return package_export_response(
+        files,
+        f"{project_id}-html-ppt-{revision_hash[-8:]}.zip",
+    )
+
+
+@app.get(
+    "/api/projects/{project_id}/full-deck/revisions/{revision_hash}/preview/{logical_path:path}"
+)
+def preview_full_deck_package_file(
+    project_id: str,
+    revision_hash: str,
+    logical_path: str,
+) -> FileResponse:
+    try:
+        path, media_type = store_for(project_id).full_deck_package_file(
+            revision_hash,
+            logical_path,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="全稿包文件不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="全稿包路径无效") from exc
+    return package_file_response(path, media_type)
+
+
+@app.get("/api/projects/{project_id}/full-deck/revisions/{revision_hash}/export")
+def export_full_deck_package(project_id: str, revision_hash: str) -> Response:
+    try:
+        files = store_for(project_id).full_deck_package_files(revision_hash)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="完整全稿包不存在") from exc
+    return package_export_response(
+        files,
+        f"{project_id}-full-deck-{revision_hash[-8:]}.zip",
     )
 
 
@@ -522,6 +658,35 @@ def branch_from_sample_revision(
     return project_view(store)
 
 
+@app.post(
+    "/api/projects/{project_id}/full-deck/revisions/{revision_hash}/branches"
+)
+def branch_from_full_deck_revision(
+    project_id: str,
+    revision_hash: str,
+    request: FullDeckRevisionBranchRequest,
+) -> dict[str, Any]:
+    store = store_for(project_id)
+    with jobs.project_guard(project_id) as active:
+        if active:
+            raise ConflictError("active_job:请等待当前任务结束后再创建分支。")
+        current = store.read(latest_sample_only=True, include_sample_html=False)
+        if current["checkpoint_id"] != request.checkpoint_id:
+            raise ConflictError("stale_revision:工程已更新，请刷新后重试。")
+        try:
+            source_checkpoint = store.full_deck_revision_checkpoint(revision_hash)
+            store.fork(
+                source_checkpoint,
+                request.name,
+                full_deck_revision_hash=revision_hash,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="全稿修订不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="全稿修订标识无效") from exc
+    return project_view(store)
+
+
 @app.get("/api/projects/{project_id}/timeline")
 def timeline(project_id: str) -> list[dict[str, Any]]:
     return store_for(project_id).events()
@@ -539,8 +704,20 @@ def project_activity(
     job_events = jobs.events_for_project(project_id, limit=min(limit, 1000))
     events: list[dict[str, Any]] = []
 
-    artifact_events = {"sample_generated", "sample_revised", "sample_revision_selected"}
-    validation_events = {"document_approved", "sample_approved"}
+    artifact_events = {
+        "sample_generated",
+        "sample_revised",
+        "sample_revision_selected",
+        "full_deck_initialized",
+        "full_deck_generated",
+        "full_deck_revised",
+        "full_deck_revision_selected",
+    }
+    validation_events = {
+        "document_approved",
+        "sample_approved",
+        "full_deck_approved",
+    }
     for index, item in enumerate(project_events):
         kind = "artifact" if item["event"] in artifact_events else "validation" if item["event"] in validation_events else "project"
         events.append({
