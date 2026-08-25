@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -7,6 +8,7 @@ from pathlib import Path
 
 from agent_core.jobs import JobRegistry
 from agent_core.models import SamplePage, SampleRevision, TaskCard, utc_now
+from agent_core.processes import process_is_alive
 from agent_core.workflow import Workflow
 from configs.runtime import ManagedRuntime
 from storage.project_store import ProjectStore
@@ -67,6 +69,12 @@ def _read_legacy_project_in_process(root: str, project_id: str, ready, start, re
         results.put(("ok", manifest["checkpoint_id"]))
     except Exception as exc:  # pragma: no cover - the assertion reports the child failure.
         results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def test_process_liveness_probe_is_non_destructive() -> None:
+    assert process_is_alive(os.getpid())
+    assert not process_is_alive(None)
+    assert not process_is_alive(0)
 
 
 def test_project_store_commits_sqlite_wal_artifacts_and_parent_links(

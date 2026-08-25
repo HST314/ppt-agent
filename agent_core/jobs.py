@@ -13,6 +13,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from agent_core.models import utc_now
+from agent_core.processes import process_is_alive
 
 
 def public_job_error(exc: Exception) -> dict[str, str]:
@@ -145,18 +146,6 @@ class JobRegistry:
             ),
         )
 
-    @staticmethod
-    def _process_is_alive(process_id: int | None) -> bool:
-        if not process_id or process_id <= 0:
-            return False
-        try:
-            os.kill(process_id, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
-
     def _migrate_legacy_files(self) -> None:
         with self._transaction() as connection:
             if connection.execute("SELECT 1 FROM jobs LIMIT 1").fetchone():
@@ -198,7 +187,7 @@ class JobRegistry:
             ).fetchall()
             for row in rows:
                 record = self._record(row)
-                if self._process_is_alive(row["owner_pid"]):
+                if process_is_alive(row["owner_pid"]):
                     continue
                 record.update(
                     status="failed",
