@@ -164,10 +164,31 @@ def test_api_drives_sample_generation_feedback_and_approval(
     assert len(project["samples"]) == 1
     assert revised["revision"] == 2
     assert revised["feedback"] == "标题更有冲击力，减少辅助文字"
+    assert [item["revision"] for item in project["sample_revisions"]] == [2, 1]
+    assert project["sample_revisions"][0]["current"] is True
+
+    first_hash = project["sample_revisions"][1]["revision_hash"]
+    historical = client.get(
+        f"/api/projects/{project_id}/samples/revisions/{first_hash}"
+    )
+    assert historical.status_code == 200
+    assert historical.json()["revision"] == 1
+    assert all("html" in page for page in historical.json()["pages"])
+
+    restored = client.post(
+        f"/api/projects/{project_id}/samples/revisions/{first_hash}/restore",
+        json={"checkpoint_id": project["checkpoint_id"]},
+    )
+    assert restored.status_code == 200
+    project = restored.json()
+    restored_sample = project["samples"][-1]
+    assert restored_sample["revision"] == 3
+    assert restored_sample["parent_revision_hash"] == revised["revision_hash"]
+    assert restored_sample["provenance"]["restored_from_revision_hash"] == first_hash
 
     approved = client.post(f"/api/projects/{project_id}/samples/approve", json={
         "checkpoint_id": project["checkpoint_id"],
-        "revision_hash": revised["revision_hash"],
+        "revision_hash": restored_sample["revision_hash"],
     })
     assert approved.status_code == 200
     assert approved.json()["phase"] == "completed"
@@ -175,6 +196,23 @@ def test_api_drives_sample_generation_feedback_and_approval(
         item for item in approved.json()["progress_snapshots"] if item["stage"] == "ppt_sample"
     )
     assert "html" not in sample_snapshot["snapshot"]["samples"][-1]["pages"][0]
+
+    prompt_export = client.get(f"/api/projects/{project_id}/audit/prompt-calls.jsonl")
+    assert prompt_export.status_code == 200
+    assert prompt_export.headers["content-type"].startswith("application/x-ndjson")
+    prompt_calls = [line for line in prompt_export.text.splitlines() if line]
+    assert len(prompt_calls) >= 5
+
+    branch = client.post(
+        f"/api/projects/{project_id}/samples/revisions/{first_hash}/branches",
+        json={
+            "checkpoint_id": approved.json()["checkpoint_id"],
+            "name": "sample-history",
+        },
+    )
+    assert branch.status_code == 200
+    assert branch.json()["branch"] == "sample-history"
+    assert branch.json()["samples"][-1]["revision_hash"] == first_hash
 
 
 def test_api_updates_runtime_and_switches_branches(tmp_path: Path, monkeypatch) -> None:

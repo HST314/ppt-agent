@@ -4,7 +4,7 @@ PPT Agent 是一个带持久化确认门的演示文稿创作工作台。当前�
 
 `任务卡 → 澄清问题 → 叙事结构 → 逐页大纲 → PPT 样品`
 
-叙事结构和逐页大纲以版本化 Markdown 保存；PPT 样品以版本化、自包含的 16:9 HTML 页面保存。样品区提供大画框隔离预览、分页切换、自然语言修改和确认，默认生成 2 页。工作台支持安全预览、浏览器草稿恢复、修订确认、上游失效传播、从阶段快照创建重跑分支，以及按阶段配置模型。Agent 仅能通过标准 `read` 工具读取 `skills/` 内的 Markdown / 文本文件。
+叙事结构和逐页大纲以版本化 Markdown 保存；PPT 样品是版本化、自包含的 16:9 HTML 页面，净化后按内容哈希去重保存。样品区提供大画框隔离预览、分页切换、自然语言修改和确认，并在意见区后方提供修订历史：历史版本可只读预览、恢复为新修订或作为新分支起点。工作台支持浏览器草稿恢复、修订确认、上游失效传播、从阶段快照创建重跑分支，以及按阶段配置模型。Agent 仅能通过标准 `read` 工具读取 `skills/` 内的 Markdown / 文本文件。
 
 ## 本地启动
 
@@ -46,7 +46,11 @@ python main.py
 
 ## 数据与恢复
 
-项目数据默认保存在 `frontend/data/projects/`。每次状态变化都会原子写入 Manifest 和 Checkpoint，并追加事件日志。创作进度卡中已有快照的阶段可点击回看，并可从该阶段的输入边界重跑创建新分支；已有分支可在分支页面查看和切换。旧版本中已确认逐页大纲的工程可直接进入 PPT 样品阶段。也可通过 `PPT_AGENT_PROJECTS_ROOT` 指定受管数据目录。
+项目数据默认保存在 `frontend/data/projects/`。每个工程包含一个启用 WAL 的 `project.db`，在单个事务中更新工程状态、显式父检查点、分支头、修订、事件、PromptCall 和 artifact 元数据；净化后的 HTML 位于 `artifacts/html/<sha256>.html`，相同内容自动复用。后台 Job 存放在 `.jobs/jobs.db`，多 worker 通过 SQLite 写锁协调提交与分支操作。文件格式的既有工程会在首次读取时自动导入，源文件仍保留。
+
+PromptCall 审计记录保存脱敏后的输入消息、模板/配置/Skill 哈希、模型参数、工具调用、终态和产物引用。可通过 `GET /api/projects/<project_id>/audit/prompt-calls` 查询，或从 `GET /api/projects/<project_id>/audit/prompt-calls.jsonl` 导出 JSONL。
+
+创作进度卡中已有快照的阶段可点击回看，并可从该阶段的输入边界重跑创建新分支；已有分支可在分支页面查看和切换。旧版本中已确认逐页大纲的工程可直接进入 PPT 样品阶段。也可通过 `PPT_AGENT_PROJECTS_ROOT` 指定受管数据目录。
 
 ## 测试
 

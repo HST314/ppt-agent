@@ -31,6 +31,11 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert 'name="sample_page_count"' in app
     assert 'id="sample-feedback-form"' in samples
     assert 'data-action="generate_sample"' in samples
+    assert '${completion}${preview}${feedback}${historyMarkup}' in samples
+    assert 'data-action="restore_sample"' in samples
+    assert 'data-action="branch_sample_revision"' in samples
+    assert 'data-sample-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"' in samples
+    assert "sampleRevision:" in (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
 
 
 def test_sample_preview_is_sandboxed_and_never_inserted_into_parent_dom() -> None:

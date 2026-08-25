@@ -12,6 +12,7 @@ import tinycss2
 HTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
 SVG_NAMESPACE = "http://www.w3.org/2000/svg"
 XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/"
+SANITIZER_VERSION = "sample-html-v1"
 
 HTML_TAGS = {
     "a", "abbr", "article", "aside", "b", "bdi", "bdo", "blockquote", "br",

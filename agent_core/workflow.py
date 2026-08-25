@@ -8,10 +8,10 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from agent_core.models import DocumentRevision, Question, QuestionCard, SampleOutput, SampleRevision, TaskCard
+from agent_core.models import DocumentRevision, Question, QuestionCard, SampleOutput, SamplePage, SampleRevision, TaskCard
 from agent_core.sample_html import SampleHtmlError
 from configs.runtime import ManagedRuntime
-from model_router.client import ModelGateway, ModelOutputError
+from model_router.client import ModelGateway, ModelOutputError, SYSTEM_MESSAGE
 from runtime.read_tool import SkillReader
 from storage.project_store import ConflictError, ProjectStore
 
@@ -174,6 +174,60 @@ class Workflow:
         content = path.read_text(encoding="utf-8")
         return content, "sha256:" + hashlib.sha256(content.encode()).hexdigest()
 
+    def _start_prompt_audit(
+        self,
+        state: str,
+        prompt: str,
+        *,
+        template_id: str,
+        template_hash: str,
+        skills_hash: str,
+        json_mode: bool = False,
+        parent_prompt_call_id: str | None = None,
+    ) -> str:
+        self.gateway.last_messages = None
+        binding = self.runtime.models.binding_for(state)
+        parameters = dict(binding.parameters)
+        if json_mode:
+            parameters["response_format"] = {"type": "json_object"}
+        return self.store.start_prompt_call(
+            state=state,
+            messages=[
+                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "user", "content": prompt},
+            ],
+            template_id=template_id,
+            template_version=1,
+            template_hash=template_hash,
+            model_config_hash=self.runtime.model_hash,
+            runtime_config_hash=self.runtime.runtime_hash,
+            skills_hash=skills_hash,
+            parameters={
+                "provider": binding.provider,
+                "model": binding.model,
+                "parameters": parameters,
+            },
+            parent_prompt_call_id=parent_prompt_call_id,
+        )
+
+    def _fail_prompt_audit(
+        self,
+        prompt_call_id: str,
+        exc: Exception,
+        traces: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.store.finish_prompt_call(
+            prompt_call_id,
+            status="failed",
+            traces=traces,
+            messages=self.gateway.last_messages,
+            error={
+                "type": type(exc).__name__,
+                "code": getattr(exc, "public_code", None),
+                "message": str(exc)[:1000],
+            },
+        )
+
     @staticmethod
     def _require(manifest: dict[str, Any], capability: str, checkpoint_id: str | None = None) -> None:
         if checkpoint_id and manifest["checkpoint_id"] != checkpoint_id:
@@ -195,13 +249,35 @@ class Workflow:
             + "\nAvailable skill index:\n"
             + json.dumps(skill_index, ensure_ascii=False)
         )
-        text, traces = self.gateway.generate("intake_clarify", prompt, json_mode=True)
-        payload = self.gateway.parse_json(text)
-        raw_questions = payload.get("questions", [])[: self.runtime.policy.max_auto_questions]
-        questions = [Question.model_validate(item) for item in raw_questions]
-        if not questions:
-            raise WorkflowError("model returned no clarification questions")
+        skills_hash = stable_hash(skill_index)
+        prompt_call_id = self._start_prompt_audit(
+            "intake_clarify",
+            prompt,
+            template_id="clarify_questions",
+            template_hash=template_hash,
+            skills_hash=skills_hash,
+            json_mode=True,
+        )
+        traces: list[dict[str, Any]] = []
+        try:
+            text, traces = self.gateway.generate("intake_clarify", prompt, json_mode=True)
+            payload = self.gateway.parse_json(text)
+            raw_questions = payload.get("questions", [])[: self.runtime.policy.max_auto_questions]
+            questions = [Question.model_validate(item) for item in raw_questions]
+            if not questions:
+                raise WorkflowError("model returned no clarification questions")
+        except Exception as exc:
+            self._fail_prompt_audit(prompt_call_id, exc, traces)
+            raise
         card_id = "questions_" + uuid4().hex[:16]
+        self.store.finish_prompt_call(
+            prompt_call_id,
+            status="completed",
+            traces=traces,
+            messages=self.gateway.last_messages,
+            output_ref=card_id,
+            output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
+        )
 
         def apply(value: dict[str, Any]) -> dict[str, Any]:
             card = QuestionCard(
@@ -215,6 +291,7 @@ class Workflow:
                     "template_id": "clarify_questions",
                     "template_version": 1,
                     "template_hash": template_hash,
+                    "prompt_call_id": prompt_call_id,
                     "traces": traces,
                 },
             )
@@ -280,7 +357,20 @@ class Workflow:
             f"Approved upstream document:\n{(upstream or {}).get('markdown_body', 'none')}\n"
             f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
         )
-        markdown, traces = self.gateway.generate(state, prompt)
+        skills_hash = stable_hash(skill_index)
+        prompt_call_id = self._start_prompt_audit(
+            state,
+            prompt,
+            template_id=template_name.removesuffix(".md"),
+            template_hash=template_hash,
+            skills_hash=skills_hash,
+        )
+        traces: list[dict[str, Any]] = []
+        try:
+            markdown, traces = self.gateway.generate(state, prompt)
+        except Exception as exc:
+            self._fail_prompt_audit(prompt_call_id, exc, traces)
+            raise
         task_hash = "sha256:" + hashlib.sha256(json.dumps(manifest["task_card"], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         history = manifest["documents"][document_type]
         parent = history[-1]["revision_hash"] if history else None
@@ -299,8 +389,17 @@ class Workflow:
                 "template_id": template_name.removesuffix(".md"),
                 "template_version": 1,
                 "template_hash": template_hash,
+                "prompt_call_id": prompt_call_id,
                 "traces": traces,
             },
+        )
+        self.store.finish_prompt_call(
+            prompt_call_id,
+            status="completed",
+            traces=traces,
+            messages=self.gateway.last_messages,
+            output_ref=document.revision_hash,
+            output_hash="sha256:" + hashlib.sha256(markdown.encode()).hexdigest(),
         )
 
         def apply(value: dict[str, Any]) -> dict[str, Any]:
@@ -433,18 +532,39 @@ class Workflow:
             + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
         )
         traces: list[dict[str, Any]] = []
+        prompt_call_ids: list[str] = []
         repair_attempts = 0
         current_prompt = prompt
+        parent_prompt_call_id: str | None = None
+        successful_prompt_call_id: str | None = None
         for attempt in range(SAMPLE_MAX_REPAIR_ATTEMPTS + 1):
-            text, attempt_traces = self.gateway.generate("ppt_sample", current_prompt, json_mode=True)
+            prompt_call_id = self._start_prompt_audit(
+                "ppt_sample",
+                current_prompt,
+                template_id="ppt_sample",
+                template_hash=template_hash,
+                skills_hash=stable_hash(skill_index),
+                json_mode=True,
+                parent_prompt_call_id=parent_prompt_call_id,
+            )
+            prompt_call_ids.append(prompt_call_id)
+            attempt_traces: list[dict[str, Any]] = []
+            try:
+                text, attempt_traces = self.gateway.generate("ppt_sample", current_prompt, json_mode=True)
+            except Exception as exc:
+                self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
+                raise
             traces.extend(attempt_traces)
             try:
                 output = _validate_sample_output(text, page_count)
                 repair_attempts = attempt
+                successful_prompt_call_id = prompt_call_id
                 break
             except SampleGenerationError as exc:
+                self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
                 if attempt == SAMPLE_MAX_REPAIR_ATTEMPTS:
                     raise
+                parent_prompt_call_id = prompt_call_id
                 current_prompt = prompt + (
                     f"\n\nAUTOMATED_REPAIR_ATTEMPT: {attempt + 1}/{SAMPLE_MAX_REPAIR_ATTEMPTS}\n"
                     "The previous response was rejected. Return a fresh, complete JSON object; do not continue "
@@ -469,8 +589,20 @@ class Workflow:
                 "sample_page_count": page_count,
                 "sample_html_char_budget_per_page": SAMPLE_HTML_CHAR_BUDGET,
                 "sample_repair_attempts": repair_attempts,
+                "prompt_call_id": successful_prompt_call_id,
+                "prompt_call_ids": prompt_call_ids,
                 "traces": traces,
             },
+        )
+        if successful_prompt_call_id is None:
+            raise WorkflowError("sample prompt audit is incomplete")
+        self.store.finish_prompt_call(
+            successful_prompt_call_id,
+            status="completed",
+            traces=attempt_traces,
+            messages=self.gateway.last_messages,
+            output_ref=sample.revision_hash,
+            output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
         )
 
         def apply(value: dict[str, Any]) -> dict[str, Any]:
@@ -482,6 +614,56 @@ class Workflow:
             apply,
             "sample_revised" if normalized_feedback else "sample_generated",
             {"revision_hash": sample.revision_hash, "page_count": len(sample.pages)},
+            expected_checkpoint_id=checkpoint_id,
+        )
+
+    def restore_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
+        """Copy a reachable historical sample into a new current revision."""
+
+        manifest = self.store.read()
+        self._require(manifest, "revise_sample", checkpoint_id)
+        history = manifest.get("samples", [])
+        source = next(
+            (item for item in history if item["revision_hash"] == revision_hash),
+            None,
+        )
+        if source is None:
+            raise FileNotFoundError(revision_hash)
+        current = history[-1]
+        pages = [
+            SamplePage.model_validate({
+                "page_id": page["page_id"],
+                "title": page["title"],
+                "html": page["html"],
+            })
+            for page in source["pages"]
+        ]
+        outline = self._current(manifest, "slide_outline")
+        sample = SampleRevision.create(
+            pages,
+            revision=current["revision"] + 1,
+            parent=current["revision_hash"],
+            feedback=None,
+            provenance={
+                "restored_from_revision_hash": source["revision_hash"],
+                "source_provenance_hash": stable_hash(source.get("provenance", {})),
+                "upstream_revision_hash": outline["revision_hash"] if outline else None,
+            },
+        )
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            value.setdefault("samples", []).append(sample.model_dump())
+            value.update(state="ppt_sample", phase="waiting_human_approval")
+            return value
+
+        return self.store.update(
+            apply,
+            "sample_restored",
+            {
+                "revision_hash": sample.revision_hash,
+                "restored_from_revision_hash": source["revision_hash"],
+                "page_count": len(sample.pages),
+            },
             expected_checkpoint_id=checkpoint_id,
         )
 

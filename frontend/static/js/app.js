@@ -51,6 +51,7 @@ const EVENT_LABELS = {
   sample_stage_started: "进入样品阶段",
   sample_generated: "生成 PPT 样品",
   sample_revised: "根据意见修改样品",
+  sample_restored: "恢复样品修订",
   sample_approved: "确认 PPT 样品",
   branch_created: "创建分支",
   branch_switched: "切换分支",
@@ -58,7 +59,7 @@ const EVENT_LABELS = {
 
 const state = {
   projects: [], project: null, branches: null, runtime: null,
-  view: "workspace", busy: false, focusStage: null, samplePageIndex: 0,
+  view: "workspace", busy: false, focusStage: null, samplePageIndex: 0, samplePreview: null,
 };
 
 const content = document.querySelector("#content");
@@ -122,6 +123,10 @@ function currentDocument(type) {
 }
 
 function currentSample() {
+  return state.samplePreview || headSample();
+}
+
+function headSample() {
   return state.project?.samples?.at(-1) || null;
 }
 
@@ -171,7 +176,7 @@ function progressCard() {
   const project = state.project;
   const active = activeStageIndex();
   const outlineApproved = currentDocument("slide_outline")?.status === "approved";
-  const sampleApproved = currentSample()?.status === "approved";
+  const sampleApproved = headSample()?.status === "approved";
   const snapshots = stageSnapshotMap(project);
   const steps = STAGES.map((stage, index) => {
     const done = index < active || (index === 3 && outlineApproved) || (index === 4 && sampleApproved);
@@ -266,7 +271,12 @@ function selectSamplePage(index) {
 function sampleView() {
   const sample = currentSample();
   if (!sample) return readySampleView();
-  const view = sampleBody(sample, state.samplePageIndex, escapeHtml);
+  const current = headSample();
+  const view = sampleBody(sample, state.samplePageIndex, escapeHtml, {
+    history: state.project.sample_revisions || [],
+    selectedHash: sample.revision_hash,
+    isCurrent: sample.revision_hash === current?.revision_hash,
+  });
   state.samplePageIndex = view.pageIndex;
   return stagePanel("PPT 样品", "在大画框中检查代表性页面，再用自然语言让 AI 调整", view.body, view.status);
 }
@@ -407,6 +417,7 @@ async function openProject(id) {
     state.branches = branches;
     state.focusStage = null;
     state.samplePageIndex = 0;
+    state.samplePreview = null;
     state.view = "workspace";
     sidebarPinned = false;
     applySidebar(false);
@@ -421,6 +432,7 @@ async function refreshCurrent() {
   const [project, branches] = await Promise.all([api.project(state.project.project_id), api.branches(state.project.project_id)]);
   state.project = project;
   state.branches = branches;
+  state.samplePreview = null;
   await loadProjects();
   await render();
 }
@@ -460,6 +472,7 @@ async function runJob(operation, extra = {}) {
 
 function wireWorkspace() {
   content.querySelectorAll("[data-sample-page]").forEach((button) => button.addEventListener("click", () => selectSamplePage(Number(button.dataset.samplePage))));
+  content.querySelectorAll("[data-sample-revision]").forEach((button) => button.addEventListener("click", () => selectSampleRevision(button.dataset.sampleRevision)));
   content.querySelectorAll("[data-snapshot-stage]").forEach((button) => button.addEventListener("click", () => {
     openSnapshotDialog(button.dataset.snapshotStage);
   }));
@@ -479,6 +492,8 @@ function wireWorkspace() {
     if (action === "approve_document") await approveDocument(button.dataset.type);
     if (action === "regenerate_sample") await runJob("regenerate_sample");
     if (action === "approve_sample") await approveSample();
+    if (action === "restore_sample") await restoreSampleRevision(button.dataset.revisionHash);
+    if (action === "branch_sample_revision") await branchFromSampleRevision(button.dataset.revisionHash);
     if (action === "cancel_job" && state.project?.active_job) {
       try { await api.cancelJob(state.project.active_job.job_id); toast("已提交取消请求。"); }
       catch (error) { toast(error.message, true); }
@@ -550,6 +565,7 @@ async function enterSampleStage() {
     state.project = await api.enterSample(state.project.project_id, state.project.checkpoint_id);
     state.focusStage = null;
     state.samplePageIndex = 0;
+    state.samplePreview = null;
     state.branches = await api.branches(state.project.project_id);
     await render();
   } catch (error) { toast(error.message, true); }
@@ -577,7 +593,7 @@ async function submitSampleFeedback(event) {
 }
 
 async function approveSample() {
-  const sample = currentSample();
+  const sample = headSample();
   if (!sample) return;
   setBusy(true);
   try {
@@ -589,6 +605,60 @@ async function approveSample() {
     state.branches = await api.branches(state.project.project_id);
     await render();
     toast("PPT 样品已确认。");
+  } catch (error) { toast(error.message, true); }
+  finally { setBusy(false); }
+}
+
+async function selectSampleRevision(revisionHash) {
+  const current = headSample();
+  if (!current) return;
+  setBusy(true);
+  try {
+    state.samplePreview = revisionHash === current.revision_hash
+      ? null
+      : await api.sampleRevision(state.project.project_id, revisionHash);
+    state.samplePageIndex = 0;
+    await render();
+    document.querySelector("#sample-preview-frame")?.focus();
+  } catch (error) { toast(error.message, true); }
+  finally { setBusy(false); }
+}
+
+async function restoreSampleRevision(revisionHash) {
+  setBusy(true);
+  try {
+    state.project = await api.restoreSample(
+      state.project.project_id,
+      revisionHash,
+      state.project.checkpoint_id,
+    );
+    state.samplePreview = null;
+    state.samplePageIndex = 0;
+    state.branches = await api.branches(state.project.project_id);
+    await loadProjects();
+    await render();
+    toast("已恢复为新的当前修订，历史版本保持可回看。");
+  } catch (error) { toast(error.message, true); }
+  finally { setBusy(false); }
+}
+
+async function branchFromSampleRevision(revisionHash) {
+  const revision = (state.project.sample_revisions || []).find((item) => item.revision_hash === revisionHash);
+  if (!revision) return;
+  const name = automaticBranchName(`sample-r${revision.revision}`);
+  setBusy(true);
+  try {
+    state.project = await api.branchFromSample(state.project.project_id, revisionHash, {
+      checkpoint_id: state.project.checkpoint_id,
+      name,
+    });
+    state.samplePreview = null;
+    state.samplePageIndex = 0;
+    state.branches = await api.branches(state.project.project_id);
+    state.focusStage = "ppt_sample";
+    await loadProjects();
+    await render();
+    toast(`已从修订 ${revision.revision} 创建并切换到分支 ${name}。`);
   } catch (error) { toast(error.message, true); }
   finally { setBusy(false); }
 }
@@ -656,6 +726,7 @@ async function createProject(event) {
     state.branches = await api.branches(state.project.project_id);
     state.view = "workspace";
     state.samplePageIndex = 0;
+    state.samplePreview = null;
     projectDialog.close();
     await loadProjects();
     await render();
@@ -724,6 +795,7 @@ function openSnapshotDialog(stage) {
       });
       state.branches = await api.branches(state.project.project_id);
       state.focusStage = null;
+      state.samplePreview = null;
       dialog.close();
       await loadProjects();
       await render();
@@ -772,6 +844,7 @@ async function openBranchDialog() {
       state.project = await api.switchBranch(state.project.project_id, button.dataset.branchSwitch);
       state.branches = await api.branches(state.project.project_id);
       state.focusStage = null;
+      state.samplePreview = null;
       dialog.close();
       await loadProjects();
       await render();

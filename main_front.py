@@ -6,8 +6,8 @@ import threading
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -24,7 +24,7 @@ PROJECTS_ROOT = Path(os.getenv("PPT_AGENT_PROJECTS_ROOT", FRONTEND_ROOT / "data"
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 MAX_REQUEST_BYTES = 512 * 1024
 
-app = FastAPI(title="PPT Agent Studio", version="0.2.0")
+app = FastAPI(title="PPT Agent Studio", version="0.3.0")
 runtime = ManagedRuntime(APP_ROOT)
 runtime_config_lock = threading.RLock()
 jobs = JobRegistry(PROJECTS_ROOT / ".jobs")
@@ -93,6 +93,14 @@ class BranchSwitchRequest(StrictRequest):
     checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
 
 
+class SampleRevisionRequest(StrictRequest):
+    checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
+
+
+class SampleRevisionBranchRequest(SampleRevisionRequest):
+    name: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
+
+
 @app.middleware("http")
 async def request_size_limit(request: Request, call_next):
     length = request.headers.get("content-length")
@@ -128,7 +136,7 @@ def store_for(project_id: str) -> ProjectStore:
 
 
 def project_view(store: ProjectStore) -> dict[str, Any]:
-    manifest = store.read()
+    manifest = store.read(latest_sample_only=True)
     latest_job = jobs.latest_for_project(store.project_id)
     with runtime_config_lock:
         sample_page_count = runtime.policy.sample_page_count
@@ -139,6 +147,7 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
         # only needs the current HTML payload and should not download every
         # prior sample on each poll.
         "samples": latest_sample,
+        "sample_revisions": store.sample_history(),
         "sample_page_count": sample_page_count,
         "capabilities": capabilities(manifest),
         "active_job": latest_job if latest_job and latest_job["status"] in {"queued", "running"} else None,
@@ -289,9 +298,85 @@ def approve_sample(project_id: str, request: ApproveRequest) -> dict[str, Any]:
     return project_view(store)
 
 
+@app.get("/api/projects/{project_id}/samples/revisions")
+def sample_revisions(project_id: str) -> list[dict[str, Any]]:
+    return store_for(project_id).sample_history()
+
+
+@app.get("/api/projects/{project_id}/samples/revisions/{revision_hash}")
+def sample_revision(project_id: str, revision_hash: str) -> dict[str, Any]:
+    try:
+        return store_for(project_id).sample_revision(revision_hash)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="样品修订不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="样品修订标识无效") from exc
+
+
+@app.post("/api/projects/{project_id}/samples/revisions/{revision_hash}/restore")
+def restore_sample_revision(
+    project_id: str,
+    revision_hash: str,
+    request: SampleRevisionRequest,
+) -> dict[str, Any]:
+    store = store_for(project_id)
+    with runtime_config_lock:
+        current_runtime = runtime
+    try:
+        Workflow(store, current_runtime).restore_sample(request.checkpoint_id, revision_hash)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="样品修订不存在") from exc
+    return project_view(store)
+
+
+@app.post("/api/projects/{project_id}/samples/revisions/{revision_hash}/branches")
+def branch_from_sample_revision(
+    project_id: str,
+    revision_hash: str,
+    request: SampleRevisionBranchRequest,
+) -> dict[str, Any]:
+    store = store_for(project_id)
+    with jobs.project_guard(project_id) as active:
+        if active:
+            raise ConflictError("active_job")
+        current = store.read(latest_sample_only=True)
+        if current["checkpoint_id"] != request.checkpoint_id:
+            raise ConflictError("stale_revision")
+        try:
+            source_checkpoint = store.sample_revision_checkpoint(revision_hash)
+            store.fork(
+                source_checkpoint,
+                request.name,
+                sample_revision_hash=revision_hash,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="样品修订不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="样品修订标识无效") from exc
+    return project_view(store)
+
+
 @app.get("/api/projects/{project_id}/timeline")
 def timeline(project_id: str) -> list[dict[str, Any]]:
     return store_for(project_id).events()
+
+
+@app.get("/api/projects/{project_id}/audit/prompt-calls")
+def prompt_calls(
+    project_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    return store_for(project_id).prompt_calls(limit=limit)
+
+
+@app.get("/api/projects/{project_id}/audit/prompt-calls.jsonl", response_class=PlainTextResponse)
+def export_prompt_calls(project_id: str) -> PlainTextResponse:
+    store = store_for(project_id)
+    return PlainTextResponse(
+        store.export_prompt_calls_jsonl(),
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": f'attachment; filename="{project_id}-prompt-calls.jsonl"'},
+    )
 
 
 @app.get("/api/projects/{project_id}/branches")
@@ -307,9 +392,8 @@ def create_branch(project_id: str, request: BranchRequest) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="重跑分支必须指定来源阶段")
     # The registry lock closes the race with job submission: either the job is
     # visible and branching is rejected, or the branch commits before submit.
-    with jobs.lock:
-        active = jobs.latest_for_project(project_id)
-        if active and active["status"] in {"queued", "running"}:
+    with jobs.project_guard(project_id) as active:
+        if active:
             raise ConflictError("active_job")
         try:
             store.fork(
@@ -326,9 +410,8 @@ def create_branch(project_id: str, request: BranchRequest) -> dict[str, Any]:
 @app.post("/api/projects/{project_id}/branches/switch")
 def switch_branch(project_id: str, request: BranchSwitchRequest) -> dict[str, Any]:
     store = store_for(project_id)
-    with jobs.lock:
-        active = jobs.latest_for_project(project_id)
-        if active and active["status"] in {"queued", "running"}:
+    with jobs.project_guard(project_id) as active:
+        if active:
             raise ConflictError("active_job")
         try:
             store.switch_branch(request.checkpoint_id)

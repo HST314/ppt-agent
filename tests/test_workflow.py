@@ -155,6 +155,12 @@ def test_realistic_sample_output_repairs_truncated_json(workflow: Workflow, monk
     assert "AUTOMATED_REPAIR_ATTEMPT: 1/2" in prompts[1]
     assert "JSON 未完整闭合" in prompts[1]
     assert truncated not in prompts[1]
+    sample_calls = [
+        item for item in workflow.store.prompt_calls() if item["state"] == "ppt_sample"
+    ]
+    assert [item["status"] for item in sample_calls] == ["failed", "completed"]
+    assert sample_calls[1]["parent_prompt_call_id"] == sample_calls[0]["prompt_call_id"]
+    assert sample_calls[1]["output_ref"] == sample["revision_hash"]
 
 
 def test_realistic_sample_output_repairs_with_exact_allowlist_reason(
