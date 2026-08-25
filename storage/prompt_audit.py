@@ -224,5 +224,82 @@ class PromptAuditMixin:
             result.append(item)
         return result
 
+    def sample_attempts(self) -> list[dict[str, Any]]:
+        """Return a bounded public summary of the newest sample repair chain."""
+
+        self._ensure_database()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                WITH RECURSIVE newest_sample_chain AS (
+                    SELECT prompt_calls.*, 1 AS chain_depth FROM prompt_calls
+                    WHERE prompt_call_id = (
+                        SELECT prompt_call_id FROM prompt_calls
+                        WHERE state = 'ppt_sample' AND parent_prompt_call_id IS NULL
+                        ORDER BY started_at DESC, prompt_call_id DESC LIMIT 1
+                    )
+                    UNION ALL
+                    SELECT child.*, parent.chain_depth + 1 FROM prompt_calls child
+                    JOIN newest_sample_chain parent
+                      ON child.parent_prompt_call_id = parent.prompt_call_id
+                    WHERE child.state = 'ppt_sample' AND parent.chain_depth < 3
+                )
+                SELECT * FROM newest_sample_chain
+                ORDER BY started_at, prompt_call_id LIMIT 3
+                """
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for attempt_number, row in enumerate(rows, start=1):
+            messages = json.loads(row["messages_json"]) if row["messages_json"] else []
+            declared_tool_calls = [
+                call
+                for message in messages
+                if message.get("role") == "assistant"
+                for call in (message.get("tool_calls") or [])
+            ]
+            tool_rounds = sum(
+                bool(message.get("tool_calls"))
+                for message in messages
+                if message.get("role") == "assistant"
+            )
+            skill_reads = sum(
+                (call.get("function") or {}).get("name") == "read"
+                for call in declared_tool_calls
+            )
+            parameters = json.loads(row["parameters_json"]) if row["parameters_json"] else {}
+            error = json.loads(row["error_json"]) if row["error_json"] else None
+            published = row["status"] == "completed" and bool(row["output_ref"])
+            if published:
+                reason = "通过结构与安全契约校验，已发布为 PPT 样品。"
+            elif row["status"] == "started":
+                reason = "正在生成，尚未进入发布校验。"
+            elif row["status"] == "conflicted":
+                reason = "生成完成时工程版本已变化，因此未发布。"
+            elif error and "maximum tool rounds exceeded" in str(error.get("message", "")):
+                reason = "达到最大工具轮次，尚未返回最终包清单。"
+            elif error and error.get("code") in {
+                "sample_json_incomplete", "sample_output_invalid", "sample_package_invalid",
+                "sample_html_rejected",
+            }:
+                reason = " ".join(str(error.get("message") or "生成结果未通过契约校验。").split())[:300]
+            else:
+                reason = "生成未完成，因此未发布。"
+            result.append({
+                "attempt": attempt_number,
+                "prompt_call_id": row["prompt_call_id"],
+                "status": row["status"],
+                "published": published,
+                "reason": reason,
+                "failure_code": (error or {}).get("code"),
+                "tool_rounds": tool_rounds,
+                "tool_call_count": len(declared_tool_calls),
+                "skill_read_count": skill_reads,
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "provider": parameters.get("provider"),
+                "model": parameters.get("model"),
+            })
+        return result
+
     def export_prompt_calls_jsonl(self) -> str:
         return "".join(json_text(item) + "\n" for item in self.prompt_calls())

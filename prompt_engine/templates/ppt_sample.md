@@ -1,6 +1,6 @@
 # HTML-PPT 包生成
 
-基于已确认的逐页大纲生成一份可独立打开、可横向翻页的 HTML-PPT。产物单位是一个不可变文件包，不是逐页 HTML 数组。
+基于已确认的逐页大纲生成一份可独立打开、可横向翻页的 HTML-PPT 样品。当前只生成样品，不生成整份演示。产物单位是一个不可变文件包，不是逐页 HTML 数组。
 
 工作方式：
 
@@ -17,8 +17,8 @@
   "title": "演示标题",
   "slide_count": 2,
   "slides": [
-    {"slide_id": "cover", "title": "封面"},
-    {"slide_id": "insight", "title": "核心洞察"}
+    {"slide_id": "outline_3", "title": "核心洞察", "source_slide_number": 3},
+    {"slide_id": "outline_4", "title": "行动方案", "source_slide_number": 4}
   ]
 }
 ```
@@ -33,7 +33,9 @@
 
 - 包内必须存在根目录 `index.html`，它是唯一入口；允许相对路径引用包内 `css/`、`js/`、`img/`、`assets/` 文件。
 - `index.html` 必须在浏览器中直接运行，并在包内实现翻页；支持键盘左右键，触控或可点击的上一页/下一页按钮，并提供清晰的页码或进度提示。
-- 严格生成提示末尾指定的页数；`slide_id` 唯一、稳定，且与 HTML 中的页面标识一致。
+- 从提示末尾的 `OUTLINE_SLIDES_JSON` 中自行选择恰好指定数量的连续大纲页；不必从第 1 页开始，禁止扩展为全稿。
+- `slides` 必须按原大纲顺序列出所选页，并为每项返回 `source_slide_number`。这些编号必须合法、连续且数量等于 `SAMPLE_PAGE_COUNT`；修改已有样品时必须保持 `PRESERVE_SOURCE_SLIDE_NUMBERS` 指定的原范围。
+- 严格生成提示末尾指定的页数；`slide_id` 唯一、稳定，且必须与 `index.html` 中静态页面元素的 `data-slide-id` 一一对应。每个页面元素使用独立的 `slide` class，方便机器核对实际页数。
 - 画面默认按 16:9 设计，并适配浏览器预览框；不得依赖宿主工作台提供逐页切换。
 - 可以使用包内 JavaScript、CSS、SVG、字体和图片。远程网络资源在安全预览中会被阻止，因此关键内容必须有本地或内联降级。
 - 不使用 iframe、object、embed、表单提交、弹窗、下载或跳转外站；不要读取 Cookie、宿主存储或调用网络接口。

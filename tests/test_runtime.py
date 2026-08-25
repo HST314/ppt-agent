@@ -14,6 +14,7 @@ def test_default_runtime_is_valid() -> None:
     assert runtime.policy.stream_model_output is False
     assert len(runtime.models.state_bindings) == 4
     assert runtime.policy.sample_page_count == 2
+    assert runtime.policy.max_tool_rounds == 20
     assert {binding.provider for binding in runtime.models.state_bindings} == {"ark"}
     assert {binding.model for binding in runtime.models.state_bindings} == {"deepseek-v4-flash-ga-260731"}
     assert {binding.api_key_env for binding in runtime.models.state_bindings} == {"ARK_API_KEY"}
@@ -32,6 +33,12 @@ def test_runtime_rejects_unknown_fields() -> None:
 def test_runtime_rejects_inverted_read_budget() -> None:
     with pytest.raises(ValueError):
         RuntimePolicy(max_read_chars_per_call=200, max_read_chars_per_job=100)
+
+
+def test_runtime_allows_tool_round_limit_up_to_one_hundred() -> None:
+    assert RuntimePolicy(max_tool_rounds=100).max_tool_rounds == 100
+    with pytest.raises(ValueError):
+        RuntimePolicy(max_tool_rounds=101)
 
 
 def test_model_binding_rejects_non_whitelisted_parameters() -> None:

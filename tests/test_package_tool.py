@@ -79,3 +79,25 @@ def test_sample_revision_identity_includes_parent_revision() -> None:
 
     assert left.revision_hash != right.revision_hash
     assert left.package.package_hash == right.package.package_hash
+
+
+def test_sample_revision_identity_includes_outline_page_mapping() -> None:
+    base = {
+        "title": "映射测试",
+        "slide_count": 1,
+        "files": [{"path": "index.html", "content": "<main>样品</main>"}],
+    }
+    left = HtmlPptPackage.model_validate({
+        **base,
+        "slides": [{"slide_id": "sample", "title": "样品", "source_slide_number": 1}],
+    })
+    right = HtmlPptPackage.model_validate({
+        **base,
+        "slides": [{"slide_id": "sample", "title": "样品", "source_slide_number": 2}],
+    })
+
+    left_revision = SampleRevision.create_package(left, revision=1, parent=None, feedback=None)
+    right_revision = SampleRevision.create_package(right, revision=1, parent=None, feedback=None)
+
+    assert left.package_hash == right.package_hash
+    assert left_revision.revision_hash != right_revision.revision_hash

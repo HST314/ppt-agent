@@ -60,7 +60,7 @@ class RuntimePolicy(BaseModel):
     clarification_total_budget: int = Field(default=10, ge=0, le=30)
     question_preference: Literal["proactive", "minimal", "none"] = "proactive"
     model_timeout_seconds: float = Field(default=180.0, ge=1, le=600)
-    max_tool_rounds: int = Field(default=8, ge=0, le=20)
+    max_tool_rounds: int = Field(default=20, ge=0, le=100)
     max_read_chars_per_call: int = Field(default=20_000, ge=100, le=100_000)
     max_read_chars_per_job: int = Field(default=80_000, ge=100, le=500_000)
     sample_page_count: int = Field(default=2, ge=1, le=6)
@@ -147,7 +147,7 @@ class EditableRuntimePolicy(BaseModel):
     clarification_total_budget: int = Field(ge=0, le=30)
     question_preference: Literal["proactive", "minimal", "none"]
     model_timeout_seconds: float = Field(ge=1, le=600)
-    max_tool_rounds: int = Field(ge=0, le=20)
+    max_tool_rounds: int = Field(ge=0, le=100)
     max_read_chars_per_call: int = Field(ge=100, le=100_000)
     max_read_chars_per_job: int = Field(ge=100, le=500_000)
     sample_page_count: int = Field(ge=1, le=6)

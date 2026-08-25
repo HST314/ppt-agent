@@ -39,16 +39,26 @@ def ready_for_sample(workflow: Workflow) -> dict:
     return manifest
 
 
-def realistic_package_output(*, invalid_path: bool = False) -> str:
+def realistic_package_output(
+    *,
+    invalid_path: bool = False,
+    source_slide_numbers: tuple[int, ...] = (1, 2),
+    html_slide_ids: tuple[str, ...] | None = None,
+) -> str:
     slides = []
     sections = []
-    for index in range(1, 3):
+    for index, source_slide_number in enumerate(source_slide_numbers, start=1):
         slides.append({
             "slide_id": f"sample_{index}",
             "title": "结论先行" if index == 1 else "行动路径",
+            "source_slide_number": source_slide_number,
         })
+    for index, slide_id in enumerate(
+        html_slide_ids or tuple(item["slide_id"] for item in slides),
+        start=1,
+    ):
         sections.append(
-            f'<section class="slide" data-slide-id="sample_{index}">'
+            f'<section class="slide" data-slide-id="{slide_id}">'
             f'<h1>样品页 {index}</h1><p>结论、证据与行动建议。</p></section>'
         )
     html = (
@@ -61,7 +71,7 @@ def realistic_package_output(*, invalid_path: bool = False) -> str:
     return json.dumps({
         "entrypoint": "index.html",
         "title": "真实形态 HTML-PPT",
-        "slide_count": 2,
+        "slide_count": len(slides),
         "slides": slides,
         "files": [
             {"path": "index.html", "content": html, "encoding": "utf-8"},
@@ -113,6 +123,7 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
     sample = manifest["samples"][-1]
     assert sample["package"]["entrypoint"] == "index.html"
     assert sample["package"]["slide_count"] == 2
+    assert [item["source_slide_number"] for item in sample["package"]["slides"]] == [1, 2]
     assert [item["path"] for item in sample["package"]["files"]] == ["index.html"]
     assert sample["provenance"]["sample_page_count"] == 2
     assert {"revise_sample", "approve_sample", "regenerate_sample"} <= set(capabilities(manifest))
@@ -199,6 +210,8 @@ def test_realistic_package_output_repairs_truncated_json(workflow: Workflow, mon
     assert sample["provenance"]["sample_html_char_budget_per_page"] == 7_000
     assert len(sample["provenance"]["traces"]) == 2
     assert "SAMPLE_HTML_CHAR_BUDGET_PER_PAGE: 7000" in prompts[0]
+    assert "SAMPLE_STAGE_ONLY: true" in prompts[0]
+    assert "OUTLINE_SLIDES_JSON:" in prompts[0]
     assert "AUTOMATED_REPAIR_ATTEMPT: 1/2" in prompts[1]
     assert "JSON 未完整闭合" in prompts[1]
     assert truncated not in prompts[1]
@@ -230,6 +243,67 @@ def test_realistic_package_output_repairs_with_exact_path_reason(
     assert sample["package"]["entrypoint"] == "index.html"
     assert "包文件校验失败" in prompts[1]
     assert "stay inside the draft" in prompts[1]
+
+
+def test_sample_can_select_later_contiguous_outline_pages_and_preserves_them_on_revision(
+    workflow: Workflow, monkeypatch
+) -> None:
+    manifest = ready_for_sample(workflow)
+    responses = iter([
+        realistic_package_output(source_slide_numbers=(2, 3)),
+        realistic_package_output(source_slide_numbers=(1, 2)),
+        realistic_package_output(source_slide_numbers=(2, 3)),
+    ])
+    prompts: list[str] = []
+
+    def generate(state: str, prompt: str, *, json_mode: bool = False):
+        prompts.append(prompt)
+        return next(responses), [
+            {"type": "model_call", "provider": "test", "model": "range", "usage": {}}
+        ]
+
+    monkeypatch.setattr(workflow.gateway, "generate", generate)
+
+    manifest = workflow.generate_sample(manifest["checkpoint_id"])
+    first = manifest["samples"][-1]
+    assert [item["source_slide_number"] for item in first["package"]["slides"]] == [2, 3]
+
+    workflow.runtime.policy = workflow.runtime.policy.model_copy(update={"sample_page_count": 3})
+    manifest = workflow.generate_sample(manifest["checkpoint_id"], feedback="放大数据")
+    revised = manifest["samples"][-1]
+
+    assert revised["package"]["slide_count"] == 2
+    assert [item["source_slide_number"] for item in revised["package"]["slides"]] == [2, 3]
+    assert "PRESERVE_SOURCE_SLIDE_NUMBERS: [2, 3]" in prompts[1]
+    assert "修改样品必须保持原大纲页 [2, 3]" in prompts[2]
+
+
+def test_sample_rejects_non_contiguous_range_and_html_manifest_mismatch(
+    workflow: Workflow, monkeypatch
+) -> None:
+    manifest = ready_for_sample(workflow)
+    responses = iter([
+        realistic_package_output(source_slide_numbers=(1, 3)),
+        realistic_package_output(html_slide_ids=("sample_1", "sample_2", "extra")),
+        realistic_package_output(source_slide_numbers=(2, 3)),
+    ])
+    prompts: list[str] = []
+
+    def generate(state: str, prompt: str, *, json_mode: bool = False):
+        prompts.append(prompt)
+        return next(responses), [
+            {"type": "model_call", "provider": "test", "model": "range", "usage": {}}
+        ]
+
+    monkeypatch.setattr(workflow.gateway, "generate", generate)
+
+    generated = workflow.generate_sample(manifest["checkpoint_id"])
+
+    assert [
+        item["source_slide_number"] for item in generated["samples"][-1]["package"]["slides"]
+    ] == [2, 3]
+    assert "必须按大纲顺序连续" in prompts[1]
+    assert "data-slide-id 必须与清单 slides 一一对应" in prompts[2]
 
 
 def test_new_generation_repairs_legacy_pages_contract(

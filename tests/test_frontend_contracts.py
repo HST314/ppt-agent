@@ -25,7 +25,11 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert 'name="sample_page_count"' in app
     assert 'id="sample-feedback-form"' in samples
     assert 'data-action="generate_sample"' in samples
-    assert '${completion}${preview}${feedback}${historyMarkup}' in samples
+    assert '${completion}${preview}${feedback}${attemptsMarkup}${historyMarkup}' in samples
+    assert "本次生成尝试" in samples
+    assert "已发布为 PPT 样品" in samples
+    assert "source_slide_number" in samples
+    assert 'toolRoundsInput.max = "100"' in app
     assert "不会创建新修订" in samples
     assert 'data-action="branch_sample_revision"' in samples
     assert 'data-sample-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"' in samples

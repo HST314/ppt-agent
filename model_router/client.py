@@ -240,12 +240,18 @@ class ModelGateway:
             return "# 逐页大纲\n\n## 第 1 页｜封面\n- 本页目的：建立主题与场合\n- 核心信息：演示主题与汇报人\n- 视觉方向：克制留白与清晰标题\n\n## 第 2 页｜结论先行\n- 本页目的：让听众立即理解核心判断\n- 核心信息：一句话主结论与三项支撑\n- 视觉方向：大数字与三列摘要\n\n## 第 3 页｜背景与机会\n- 本页目的：解释为什么现在需要行动\n- 核心信息：背景变化、机会窗口、潜在风险\n- 视觉方向：简洁趋势图\n\n## 第 4 页｜行动方案\n- 本页目的：形成下一步共识\n- 核心信息：责任、节奏与成功标准\n- 视觉方向：三阶段路线图"
         match = re.search(r"SAMPLE_PAGE_COUNT:\s*(\d+)", prompt)
         page_count = int(match.group(1)) if match else 2
+        preserved_match = re.search(r"PRESERVE_SOURCE_SLIDE_NUMBERS:\s*(\[[^\n]*\]|none)", prompt)
+        if preserved_match and preserved_match.group(1) != "none":
+            source_slide_numbers = json.loads(preserved_match.group(1))
+        else:
+            source_slide_numbers = list(range(1, page_count + 1))
         slides = []
-        for index in range(1, page_count + 1):
+        for index, source_slide_number in enumerate(source_slide_numbers, start=1):
             accent = "#6d28d9" if index % 2 else "#be185d"
             slides.append({
                 "slide_id": f"sample_{index}",
                 "title": "核心判断" if index == 1 else f"行动方向 {index}",
+                "source_slide_number": source_slide_number,
             })
         sections = []
         for index, slide in enumerate(slides, start=1):

@@ -125,6 +125,10 @@ class SampleOutput(StrictModel):
 class PackageSlide(StrictModel):
     slide_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     title: str = Field(min_length=1, max_length=160)
+    # Legacy packages do not carry this mapping. New sample generations make
+    # it mandatory at the workflow boundary so a future full-deck page list
+    # can reuse the immutable sample slide without guessing its outline page.
+    source_slide_number: int | None = Field(default=None, ge=1, le=1000)
 
 
 class PackageFile(StrictModel):
@@ -241,11 +245,16 @@ class SampleRevision(StrictModel):
         feedback: str | None,
         provenance: dict[str, Any] | None = None,
     ) -> "SampleRevision":
+        slide_mapping = json.dumps(
+            [slide.model_dump() for slide in package.slides],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         return cls(
             revision=revision,
             revision_hash=digest(
                 f"ppt_package\n{revision}\n{parent or 'root'}\n"
-                f"{package.package_hash or package.content_hash()}"
+                f"{package.package_hash or package.content_hash()}\n{slide_mapping}"
             ),
             parent_revision_hash=parent,
             package=package,

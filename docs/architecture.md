@@ -16,14 +16,14 @@
 
 ## 产物规则
 
-叙事结构与逐页大纲正文不设业务 Schema，外围信封记录 revision、hash、父 revision、创建者、确认状态以及模型、运行配置和工具读取来源。PPT 样品修订保存不可变 HTML-PPT 包：入口固定为包内 `index.html`，CSS、JavaScript、SVG、图片和字体等资源按路径与 SHA-256 建立清单。修改意见生成新修订；选择历史版本只移动 `current_sample_revision_hash` 指针并形成新检查点，不复制内容或创建修订。后续修改以当前指针所指修订为父级，因此可自然形成版本分叉；“从此版本创建分支”仍是显式、独立的工程分支操作。叙事结构的编辑会把既有逐页大纲和样品标记为 stale，逐页大纲的编辑会把既有样品标记为 stale。
+叙事结构与逐页大纲正文不设业务 Schema，外围信封记录 revision、hash、父 revision、创建者、确认状态以及模型、运行配置和工具读取来源。逐页大纲用唯一的连续页号建立样品选择边界。PPT 样品修订保存不可变 HTML-PPT 包：入口固定为包内 `index.html`，每个清单页通过 `source_slide_number` 映射回大纲页，CSS、JavaScript、SVG、图片和字体等资源按路径与 SHA-256 建立清单。生成边界同时核对选择范围连续性、清单页数与 `index.html` 中静态 `data-slide-id`。修改意见生成新修订并保持原页段映射；选择历史版本只移动 `current_sample_revision_hash` 指针并形成新检查点，不复制内容或创建修订。后续修改以当前指针所指修订为父级，因此可自然形成版本分叉；“从此版本创建分支”仍是显式、独立的工程分支操作。叙事结构的编辑会把既有逐页大纲和样品标记为 stale，逐页大纲的编辑会把既有样品标记为 stale。
 
 ## 持久化模型
 
 - `project_state` 保存当前投影；`checkpoints` 保存不可变状态并用 `parent_checkpoint_id` 形成 DAG；`branches` 保存分支头。
 - `document_revisions`、`sample_revisions` 保存可查询的修订记录；`sample_packages`、`sample_package_files` 保存整包入口、页数、文件路径与哈希。`sample_pages` 和 `artifacts` 保留旧版页面兼容能力。
 - `events` 与状态变更同事务提交。包文件先用临时文件、`fsync` 和原子替换写入；提交失败最多留下可安全清理的未引用内容哈希文件，不会产生指向缺失产物的已提交状态。
-- `prompt_calls` 和 `prompt_call_events` 形成独立审计链，记录脱敏后的 messages、模板/运行/模型/Skill 哈希、模型参数、工具调用、开始/完成/失败/冲突和 output ref；只有已提交产物可进入 completed，CAS 冲突终态不携带 output ref，JSONL 只作为导出格式。
+- `prompt_calls` 和 `prompt_call_events` 形成独立审计链，记录脱敏后的 messages、模板/运行/模型/Skill 哈希、模型参数、工具调用、开始/完成/失败/冲突和 output ref；只有已提交产物可进入 completed，CAS 冲突终态不携带 output ref。最新样品修复链从该审计记录投影为有界的尝试摘要，JSONL 只作为完整导出格式。
 - `.jobs/jobs.db` 持久化 Job 和状态事件。SQLite `BEGIN IMMEDIATE` 同时承担跨线程、跨 worker 的写入协调；后续多机部署可将表边界迁移到 PostgreSQL，并将 artifact 目录替换为对象存储。
 
 ## 安全

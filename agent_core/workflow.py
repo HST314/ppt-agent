@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Literal
 from uuid import uuid4
@@ -26,6 +28,11 @@ from storage.project_store import ConflictError, ProjectStore
 DocumentType = Literal["narrative_structure", "slide_outline"]
 SAMPLE_HTML_CHAR_BUDGET = 7_000
 SAMPLE_MAX_REPAIR_ATTEMPTS = 2
+OUTLINE_PAGE_HEADING = re.compile(
+    r"^\s{0,3}#{2,6}\s+第\s*(?P<number>\d+)\s*页(?:\s*[｜|:：—-]\s*(?P<title>.*?))?\s*$",
+    re.MULTILINE,
+)
+OUTLINE_FALLBACK_HEADING = re.compile(r"^\s{0,3}##\s+(?P<title>\S.*?)\s*$", re.MULTILINE)
 
 
 class WorkflowError(RuntimeError):
@@ -40,6 +47,63 @@ class SampleGenerationError(WorkflowError):
         self.public_code = public_code
         self.public_message = public_message
         self.repair_reason = repair_reason
+
+
+class _SlideMarkupParser(HTMLParser):
+    """Collect the static HTML-PPT page markers without executing package code."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.slide_ids: list[str | None] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if "slide" in classes:
+            self.slide_ids.append(attributes.get("data-slide-id"))
+
+
+def _outline_slide_catalog(markdown: str) -> list[dict[str, Any]]:
+    matches = list(OUTLINE_PAGE_HEADING.finditer(markdown))
+    if matches:
+        catalog = [
+            {
+                "source_slide_number": int(match.group("number")),
+                "title": (match.group("title") or f"第 {match.group('number')} 页").strip(),
+            }
+            for match in matches
+        ]
+    else:
+        # Existing projects may predate the numbered-outline contract. Treat
+        # their level-two headings as ordered pages so they remain editable.
+        catalog = [
+            {"source_slide_number": index, "title": match.group("title").strip()}
+            for index, match in enumerate(OUTLINE_FALLBACK_HEADING.finditer(markdown), start=1)
+        ]
+    numbers = [item["source_slide_number"] for item in catalog]
+    if not numbers or len(numbers) != len(set(numbers)):
+        raise WorkflowError("approved outline must contain uniquely numbered slide headings")
+    return catalog
+
+
+def _package_slide_ids(draft: DraftPackage) -> list[str]:
+    try:
+        index_html = draft.read("index.html")["content"]
+    except PackageToolError as exc:
+        raise SampleGenerationError(
+            "sample_package_invalid",
+            "HTML-PPT 包格式不正确，自动修复后仍未成功，请重试。",
+            f"无法读取 index.html：{exc}",
+        ) from exc
+    parser = _SlideMarkupParser()
+    parser.feed(index_html)
+    if any(not slide_id for slide_id in parser.slide_ids):
+        raise SampleGenerationError(
+            "sample_package_invalid",
+            "HTML-PPT 页面标识不完整，自动修复后仍未成功，请重试。",
+            "每个 class=\"slide\" 的静态页面元素都必须包含非空 data-slide-id。",
+        )
+    return [str(slide_id) for slide_id in parser.slide_ids]
 
 
 def _parse_sample_output(text: str) -> dict[str, Any]:
@@ -63,6 +127,8 @@ def _validate_package_output(
     payload: dict[str, Any],
     draft: DraftPackage,
     slide_count: int,
+    outline_slide_numbers: set[int],
+    preserve_source_slide_numbers: list[int] | None = None,
 ) -> HtmlPptPackage:
     embedded = payload.pop("files", [])
     if embedded:
@@ -98,6 +164,43 @@ def _validate_package_output(
             "sample_package_invalid",
             "HTML-PPT 页数不正确，自动修复后仍未成功，请重试。",
             f"slide_count 必须为 {slide_count}，实际为 {output.slide_count}。",
+        )
+    source_slide_numbers = [item.source_slide_number for item in output.slides]
+    if any(number is None for number in source_slide_numbers):
+        raise SampleGenerationError(
+            "sample_package_invalid",
+            "HTML-PPT 样品范围缺失，自动修复后仍未成功，请重试。",
+            "slides 中的每一项都必须返回 source_slide_number。",
+        )
+    selected_numbers = [int(number) for number in source_slide_numbers if number is not None]
+    expected_contiguous = list(range(selected_numbers[0], selected_numbers[0] + slide_count))
+    if selected_numbers != expected_contiguous:
+        raise SampleGenerationError(
+            "sample_package_invalid",
+            "HTML-PPT 样品范围不连续，自动修复后仍未成功，请重试。",
+            f"source_slide_number 必须按大纲顺序连续，实际为 {selected_numbers}。",
+        )
+    invalid_numbers = [number for number in selected_numbers if number not in outline_slide_numbers]
+    if invalid_numbers:
+        raise SampleGenerationError(
+            "sample_package_invalid",
+            "HTML-PPT 样品范围超出大纲，自动修复后仍未成功，请重试。",
+            f"以下 source_slide_number 不在已确认大纲中：{invalid_numbers}。",
+        )
+    if preserve_source_slide_numbers and selected_numbers != preserve_source_slide_numbers:
+        raise SampleGenerationError(
+            "sample_package_invalid",
+            "HTML-PPT 修改稿更换了样品范围，自动修复后仍未成功，请重试。",
+            f"修改样品必须保持原大纲页 {preserve_source_slide_numbers}，实际为 {selected_numbers}。",
+        )
+    declared_slide_ids = [item.slide_id for item in output.slides]
+    actual_slide_ids = _package_slide_ids(draft)
+    if actual_slide_ids != declared_slide_ids:
+        raise SampleGenerationError(
+            "sample_package_invalid",
+            "HTML-PPT 实际页数或页面标识不正确，自动修复后仍未成功，请重试。",
+            "index.html 中 class=\"slide\" 的 data-slide-id 必须与清单 slides 一一对应；"
+            f"清单为 {declared_slide_ids}，实际为 {actual_slide_ids}。",
         )
     return output
 
@@ -563,10 +666,22 @@ class Workflow:
         if normalized_feedback and not current:
             raise WorkflowError("sample not found")
 
-        page_count = self.runtime.policy.sample_page_count
         skill_index = SkillReader(self.runtime.skills_root, per_call=1000, per_job=1000).index()
         template, template_hash = self._template("ppt_sample.md")
         previous_package = (current or {}).get("package") or {}
+        configured_page_count = self.runtime.policy.sample_page_count
+        page_count = (
+            previous_package.get("slide_count", configured_page_count)
+            if normalized_feedback else configured_page_count
+        )
+        outline_catalog = _outline_slide_catalog(outline["markdown_body"])
+        if len(outline_catalog) < page_count:
+            raise WorkflowError(
+                f"approved outline has {len(outline_catalog)} slides, fewer than the {page_count}-page sample"
+            )
+        outline_slide_numbers = {
+            item["source_slide_number"] for item in outline_catalog
+        }
         previous = {
             "entrypoint": previous_package.get("entrypoint"),
             "title": previous_package.get("title"),
@@ -574,9 +689,24 @@ class Workflow:
             "slides": previous_package.get("slides", []),
             "files": [item.get("path") for item in previous_package.get("files", [])],
         } if current else None
+        preserve_source_slide_numbers = None
+        if normalized_feedback and previous:
+            previous_numbers = [
+                item.get("source_slide_number") for item in previous.get("slides", [])
+            ]
+            if previous_numbers and all(isinstance(number, int) for number in previous_numbers):
+                preserve_source_slide_numbers = previous_numbers
         prompt = (
             template
             + f"\n\nSAMPLE_PAGE_COUNT: {page_count}\n"
+            + "SAMPLE_STAGE_ONLY: true\n"
+            + f"OUTLINE_SLIDES_JSON: {json.dumps(outline_catalog, ensure_ascii=False)}\n"
+            + "PRESERVE_SOURCE_SLIDE_NUMBERS: "
+            + (
+                json.dumps(preserve_source_slide_numbers, ensure_ascii=False)
+                if preserve_source_slide_numbers else "none"
+            )
+            + "\n"
             + f"SAMPLE_HTML_CHAR_BUDGET_PER_PAGE: {SAMPLE_HTML_CHAR_BUDGET}\n"
             + f"Task card:\n{json.dumps(manifest['task_card'], ensure_ascii=False)}\n"
             + f"Approved slide outline:\n{outline['markdown_body']}\n"
@@ -632,7 +762,13 @@ class Workflow:
                         "HTML-PPT 包格式不正确，自动修复后仍未成功，请重试。",
                         "新样品必须返回带 index.html 的 HTML-PPT 包，不能返回旧版 pages 数组。",
                     )
-                package_output = _validate_package_output(payload, draft, page_count)
+                package_output = _validate_package_output(
+                    payload,
+                    draft,
+                    page_count,
+                    outline_slide_numbers,
+                    preserve_source_slide_numbers,
+                )
                 self.store.save_generated_package_attempt(prompt_call_id, draft.payload())
                 repair_attempts = attempt
                 successful_prompt_call_id = prompt_call_id
@@ -670,6 +806,9 @@ class Workflow:
                 "template_version": 1,
                 "template_hash": template_hash,
                 "sample_page_count": page_count,
+                "source_slide_numbers": [
+                    item.source_slide_number for item in package_output.slides
+                ],
                 "sample_html_char_budget_per_page": SAMPLE_HTML_CHAR_BUDGET,
                 "sample_repair_attempts": repair_attempts,
                 "prompt_call_id": successful_prompt_call_id,
@@ -702,6 +841,9 @@ class Workflow:
                 {
                     "revision_hash": sample.revision_hash,
                     "slide_count": package_output.slide_count,
+                    "source_slide_numbers": [
+                        item.source_slide_number for item in package_output.slides
+                    ],
                 },
                 expected_checkpoint_id=checkpoint_id,
             ),

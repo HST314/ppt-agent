@@ -259,7 +259,12 @@ function samplePageCount() {
 
 function readySampleView() {
   const count = samplePageCount();
-  const preview = readySampleBody(count, icons.spark);
+  const preview = readySampleBody(
+    count,
+    icons.spark,
+    state.project.sample_attempts || [],
+    escapeHtml,
+  );
   return stagePanel("PPT 样品", "确认视觉语言、信息层级与版式方向", preview, `<span class="badge badge--warning">${count} 页 · 待生成</span>`);
 }
 
@@ -272,6 +277,7 @@ function sampleView() {
   if (!sample) return readySampleView();
   const view = sampleBody(sample, escapeHtml, {
     history: state.project.sample_revisions || [],
+    attempts: state.project.sample_attempts || [],
     selectedHash: sample.revision_hash,
   });
   return stagePanel("HTML-PPT", "在通用安全预览器中检查完整文件包，再用自然语言让 AI 调整", view.body, view.status);
@@ -592,6 +598,13 @@ function wireWorkspace() {
 
 function wireSettings() {
   const form = document.querySelector("#settings-form");
+  const toolRoundsInput = form?.elements.max_tool_rounds;
+  if (toolRoundsInput) {
+    toolRoundsInput.max = "100";
+    const hint = document.createElement("small");
+    hint.textContent = "默认 20，最多 100；更高值会增加最长耗时与模型调用。";
+    toolRoundsInput.parentElement.append(hint);
+  }
   form?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const errorNode = document.querySelector("#settings-error");

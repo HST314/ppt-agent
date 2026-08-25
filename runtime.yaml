@@ -3,7 +3,7 @@ stream_model_output: false
 clarification_total_budget: 10
 question_preference: proactive
 model_timeout_seconds: 180.0
-max_tool_rounds: 8
+max_tool_rounds: 20
 max_read_chars_per_call: 20000
 max_read_chars_per_job: 80000
 sample_page_count: 2

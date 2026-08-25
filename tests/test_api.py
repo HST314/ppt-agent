@@ -153,6 +153,11 @@ def test_api_drives_sample_generation_feedback_and_approval(
     }))
     project = client.get(f"/api/projects/{project_id}").json()
     assert len(project["samples"][-1]["pages"]) == 2
+    assert [
+        item["source_slide_number"] for item in project["samples"][-1]["package"]["slides"]
+    ] == [1, 2]
+    assert project["sample_attempts"][-1]["published"] is True
+    assert project["sample_attempts"][-1]["reason"].endswith("已发布为 PPT 样品。")
 
     finish_job(client, client.post(f"/api/projects/{project_id}/jobs", json={
         "operation": "revise_sample",

@@ -356,6 +356,65 @@ def test_prompt_call_audit_redacts_quoted_headers_tokens_and_nested_values(
     assert calls.count("[REDACTED]") >= 12
 
 
+def test_sample_attempt_summary_groups_latest_chain_and_counts_tool_rounds(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects", "sample-attempts")
+    audit_args = {
+        "state": "ppt_sample",
+        "messages": [{"role": "user", "content": "生成样品"}],
+        "template_id": "ppt_sample",
+        "template_version": 1,
+        "template_hash": "sha256:template",
+        "model_config_hash": "sha256:model",
+        "runtime_config_hash": "sha256:runtime",
+        "skills_hash": "sha256:skills",
+        "parameters": {"provider": "test", "model": "test-model"},
+    }
+    first = store.start_prompt_call(**audit_args)
+    store.finish_prompt_call(
+        first,
+        status="failed",
+        messages=[
+            {"role": "user", "content": "生成样品"},
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "read", "arguments": "{}"}},
+                {"function": {"name": "write_package_file", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "content": "{}"},
+        ],
+        error={
+            "type": "SampleGenerationError",
+            "code": "sample_package_invalid",
+            "message": "slide_count 必须为 2，实际为 17。",
+        },
+    )
+    second = store.start_prompt_call(**audit_args, parent_prompt_call_id=first)
+    store.finish_prompt_call(
+        second,
+        status="completed",
+        messages=[
+            {"role": "user", "content": "修复样品"},
+            {"role": "assistant", "tool_calls": [
+                {"function": {"name": "read", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "content": "{}"},
+            {"role": "assistant", "content": "{}"},
+        ],
+        output_ref="sha256:" + "a" * 64,
+        output_hash="sha256:" + "b" * 64,
+    )
+
+    attempts = store.sample_attempts()
+
+    assert [item["status"] for item in attempts] == ["failed", "completed"]
+    assert attempts[0]["reason"] == "slide_count 必须为 2，实际为 17。"
+    assert attempts[0]["tool_rounds"] == 1
+    assert attempts[0]["tool_call_count"] == 2
+    assert attempts[0]["skill_read_count"] == 1
+    assert attempts[1]["published"] is True
+
+
 def test_job_registry_uses_sqlite_and_deduplicates_across_instances(tmp_path: Path) -> None:
     root = tmp_path / ".jobs"
     registry = JobRegistry(root)

@@ -165,6 +165,7 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
         # every prior sample on each poll.
         "samples": latest_sample,
         "sample_revisions": history,
+        "sample_attempts": store.sample_attempts(),
         "sample_page_count": sample_page_count,
         "capabilities": capabilities(manifest),
         "active_job": latest_job if latest_job and latest_job["status"] in {"queued", "running"} else None,
