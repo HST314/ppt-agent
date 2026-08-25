@@ -36,6 +36,59 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert "restoreSample:" in (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
 
 
+def test_full_deck_workspace_contracts_match_the_sample_interaction_model() -> None:
+    app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
+    full_deck = (ROOT / "frontend/static/js/full-deck.js").read_text(encoding="utf-8")
+    api = (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
+    css = (ROOT / "frontend/static/css/main.css").read_text(encoding="utf-8")
+
+    assert '{ id: "ppt_full", label: "PPT 全稿" }' in app
+    assert '{ id: "ppt_full", label: "PPT 全稿", future: true }' not in app
+    assert 'data-action="enter_full_deck"' in samples
+    assert "确认样品并进入全稿" in samples
+    assert "confirm(" not in app
+    assert "正在进入全稿" in app
+    assert all(code in app for code in (
+        "full_deck_already_initialized", "full_deck_plan_invalid",
+        "full_deck_revision_not_found", "stale_revision", "active_job",
+    ))
+    assert 'document.querySelector("#full-deck-title")?.focus()' in app
+    assert "enterFullDeck:" in api
+    assert all(name in api for name in (
+        "fullDeckRevisions:", "fullDeckRevision:", "restoreFullDeck:",
+        "branchFromFullDeck:", "fullDeckPreviewUrl:", "fullDeckExportUrl:",
+    ))
+
+    assert 'id="full-deck-title"' in app
+    assert 'id="full-deck-preview-frame" sandbox="allow-scripts" referrerpolicy="no-referrer"' in full_deck
+    assert 'id="full-deck-feedback-form"' in full_deck
+    assert "完整页面清单" in full_deck
+    assert all(label in full_deck for label in (
+        "已就绪", "待生成", "样品来源", "本次全稿生成尝试", "全稿修订历史",
+    ))
+    assert 'data-full-deck-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"' in full_deck
+    assert 'data-action="branch_full_deck_revision"' in full_deck
+    assert "不会创建新修订" in full_deck
+    assert "aspect-ratio:16/9" in css
+    assert ".full-deck-page-grid" in css
+    assert "@media(max-width:767px)" in css
+
+
+def test_full_deck_preview_is_sandboxed_and_uses_package_routes() -> None:
+    app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    full_deck = (ROOT / "frontend/static/js/full-deck.js").read_text(encoding="utf-8")
+    server = (ROOT / "main_front.py").read_text(encoding="utf-8")
+
+    assert "hydrateFullDeckFrame" in app
+    assert "frame.src = revision.preview_url" in full_deck
+    assert "frame.src = sample.preview_url" in full_deck
+    assert "/full-deck/revisions/{revision_hash}/preview/{logical_path:path}" in server
+    assert "/full-deck/revisions/{revision_hash}/export" in server
+    assert '"sandbox allow-scripts; default-src \'none\'' in server
+    assert "innerHTML = page.html" not in app + full_deck
+
+
 def test_sample_preview_is_sandboxed_and_never_inserted_into_parent_dom() -> None:
     app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
     samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
