@@ -63,9 +63,9 @@ def _sample_validation_error(exc: ValidationError) -> SampleGenerationError:
     )
 
 
-def _validate_sample_output(text: str, page_count: int) -> SampleOutput:
+def _parse_sample_output(text: str) -> dict[str, Any]:
     try:
-        payload = ModelGateway.parse_json(text)
+        return ModelGateway.parse_json(text)
     except json.JSONDecodeError as exc:
         raise SampleGenerationError(
             "sample_json_incomplete",
@@ -79,6 +79,8 @@ def _validate_sample_output(text: str, page_count: int) -> SampleOutput:
             f"JSON 顶层结构无效：{exc}",
         ) from exc
 
+
+def _validate_sample_output(payload: dict[str, Any], page_count: int) -> SampleOutput:
     try:
         output = SampleOutput.model_validate(payload)
     except ValidationError as exc:
@@ -591,7 +593,9 @@ class Workflow:
                 raise
             traces.extend(attempt_traces)
             try:
-                output = _validate_sample_output(text, page_count)
+                payload = _parse_sample_output(text)
+                self.store.save_generated_html_attempt(prompt_call_id, payload)
+                output = _validate_sample_output(payload, page_count)
                 repair_attempts = attempt
                 successful_prompt_call_id = prompt_call_id
                 break
@@ -607,6 +611,9 @@ class Workflow:
                     "correct it exactly:\n"
                     f"{json.dumps(exc.repair_reason, ensure_ascii=False)}"
                 )
+            except Exception as exc:
+                self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
+                raise
         serialized = json.dumps([page.model_dump() for page in output.pages], ensure_ascii=False, sort_keys=True)
         sample = SampleRevision.create(
             output.pages,

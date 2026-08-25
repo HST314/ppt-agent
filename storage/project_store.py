@@ -23,9 +23,12 @@ PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 CHECKPOINT_ID = re.compile(r"^checkpoint_[a-f0-9]{24}$")
 REVISION_HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
 ARTIFACT_ID = REVISION_HASH
+PROMPT_CALL_ID = re.compile(r"^prompt_[a-f0-9]{32}$")
 STAGE_IDS = ("intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample")
 SCHEMA_VERSION = 2
 INITIALIZATION_LOCK_TIMEOUT_SECONDS = 30
+MAX_GENERATED_HTML_FILES_PER_ATTEMPT = 12
+MAX_GENERATED_HTML_BYTES_PER_FILE = 1_000_000
 
 
 class ConflictError(RuntimeError):
@@ -48,6 +51,7 @@ class ProjectStore(PromptAuditMixin):
         self.initialization_lock_path = self.root / ".project-db-init.lock"
         self.manifest_path = self.root / "manifest.json"
         self.artifacts_root = self.root / "artifacts" / "html"
+        self.generated_html_root = self.root / "generated_html"
         self.lock = self._locks.setdefault(str(self.root), threading.RLock())
 
     def _connect(self) -> sqlite3.Connection:
@@ -165,6 +169,33 @@ class ProjectStore(PromptAuditMixin):
             "created_at": utc_now(),
         }
 
+    def save_generated_html_attempt(
+        self,
+        prompt_call_id: str,
+        payload: dict[str, Any],
+    ) -> list[str]:
+        """Persist model HTML before validation without publishing it as an artifact."""
+
+        if not PROMPT_CALL_ID.fullmatch(prompt_call_id):
+            raise ValueError("invalid prompt call id")
+        pages = payload.get("pages")
+        if not isinstance(pages, list):
+            return []
+        relative_paths: list[str] = []
+        for index, page in enumerate(pages[:MAX_GENERATED_HTML_FILES_PER_ATTEMPT], start=1):
+            if not isinstance(page, dict) or not isinstance(page.get("html"), str):
+                continue
+            content = page["html"].encode("utf-8")
+            if not content or len(content) > MAX_GENERATED_HTML_BYTES_PER_FILE:
+                continue
+            relative_path = f"generated_html/{prompt_call_id}/page-{index:02d}.html"
+            path = (self.root / relative_path).resolve()
+            if not path.is_relative_to(self.generated_html_root.resolve()):
+                raise ValueError("invalid generated HTML path")
+            atomic_bytes(path, content)
+            relative_paths.append(relative_path)
+        return relative_paths
+
     def _externalize_manifest(
         self,
         manifest: dict[str, Any],
@@ -181,14 +212,23 @@ class ProjectStore(PromptAuditMixin):
             for page in sample.get("pages", []):
                 html = page.pop("html", None)
                 if html is not None:
-                    record = self._artifact_record(html.encode("utf-8"))
-                    artifacts[record["artifact_id"]] = record
-                    page.update({
-                        "artifact_id": record["artifact_id"],
-                        "sha256": record["sha256"],
-                        "size": record["size_bytes"],
-                        "sanitizer_version": record["sanitizer_version"],
-                    })
+                    content = html.encode("utf-8")
+                    checksum = f"sha256:{hashlib.sha256(content).hexdigest()}"
+                    existing_reference = (
+                        page.get("artifact_id") == checksum
+                        and page.get("sha256") == checksum
+                        and page.get("size") == len(content)
+                        and isinstance(page.get("sanitizer_version"), str)
+                    )
+                    if not existing_reference:
+                        record = self._artifact_record(content)
+                        artifacts[record["artifact_id"]] = record
+                        page.update({
+                            "artifact_id": record["artifact_id"],
+                            "sha256": record["sha256"],
+                            "size": record["size_bytes"],
+                            "sanitizer_version": record["sanitizer_version"],
+                        })
                 elif not ARTIFACT_ID.fullmatch(str(page.get("artifact_id", ""))):
                     raise ConflictError("sample_artifact_missing")
         payload = deepcopy(projection)

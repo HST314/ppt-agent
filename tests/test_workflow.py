@@ -42,7 +42,7 @@ def ready_for_sample(workflow: Workflow) -> dict:
 def realistic_sample_output(*, unsafe_css: bool = False) -> str:
     pages = []
     for index in range(1, 3):
-        unsafe = "backdrop-filter:blur(8px);" if unsafe_css else ""
+        unsafe = "background-image:url('https://audit.invalid/pixel.png');" if unsafe_css else ""
         pages.append({
             "page_id": f"sample_{index}",
             "title": "结论先行" if index == 1 else "行动路径",
@@ -163,7 +163,7 @@ def test_realistic_sample_output_repairs_truncated_json(workflow: Workflow, monk
     assert sample_calls[1]["output_ref"] == sample["revision_hash"]
 
 
-def test_realistic_sample_output_repairs_with_exact_allowlist_reason(
+def test_realistic_sample_output_repairs_with_exact_security_reason(
     workflow: Workflow, monkeypatch
 ) -> None:
     manifest = ready_for_sample(workflow)
@@ -180,9 +180,9 @@ def test_realistic_sample_output_repairs_with_exact_allowlist_reason(
 
     sample = generated["samples"][-1]
     assert sample["provenance"]["sample_repair_attempts"] == 1
-    assert all("backdrop-filter" not in page["html"] for page in sample["pages"])
+    assert all("audit.invalid" not in page["html"] for page in sample["pages"])
     assert "安全净化拒绝" in prompts[1]
-    assert "pages.0.html: unsupported CSS declaration: backdrop-filter" in prompts[1]
+    assert "pages.0.html: external CSS URL" in prompts[1]
 
 
 def test_sample_output_repair_stops_after_bounded_attempts(workflow: Workflow, monkeypatch) -> None:
@@ -206,6 +206,29 @@ def test_sample_output_repair_stops_after_bounded_attempts(workflow: Workflow, m
     persisted = workflow.store.read()
     assert persisted["phase"] == "ready_to_generate"
     assert persisted["samples"] == []
+    generated_files = sorted(workflow.store.generated_html_root.glob("prompt_*/page-*.html"))
+    assert len(generated_files) == 6
+    assert all("audit.invalid" in path.read_text(encoding="utf-8") for path in generated_files)
+    assert not list(workflow.store.artifacts_root.glob("*.html"))
+
+
+def test_generated_html_persistence_failure_closes_prompt_audit(
+    workflow: Workflow, monkeypatch
+) -> None:
+    manifest = ready_for_sample(workflow)
+
+    def fail_persistence(*args, **kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(workflow.store, "save_generated_html_attempt", fail_persistence)
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        workflow.generate_sample(manifest["checkpoint_id"])
+
+    sample_calls = [
+        item for item in workflow.store.prompt_calls() if item["state"] == "ppt_sample"
+    ]
+    assert [item["status"] for item in sample_calls] == ["failed"]
 
 
 def test_job_error_contract_hides_internal_sample_validation_details() -> None:
@@ -228,6 +251,11 @@ def test_job_error_contract_hides_internal_sample_validation_details() -> None:
     "html",
     [
         "<script>alert(1)</script>",
+        '<iframe srcdoc="<p>unsafe</p>"></iframe>',
+        '<object data="data:text/html;base64,AA=="></object>',
+        '<embed src="data:text/html;base64,AA==">',
+        '<link rel="stylesheet" href="data:text/css;base64,AA==">',
+        '<meta http-equiv="refresh" content="0;url=https://example.com">',
         '<img src="https://example.com/tracker.png">',
         '<img src="&#x68;ttps://example.com/tracker.png">',
         '<img src="/relative-tracker.png">',
@@ -239,12 +267,16 @@ def test_job_error_contract_hides_internal_sample_validation_details() -> None:
         '<style>body{background-image:u\\72l("https://example.com/tracker.png")}</style>',
         '<style>body{background-image:url("\\68 ttps://example.com/tracker.png")}</style>',
         '<style>body{b\\61ckground-image:url("https://example.com/tracker.png")}</style>',
+        '<style>body{behavior:url("#legacy")}</style>',
+        '<style>body{width:expression(alert(1))}</style>',
+        '<style>@media screen{@import "https://example.com/theme.css";}</style>',
+        '<style>@font-face{font-family:x;src:url("https://example.com/font.woff2")}</style>',
         '<svg><rect fill="u\\72l(https://example.com/paint.svg#gradient)"></rect></svg>',
+        '<svg><feImage href="https://example.com/image.png"></feImage></svg>',
         '<svg xmlns="https://example.com/evil"><rect></rect></svg>',
         '<svg xmlns=" http://www.w3.org/2000/svg"><rect></rect></svg>',
-        '<svg xmlns:xlink="http://www.w3.org/1999/xlink"><rect></rect></svg>',
-        '<div xmlns="http://www.w3.org/2000/svg">wrong owner</div>',
-        '<div data-remote="https://example.com">unsafe attribute</div>',
+        '<svg xmlns:xlink="http://www.w3.org/1999/xlink"><use xlink:href="https://example.com/icon.svg#dot"></use></svg>',
+        '<img srcset="data:image/png;base64,AA== 1x, https://example.com/tracker.png 2x">',
     ],
 )
 def test_sample_page_rejects_active_or_external_html(html: str) -> None:
@@ -268,11 +300,65 @@ def test_sample_page_allows_passive_inline_content() -> None:
     )
 
     assert page.page_id == "sample_1"
-    assert "<!doctype" not in page.html
-    assert "<html" not in page.html
+    assert page.html.startswith('<!doctype html><html lang="zh-CN"><head>')
+    assert page.html.endswith("</body></html>")
     assert "<!--" not in page.html
     assert "linear-gradient" in page.html
     assert 'fill="url(#paint)"' in page.html
+
+
+def test_sample_page_supports_common_html_css_and_svg_display_features() -> None:
+    page = SamplePage(
+        page_id="sample_1",
+        title="Compatible",
+        html=(
+            '<!doctype html><html lang="zh-CN" data-theme="dark"><head><title>样品</title>'
+            '<meta name="theme-color" content="#101828"><style>'
+            ':root{--columns:3}.slide::before{content:"";pointer-events:none;text-indent:1em;'
+            '-webkit-background-clip:text;background-clip:text;backdrop-filter:blur(8px);'
+            'grid-template-columns:repeat(var(--columns),minmax(0,1fr));'
+            '& .label{text-wrap:balance}}'
+            '@media (max-width:800px){.slide{container-type:inline-size}}'
+            '@supports (display:grid){.slide{display:grid}}'
+            '@keyframes enter{from{opacity:0}to{opacity:1}}'
+            '@font-face{font-family:"Deck";src:local("Arial"),'
+            'url("data:font/woff2;base64,AA==") format("woff2")}'
+            '</style></head><body class="deck" style="margin:0" data-revision="2">'
+            '<main class="slide"><dialog open><progress value="60" max="100"></progress></dialog>'
+            '<svg viewBox="0 0 20 20" xmlns:xlink="http://www.w3.org/1999/xlink"><defs>'
+            '<pattern id="grid" width="4" height="4" '
+            'patternUnits="userSpaceOnUse"><rect width="1" height="1"></rect></pattern>'
+            '<filter id="soft"><feGaussianBlur stdDeviation="1"></feGaussianBlur></filter>'
+            '<symbol id="dot"><circle cx="2" cy="2" r="2"></circle></symbol></defs>'
+            '<rect width="20" height="20" fill="url(#grid)" filter="url(#soft)"></rect>'
+            '<use xlink:href="#dot"></use></svg></main></body></html>'
+        ),
+    )
+
+    assert 'data-theme="dark"' in page.html
+    assert '<body class="deck" style="margin:0" data-revision="2">' in page.html
+    assert "grid-template-columns:repeat(var(--columns),minmax(0,1fr))" in page.html
+    assert "& .label{text-wrap:balance" in page.html
+    assert "@media (max-width:800px)" in page.html
+    assert "@keyframes enter" in page.html
+    assert 'patternUnits="userSpaceOnUse"' in page.html
+    assert '<feGaussianBlur stdDeviation="1"></feGaussianBlur>' in page.html
+    assert '<use href="#dot"></use>' in page.html
+
+
+def test_sample_page_allows_safe_data_media_and_custom_attributes() -> None:
+    page = SamplePage(
+        page_id="sample_1",
+        title="Media",
+        html=(
+            '<section data-source="local"><video controls poster="data:image/png;base64,AA==">'
+            '<source src="data:video/mp4;base64,AA==" type="video/mp4">'
+            '</video></section>'
+        ),
+    )
+
+    assert 'data-source="local"' in page.html
+    assert 'src="data:video/mp4;base64,AA=="' in page.html
 
 
 def test_sample_page_allows_svg_namespace_declaration_and_drops_it() -> None:

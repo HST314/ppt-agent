@@ -75,6 +75,33 @@ def test_sample_preview_csp_precedes_untrusted_comment_and_document_markup() -> 
     assert isolated.count("Content-Security-Policy") == 1
 
 
+def test_sample_preview_injects_csp_into_sanitized_standalone_document() -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the frontend security regression")
+    samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
+    module_url = "data:text/javascript;base64," + base64.b64encode(samples.encode()).decode()
+    payload = '<!doctype html><html lang="zh-CN"><head><title>sample</title></head><body>ok</body></html>'
+    script = (
+        f"const module = await import({json.dumps(module_url)});"
+        f"console.log(JSON.stringify(module.isolatedSampleHtml({json.dumps(payload)})));"
+    )
+
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    isolated = json.loads(result.stdout)
+
+    assert isolated.startswith(
+        '<!doctype html><html lang="zh-CN"><head><meta http-equiv="Content-Security-Policy"'
+    )
+    assert isolated.count("<!doctype html>") == 1
+    assert isolated.count("Content-Security-Policy") == 1
+
+
 def test_markdown_renderer_escapes_raw_html() -> None:
     source = (ROOT / "frontend/static/js/markdown.js").read_text(encoding="utf-8")
 

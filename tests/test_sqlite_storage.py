@@ -108,7 +108,8 @@ def test_project_store_commits_sqlite_wal_artifacts_and_parent_links(
 
     assert store.database_path.is_file()
     assert not store.manifest_path.exists()
-    assert manifest["samples"][0]["pages"][0]["html"].endswith("</main>")
+    assert manifest["samples"][0]["pages"][0]["html"].startswith("<!doctype html>")
+    assert manifest["samples"][0]["pages"][0]["html"].endswith("</body></html>")
 
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -133,6 +134,7 @@ def test_project_store_commits_sqlite_wal_artifacts_and_parent_links(
     artifact_path = store.root / artifact[1]
     assert artifact_path.is_file()
     assert artifact_path.stat().st_size == artifact[2]
+    assert artifact_path.read_text(encoding="utf-8").startswith("<!doctype html>")
 
 
 def test_legacy_file_project_is_imported_without_removing_source_files(

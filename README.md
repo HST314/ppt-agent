@@ -58,7 +58,7 @@ python main.py
 
 ## 数据与恢复
 
-项目数据默认保存在 `frontend/data/projects/`。每个工程包含一个启用 WAL 的 `project.db`，在单个事务中更新工程状态、显式父检查点、分支头、修订、事件和 artifact 元数据；PromptCall 使用同库的独立审计状态。净化后的 HTML 位于 `artifacts/html/<sha256>.html`，相同内容自动复用。后台 Job 存放在 `.jobs/jobs.db`，多 worker 通过 SQLite 写锁协调提交与分支操作。文件格式的既有工程会在首次读取时通过跨进程初始化锁自动导入，源文件仍保留。
+项目数据默认保存在 `frontend/data/projects/`。每个工程包含一个启用 WAL 的 `project.db`，在单个事务中更新工程状态、显式父检查点、分支头、修订、事件和 artifact 元数据；PromptCall 使用同库的独立审计状态。每次模型返回且 JSON 可解析时，原始页面 HTML 会立即写入 `generated_html/<prompt_call_id>/page-XX.html`，即使后续安全校验失败也会保留；这些原始文件仅供后端排查，不会进入预览或由应用发布。净化成功后的独立 HTML 文档位于 `artifacts/html/<sha256>.html`，相同内容自动复用。后台 Job 存放在 `.jobs/jobs.db`，多 worker 通过 SQLite 写锁协调提交与分支操作。文件格式的既有工程会在首次读取时通过跨进程初始化锁自动导入，源文件仍保留。
 
 PromptCall 审计记录保存脱敏后的输入消息、模板/配置/Skill 哈希、模型参数、工具调用、终态和产物引用。产物提交成功后才写入 `completed`；并发 CAS 落败会写入不带产物引用的 `conflicted`。可通过 `GET /api/projects/<project_id>/audit/prompt-calls` 查询，或从 `GET /api/projects/<project_id>/audit/prompt-calls.jsonl` 导出 JSONL。
 
