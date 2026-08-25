@@ -46,8 +46,9 @@ def test_sample_preview_is_sandboxed_and_never_inserted_into_parent_dom() -> Non
     assert "innerHTML = page.html" not in app + samples
 
 
-def test_status_console_supports_live_filter_search_expand_and_pinned_errors() -> None:
+def test_status_console_supports_stable_live_filter_search_and_expand() -> None:
     app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    status_view = (ROOT / "frontend/static/js/status-view.js").read_text(encoding="utf-8")
     css = (ROOT / "frontend/static/css/main.css").read_text(encoding="utf-8")
     api = (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
 
@@ -56,8 +57,17 @@ def test_status_console_supports_live_filter_search_expand_and_pinned_errors() -
     assert "data-status-filter" in app
     assert "data-event-expand" in app
     assert "data-copy-event" in app
-    assert "固定可见" in app
     assert "window.setInterval" in app
+    assert "refreshStatusView" in app
+    assert "preserveStatusViewport: true" in app
+    assert "skipUnchangedStatus: skipUnchanged" in app
+    assert 'id="status-elapsed"' in app
+    assert "signature === statusDataSignature" in app
+    assert "statusPollInFlight" in app
+    assert 'from "./status-view.js"' in app
+    assert "window.scrollTo(snapshot.scrollX, snapshot.scrollY)" in status_view
+    assert "需要关注" not in app
+    assert ".status-errors" not in css
     assert "/activity" in api
     assert ".event-density" in css
     assert ".activity-event" in css

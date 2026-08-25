@@ -1,6 +1,7 @@
 import { api } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
 import { hydrateSampleFrame as hydrateFrame, readySampleBody, sampleBody } from "./samples.js";
+import { captureStatusViewport, createStatusSignature, restoreStatusViewport, statusElapsedLabel } from "./status-view.js";
 
 const icons = {
   file: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 13h6M9 17h5"/></svg>',
@@ -74,6 +75,9 @@ let renderGeneration = 0;
 let trackedJobId = null;
 let statusPollTimer = null;
 let statusSearchTimer = null;
+let statusPollInFlight = false;
+let statusPollErrorShown = false;
+let statusDataSignature = null;
 
 const escapeHtml = (value = "") => String(value)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -339,11 +343,19 @@ function readSettingsForm(form) {
   };
 }
 
-async function statusMarkup() {
-  if (!state.project) return { markup: '<div class="empty-state"><span class="empty-state__icon">' + icons.file + '</span><h2>尚未打开工程</h2><p>从左侧目录打开一个工程后，这里会显示运行状态、分支和事件记录。</p></div>', branches: null };
+async function statusMarkup({ skipUnchanged = false } = {}) {
+  if (!state.project) {
+    const signature = "no-project";
+    const markup = skipUnchanged && signature === statusDataSignature
+      ? null
+      : '<div class="empty-state"><span class="empty-state__icon">' + icons.file + '</span><h2>尚未打开工程</h2><p>从左侧目录打开一个工程后，这里会显示运行状态、分支和事件记录。</p></div>';
+    return { markup, branches: null, activity: null, summary: null, signature };
+  }
   const p = state.project;
   const [activity, branches] = await Promise.all([api.activity(p.project_id), api.branches(p.project_id)]);
   const summary = activity.summary;
+  const signature = createStatusSignature(activity, branches);
+  if (skipUnchanged && signature === statusDataSignature) return { markup: null, branches, activity, summary, signature };
   const job = summary.active_job;
   const counts = activity.events.reduce((result, event) => {
     result[event.kind] = (result[event.kind] || 0) + 1;
@@ -358,45 +370,43 @@ async function statusMarkup() {
   filtered.sort((a, b) => state.statusOrder === "oldest"
     ? String(a.at).localeCompare(String(b.at))
     : String(b.at).localeCompare(String(a.at)));
-  const failures = activity.events.filter((event) => event.kind === "error").slice(0, 3);
   const kindLabels = { all: "全部", job: "任务", model: "模型", skill: "Skill", validation: "校验", artifact: "产物", project: "工程", error: "失败" };
   const filters = Object.entries(kindLabels).map(([kind, label]) => `<button class="status-filter${state.statusFilter === kind ? " is-active" : ""}" type="button" data-status-filter="${kind}" aria-pressed="${state.statusFilter === kind}">${label}<span>${kind === "all" ? activity.events.length : counts[kind] || 0}</span></button>`).join("");
-  const duration = job?.started_at ? Math.max(0, Math.floor((Date.now() - new Date(job.started_at).getTime()) / 1000)) : null;
-  const elapsed = duration === null ? "—" : duration < 60 ? `${duration}s` : `${Math.floor(duration / 60)}m ${duration % 60}s`;
   const density = activity.events.slice(0, 64).reverse().map((event) => `<span class="event-density__mark is-${escapeHtml(event.kind)}" title="${escapeHtml(`${kindLabels[event.kind] || event.kind} · ${formatDate(event.at)}`)}"></span>`).join("") || '<span class="event-density__empty">暂无事件</span>';
 
-  const eventMarkup = (event, pinned = false) => {
+  const eventMarkup = (event) => {
     const expanded = state.expandedEventId === event.id;
     const title = EVENT_LABELS[event.title]
       || MODEL_STATE_LABELS[event.title]
       || (event.kind === "job" || event.kind === "error" ? jobLabel(event.title) : event.title);
-    return `<article class="activity-event is-${escapeHtml(event.kind)}${pinned ? " is-pinned" : ""}"><button class="activity-event__summary" type="button" data-event-expand="${escapeHtml(event.id)}" aria-expanded="${expanded}"><span class="activity-event__dot" aria-hidden="true"></span><span class="activity-event__main"><span class="activity-event__line"><strong>${escapeHtml(title)}</strong><span class="badge">${escapeHtml(kindLabels[event.kind] || event.kind)}</span>${pinned ? '<span class="badge badge--danger">固定可见</span>' : ""}</span><span>${escapeHtml(event.summary || "无摘要")}</span></span><time datetime="${escapeHtml(event.at)}">${escapeHtml(formatDate(event.at))}</time><span class="activity-event__chevron" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></svg></span></button>${expanded ? `<div class="activity-event__detail"><pre>${escapeHtml(JSON.stringify(event.details, null, 2))}</pre><button class="btn btn--secondary" type="button" data-copy-event="${escapeHtml(event.id)}">复制详情</button></div>` : ""}</article>`;
+    return `<article class="activity-event is-${escapeHtml(event.kind)}"><button class="activity-event__summary" type="button" data-event-expand="${escapeHtml(event.id)}" aria-expanded="${expanded}"><span class="activity-event__dot" aria-hidden="true"></span><span class="activity-event__main"><span class="activity-event__line"><strong>${escapeHtml(title)}</strong><span class="badge">${escapeHtml(kindLabels[event.kind] || event.kind)}</span></span><span>${escapeHtml(event.summary || "无摘要")}</span></span><time datetime="${escapeHtml(event.at)}">${escapeHtml(formatDate(event.at))}</time><span class="activity-event__chevron" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></svg></span></button>${expanded ? `<div class="activity-event__detail"><pre>${escapeHtml(JSON.stringify(event.details, null, 2))}</pre><button class="btn btn--secondary" type="button" data-copy-event="${escapeHtml(event.id)}">复制详情</button></div>` : ""}</article>`;
   };
-  const errorTray = failures.length
-    ? `<section class="status-errors" aria-labelledby="status-errors-title"><div><h2 id="status-errors-title">需要关注</h2><p>失败事件不受筛选与搜索影响，便于快速定位。</p></div><div class="activity-list">${failures.map((event) => eventMarkup(event, true)).join("")}</div></section>`
-    : "";
   const eventsMarkup = filtered.length
     ? filtered.map((event) => eventMarkup(event)).join("")
     : `<div class="status-empty"><strong>没有匹配的事件</strong><p>尝试清空搜索词，或切换到“全部”类型。</p><button class="btn btn--secondary" type="button" data-status-reset>清除筛选</button></div>`;
-  const markup = `<div class="page-head"><div><p class="eyebrow">Agent observability</p><h1>${escapeHtml(p.title)}</h1><p class="lede">实时汇总后台任务、模型调用、Skill 读取、校验、产物保存和错误。</p></div><span class="badge ${job ? "badge--info" : "badge--success"}">${job ? "实时运行中" : "已同步"}</span></div><section class="panel section ia-section status-overview"><div class="metric-grid metric-grid--status"><div class="metric"><span>当前任务</span><strong>${escapeHtml(job ? jobLabel(job.operation) : "暂无运行任务")}</strong></div><div class="metric"><span>阶段 / 耗时</span><strong>${escapeHtml(STATE_LABELS[summary.stage] || summary.stage)} · ${elapsed}</strong></div><div class="metric"><span>模型</span><strong>${escapeHtml(summary.model || "尚未调用")}</strong><small>${escapeHtml(summary.provider || "")}</small></div><div class="metric"><span>事件 / 失败</span><strong>${summary.event_count} / ${summary.error_count}</strong></div></div>${job ? `<div class="job-progress" role="status"><span class="spinner" aria-hidden="true"></span><strong>正在${escapeHtml(jobLabel(job.operation))}</strong><span>状态台每 2 秒自动更新。</span></div>` : ""}<div class="event-density" aria-label="最近 ${Math.min(activity.events.length, 64)} 条事件的类型密度"><span>事件密度</span><div>${density}</div></div></section>${errorTray}<section class="panel section ia-section"><div class="section__head"><div><h2>统一事件流</h2><p>展开事件可查看经过脱敏的结构化详情并复制。</p></div><div class="status-sort"><label for="status-order">排序</label><select class="input" id="status-order"><option value="newest" ${state.statusOrder === "newest" ? "selected" : ""}>最新在前</option><option value="oldest" ${state.statusOrder === "oldest" ? "selected" : ""}>时间顺序</option></select></div></div><div class="status-controls"><div class="status-filters" aria-label="按事件类型筛选">${filters}</div><div class="status-search"><label class="sr-only" for="status-search">搜索事件</label><input class="input" id="status-search" type="search" value="${escapeHtml(state.statusQuery)}" placeholder="搜索操作、文件、模型或错误…"><span>${filtered.length} 条</span></div></div><div class="activity-list">${eventsMarkup}</div></section>`;
-  return { markup, branches, activity };
+  const markup = `<div class="page-head"><div><p class="eyebrow">Agent observability</p><h1>${escapeHtml(p.title)}</h1><p class="lede">实时汇总后台任务、模型调用、Skill 读取、校验、产物保存和错误。</p></div><span class="badge ${job ? "badge--info" : "badge--success"}">${job ? "实时运行中" : "已同步"}</span></div><section class="panel section ia-section status-overview"><div class="metric-grid metric-grid--status"><div class="metric"><span>当前任务</span><strong>${escapeHtml(job ? jobLabel(job.operation) : "暂无运行任务")}</strong></div><div class="metric"><span>阶段 / 耗时</span><strong id="status-elapsed">${escapeHtml(statusElapsedLabel(summary, STATE_LABELS))}</strong></div><div class="metric"><span>模型</span><strong>${escapeHtml(summary.model || "尚未调用")}</strong><small>${escapeHtml(summary.provider || "")}</small></div><div class="metric"><span>事件 / 失败</span><strong>${summary.event_count} / ${summary.error_count}</strong></div></div>${job ? `<div class="job-progress" role="status"><span class="spinner" aria-hidden="true"></span><strong>正在${escapeHtml(jobLabel(job.operation))}</strong><span>状态台每 2 秒自动更新。</span></div>` : ""}<div class="event-density" aria-label="最近 ${Math.min(activity.events.length, 64)} 条事件的类型密度"><span>事件密度</span><div>${density}</div></div></section><section class="panel section ia-section"><div class="section__head"><div><h2>统一事件流</h2><p>展开事件可查看经过脱敏的结构化详情并复制。</p></div><div class="status-sort"><label for="status-order">排序</label><select class="input" id="status-order"><option value="newest" ${state.statusOrder === "newest" ? "selected" : ""}>最新在前</option><option value="oldest" ${state.statusOrder === "oldest" ? "selected" : ""}>时间顺序</option></select></div></div><div class="status-controls"><div class="status-filters" aria-label="按事件类型筛选">${filters}</div><div class="status-search"><label class="sr-only" for="status-search">搜索事件</label><input class="input" id="status-search" type="search" value="${escapeHtml(state.statusQuery)}" placeholder="搜索操作、文件、模型或错误…"><span>${filtered.length} 条</span></div></div><div class="activity-list">${eventsMarkup}</div></section>`;
+  return { markup, branches, activity, summary, signature };
+}
+
+async function refreshStatusView({ skipUnchanged = false } = {}) {
+  await render({ showLoading: false, preserveStatusViewport: true, skipUnchangedStatus: skipUnchanged });
 }
 
 function wireStatus(activity) {
   content.querySelectorAll("[data-status-filter]").forEach((button) => button.addEventListener("click", async () => {
     state.statusFilter = button.dataset.statusFilter;
-    await render();
+    await refreshStatusView();
   }));
   content.querySelector("#status-order")?.addEventListener("change", async (event) => {
     state.statusOrder = event.target.value;
-    await render();
+    await refreshStatusView();
   });
   content.querySelector("#status-search")?.addEventListener("input", (event) => {
     state.statusQuery = event.target.value;
     if (statusSearchTimer) window.clearTimeout(statusSearchTimer);
     statusSearchTimer = window.setTimeout(async () => {
       statusSearchTimer = null;
-      await render();
+      await refreshStatusView();
       const input = content.querySelector("#status-search");
       input?.focus();
       input?.setSelectionRange(input.value.length, input.value.length);
@@ -405,11 +415,11 @@ function wireStatus(activity) {
   content.querySelector("[data-status-reset]")?.addEventListener("click", async () => {
     state.statusFilter = "all";
     state.statusQuery = "";
-    await render();
+    await refreshStatusView();
   });
   content.querySelectorAll("[data-event-expand]").forEach((button) => button.addEventListener("click", async () => {
     state.expandedEventId = state.expandedEventId === button.dataset.eventExpand ? null : button.dataset.eventExpand;
-    await render();
+    await refreshStatusView();
   }));
   content.querySelectorAll("[data-copy-event]").forEach((button) => button.addEventListener("click", async () => {
     const item = activity.events.find((event) => event.id === button.dataset.copyEvent);
@@ -419,7 +429,7 @@ function wireStatus(activity) {
   }));
 }
 
-async function render() {
+async function render({ showLoading = true, preserveStatusViewport = false, skipUnchangedStatus = false } = {}) {
   const generation = ++renderGeneration;
   markActiveTab();
   setTopContext();
@@ -429,15 +439,27 @@ async function render() {
     hydrateSampleFrame();
     return;
   }
-  hydrateFrame(content, null, 0);
-  content.innerHTML = '<section class="panel section"><div class="empty-state"><span class="spinner" aria-hidden="true"></span><p>正在读取…</p></div></section>';
+  if (showLoading) {
+    hydrateFrame(content, null, 0);
+    content.innerHTML = '<section class="panel section"><div class="empty-state"><span class="spinner" aria-hidden="true"></span><p>正在读取…</p></div></section>';
+  }
   try {
     if (state.view === "status") {
-      const result = await statusMarkup();
+      const result = await statusMarkup({ skipUnchanged: skipUnchangedStatus });
       if (generation !== renderGeneration) return;
       if (result.branches) state.branches = result.branches;
+      if (result.markup === null) {
+        const elapsed = content.querySelector("#status-elapsed");
+        if (elapsed && result.summary) elapsed.textContent = statusElapsedLabel(result.summary, STATE_LABELS);
+        statusPollErrorShown = false;
+        return;
+      }
+      const viewport = preserveStatusViewport ? captureStatusViewport(content) : null;
       content.innerHTML = result.markup;
       wireStatus(result.activity);
+      restoreStatusViewport(content, viewport);
+      statusDataSignature = result.signature;
+      statusPollErrorShown = false;
       return;
     }
     state.runtime ||= await api.runtime();
@@ -446,6 +468,11 @@ async function render() {
     wireSettings();
   } catch (error) {
     if (generation !== renderGeneration) return;
+    if (!showLoading && preserveStatusViewport) {
+      if (!statusPollErrorShown) toast("状态自动更新失败，稍后将自动重试。", true);
+      statusPollErrorShown = true;
+      return;
+    }
     content.innerHTML = `<section class="panel section"><div class="empty-state"><h2>页面加载失败</h2><p>${escapeHtml(error.message)}</p></div></section>`;
     toast(error.message, true);
   }
@@ -904,13 +931,15 @@ async function setView(view) {
     window.clearInterval(statusPollTimer);
     statusPollTimer = null;
   }
+  statusPollErrorShown = false;
   state.view = view;
   await render();
   document.querySelector("#main").focus();
   if (view === "status") {
     statusPollTimer = window.setInterval(() => {
-      if (state.view !== "status" || document.activeElement?.id === "status-search") return;
-      void render();
+      if (state.view !== "status" || document.hidden || document.activeElement?.id === "status-search" || statusPollInFlight) return;
+      statusPollInFlight = true;
+      void refreshStatusView({ skipUnchanged: true }).finally(() => { statusPollInFlight = false; });
     }, 2000);
   }
 }
