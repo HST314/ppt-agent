@@ -18,6 +18,16 @@ python -m pip install -e ".[dev]"
 python main.py
 ```
 
+Windows PowerShell 使用以下命令：
+
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade "pip>=23.1"
+python -m pip install -e ".[dev]"
+python main.py
+```
+
 如果创建出的虚拟环境没有 pip，请先安装当前 Python 对应的 `venv`/`ensurepip` 系统包，再重新创建 `.venv`；不要继续使用系统自带的旧 pip 做 editable 安装。
 
 打开 `http://127.0.0.1:8000`。默认配置已对齐 Image Agent 的真实文本推理路由：供应商 `ark`、模型 `deepseek-v4-flash-ga-260731`、服务地址 `https://ark.cn-beijing.volces.com/api/v3`。启动前需提供 `ARK_API_KEY`：
@@ -26,6 +36,8 @@ python main.py
 export ARK_API_KEY=你的密钥
 python main.py
 ```
+
+Windows PowerShell 中使用 `$env:ARK_API_KEY = "你的密钥"` 设置同名环境变量。
 
 自动化测试使用显式注入的 `mock` 配置，不会调用真实付费模型。
 
