@@ -13,6 +13,12 @@ def test_default_runtime_is_valid() -> None:
 
     assert runtime.policy.stream_model_output is False
     assert len(runtime.models.state_bindings) == 3
+    assert {binding.provider for binding in runtime.models.state_bindings} == {"ark"}
+    assert {binding.model for binding in runtime.models.state_bindings} == {"deepseek-v4-flash-ga-260731"}
+    assert {binding.api_key_env for binding in runtime.models.state_bindings} == {"ARK_API_KEY"}
+    assert {binding.base_url for binding in runtime.models.state_bindings} == {
+        "https://ark.cn-beijing.volces.com/api/v3"
+    }
     assert "api_key_env" not in runtime.public_context()["model_bindings"][0]
 
 
@@ -62,7 +68,7 @@ def test_runtime_update_persists_and_reloads_safe_fields(tmp_path: Path) -> None
 
     assert updated.models.binding_for("narrative_structure").model == "narrative-preview-v2"
     assert updated.models.binding_for("narrative_structure").parameters == {"temperature": 0.2}
-    assert updated.models.binding_for("narrative_structure").api_key_env == "OPENAI_API_KEY"
+    assert updated.models.binding_for("narrative_structure").api_key_env == "ARK_API_KEY"
     assert updated.policy.max_auto_questions == 4
     assert updated.model_hash != runtime.model_hash
     assert yaml.safe_load((tmp_path / "runtime.yaml").read_text(encoding="utf-8"))["max_auto_questions"] == 4

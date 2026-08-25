@@ -13,6 +13,10 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert 'id="topnav-branch"' in html
     assert 'id="sidebar-toggle"' in html
     assert "创作进度" in app
+    assert 'data-snapshot-stage="${stage.id}"' in app
+    assert "重跑此阶段并创建分支" in app
+    assert 'mode: "rerun_stage"' in app
+    assert 'id="branch-create-form"' not in app
     assert 'id="settings-form"' in app
     assert all(action in app for action in ("openBranchDialog", "createBranch", "switchBranch", "updateRuntime"))
     assert 'audience: document.querySelector("#audience").value.trim(),' in app

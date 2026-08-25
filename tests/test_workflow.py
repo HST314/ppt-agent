@@ -11,8 +11,8 @@ from storage.project_store import ConflictError, ProjectStore
 
 
 @pytest.fixture
-def workflow(tmp_path: Path) -> Workflow:
-    runtime = ManagedRuntime(Path(__file__).parents[1])
+def workflow(tmp_path: Path, mock_runtime: ManagedRuntime) -> Workflow:
+    runtime = mock_runtime
     store = ProjectStore(tmp_path / "projects", "demo")
     task = TaskCard(title="季度复盘", objective="形成下一季度投入共识")
     store.create(task.model_dump(), runtime.snapshot())
@@ -113,6 +113,56 @@ def test_branch_switch_restores_branch_head_without_rewriting_history(workflow: 
     switched_back = workflow.store.switch_branch(alternate_head)
     assert switched_back["branch"] == "alternate"
     assert switched_back["checkpoint_id"] == alternate_head
+
+
+def test_progress_snapshots_drive_stage_rerun_branch(workflow: Workflow) -> None:
+    manifest = workflow.store.read()
+    manifest = workflow.start_clarification(manifest["checkpoint_id"])
+    card = manifest["question_card"]
+    manifest = workflow.answer_clarification(
+        manifest["checkpoint_id"],
+        card["question_card_id"],
+        {question["question_id"]: "answer" for question in card["questions"]},
+    )
+    manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
+    narrative = manifest["documents"]["narrative_structure"][-1]
+    manifest = workflow.approve_document(
+        "narrative_structure", manifest["checkpoint_id"], narrative["revision_hash"]
+    )
+    manifest = workflow.generate_document("slide_outline", manifest["checkpoint_id"])
+    outline = manifest["documents"]["slide_outline"][-1]
+    completed = workflow.approve_document(
+        "slide_outline", manifest["checkpoint_id"], outline["revision_hash"]
+    )
+
+    snapshots = workflow.store.progress_snapshots()
+    assert [item["stage"] for item in snapshots] == [
+        "intake", "intake_clarify", "narrative_structure", "slide_outline"
+    ]
+    assert all(item["completed"] for item in snapshots)
+    narrative_snapshot = next(item for item in snapshots if item["stage"] == "narrative_structure")
+    assert narrative_snapshot["snapshot"]["documents"]["narrative_structure"][-1]["status"] == "approved"
+
+    branched = workflow.store.fork(
+        narrative_snapshot["checkpoint_id"],
+        "narrative-rerun",
+        mode="rerun_stage",
+        stage="narrative_structure",
+    )
+
+    assert branched["state"] == "narrative_structure"
+    assert branched["phase"] == "ready_to_generate"
+    assert branched["documents"] == {"narrative_structure": [], "slide_outline": []}
+    assert branched["clarification_answers"]
+    assert branched["branches"]["main"] == completed["checkpoint_id"]
+    assert branched["branch_meta"]["narrative-rerun"]["mode"] == "rerun_stage"
+    assert branched["branch_meta"]["narrative-rerun"]["source_stage"] == "narrative_structure"
+
+    branched_progress = workflow.store.progress_snapshots()
+    assert [item["stage"] for item in branched_progress] == [
+        "intake", "intake_clarify", "narrative_structure"
+    ]
+    assert [item["completed"] for item in branched_progress] == [True, True, False]
 
 
 def test_concurrent_edits_from_same_checkpoint_use_atomic_cas(workflow: Workflow, monkeypatch) -> None:

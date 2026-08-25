@@ -1,26 +1,26 @@
-model_config_id: ppt-agent-local
+model_config_id: ppt-agent-ark-runtime
 state_bindings:
   - state: intake_clarify
     model_role: reasoning_llm
-    provider: mock
-    model: deterministic-preview
+    provider: ark
+    model: deepseek-v4-flash-ga-260731
     parameters: {}
     fallback_model: null
-    base_url: null
-    api_key_env: OPENAI_API_KEY
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: ARK_API_KEY
   - state: narrative_structure
     model_role: reasoning_llm
-    provider: mock
-    model: deterministic-preview
+    provider: ark
+    model: deepseek-v4-flash-ga-260731
     parameters: {}
     fallback_model: null
-    base_url: null
-    api_key_env: OPENAI_API_KEY
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: ARK_API_KEY
   - state: slide_outline
     model_role: reasoning_llm
-    provider: mock
-    model: deterministic-preview
+    provider: ark
+    model: deepseek-v4-flash-ga-260731
     parameters: {}
     fallback_model: null
-    base_url: null
-    api_key_env: OPENAI_API_KEY
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: ARK_API_KEY

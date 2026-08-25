@@ -63,6 +63,8 @@ class ApproveRequest(StrictRequest):
 class BranchRequest(StrictRequest):
     checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
     name: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
+    mode: Literal["fork_after", "rerun_stage"] = "fork_after"
+    stage: Literal["intake", "intake_clarify", "narrative_structure", "slide_outline"] | None = None
 
 
 class BranchSwitchRequest(StrictRequest):
@@ -106,7 +108,12 @@ def store_for(project_id: str) -> ProjectStore:
 def project_view(store: ProjectStore) -> dict[str, Any]:
     manifest = store.read()
     latest_job = jobs.latest_for_project(store.project_id)
-    return {**manifest, "capabilities": capabilities(manifest), "active_job": latest_job if latest_job and latest_job["status"] in {"queued", "running"} else None}
+    return {
+        **manifest,
+        "capabilities": capabilities(manifest),
+        "active_job": latest_job if latest_job and latest_job["status"] in {"queued", "running"} else None,
+        "progress_snapshots": store.progress_snapshots(),
+    }
 
 
 @app.get("/api/health")
@@ -153,8 +160,8 @@ def create_project(request: CreateProjectRequest) -> dict[str, Any]:
     store = ProjectStore(PROJECTS_ROOT, request.project_id)
     with runtime_config_lock:
         runtime_snapshot = runtime.snapshot()
-    manifest = store.create(request.task_card.model_dump(), runtime_snapshot)
-    return {**manifest, "capabilities": capabilities(manifest), "active_job": None}
+    store.create(request.task_card.model_dump(), runtime_snapshot)
+    return project_view(store)
 
 
 @app.get("/api/projects/{project_id}")
@@ -245,6 +252,8 @@ def branches(project_id: str) -> dict[str, Any]:
 @app.post("/api/projects/{project_id}/branches")
 def create_branch(project_id: str, request: BranchRequest) -> dict[str, Any]:
     store = store_for(project_id)
+    if request.mode == "rerun_stage" and request.stage is None:
+        raise HTTPException(status_code=422, detail="重跑分支必须指定来源阶段")
     # The registry lock closes the race with job submission: either the job is
     # visible and branching is rejected, or the branch commits before submit.
     with jobs.lock:
@@ -252,7 +261,12 @@ def create_branch(project_id: str, request: BranchRequest) -> dict[str, Any]:
         if active and active["status"] in {"queued", "running"}:
             raise ConflictError("active_job")
         try:
-            store.fork(request.checkpoint_id, request.name)
+            store.fork(
+                request.checkpoint_id,
+                request.name,
+                mode=request.mode,
+                stage=request.stage,
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="检查点不存在") from exc
     return project_view(store)

@@ -10,10 +10,15 @@ from agent_core.jobs import JobRegistry
 from configs.runtime import ManagedRuntime
 
 
-def test_api_drives_project_to_narrative(tmp_path: Path, monkeypatch) -> None:
+def test_api_drives_project_to_narrative(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
     project_root = tmp_path / "projects"
     monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
     monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
     client = TestClient(main_front.app)
 
     response = client.post("/api/projects", json={
@@ -104,6 +109,64 @@ def test_api_updates_runtime_and_switches_branches(tmp_path: Path, monkeypatch) 
     assert switched.status_code == 200
     assert switched.json()["branch"] == "main"
     assert switched.json()["branches"]["alternate"] == alternate_head
+
+
+def test_api_creates_rerun_branch_from_progress_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    client = TestClient(main_front.app)
+
+    project = client.post("/api/projects", json={
+        "project_id": "snapshot-branch",
+        "task_card": {"title": "快照分支", "objective": "验证阶段回退"},
+    }).json()
+    snapshot = project["progress_snapshots"][0]
+    response = client.post("/api/projects/snapshot-branch/branches", json={
+        "checkpoint_id": snapshot["checkpoint_id"],
+        "name": "intake-rerun",
+        "mode": "rerun_stage",
+        "stage": "intake",
+    })
+
+    assert response.status_code == 200
+    branched = response.json()
+    assert branched["branch"] == "intake-rerun"
+    assert branched["state"] == "intake"
+    assert branched["phase"] == "ready_for_clarification"
+    assert branched["branch_meta"]["intake-rerun"]["from_checkpoint"] == snapshot["checkpoint_id"]
+    assert branched["progress_snapshots"][0]["stage"] == "intake"
+
+
+def test_api_rejects_stage_rerun_from_noncanonical_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    client = TestClient(main_front.app)
+
+    project = client.post("/api/projects", json={
+        "project_id": "snapshot-boundary",
+        "task_card": {"title": "快照边界", "objective": "拒绝错配阶段"},
+    }).json()
+    response = client.post("/api/projects/snapshot-boundary/branches", json={
+        "checkpoint_id": project["checkpoint_id"],
+        "name": "wrong-stage",
+        "mode": "rerun_stage",
+        "stage": "slide_outline",
+    })
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "stage_snapshot_required"
 
 
 @pytest.mark.parametrize(

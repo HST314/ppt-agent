@@ -102,6 +102,10 @@ function activeStageIndex(project = state.project) {
   return { intake: 0, intake_clarify: 1, narrative_structure: 2, slide_outline: 3 }[project?.state] ?? 0;
 }
 
+function stageSnapshotMap(project = state.project) {
+  return new Map((project?.progress_snapshots || []).map((item) => [item.stage, item]));
+}
+
 function jobLabel(operation) {
   return ({
     start_clarification: "生成澄清问题",
@@ -137,20 +141,23 @@ function progressCard() {
   const project = state.project;
   const active = activeStageIndex();
   const outlineApproved = currentDocument("slide_outline")?.status === "approved";
+  const snapshots = stageSnapshotMap(project);
   const steps = STAGES.map((stage, index) => {
     const done = index < active || (index === 3 && outlineApproved);
     const current = index === active && !(index === 3 && outlineApproved);
-    const viewable = stage.id === "narrative_structure" && currentDocument("narrative_structure")
-      || stage.id === "slide_outline" && currentDocument("slide_outline");
-    const classes = ["step", done ? "is-done" : "", current ? "is-current" : "", viewable ? "is-viewable" : ""].filter(Boolean).join(" ");
-    const attrs = viewable ? `data-stage-view="${stage.id}" title="查看${stage.label}"` : "disabled";
+    const snapshot = snapshots.get(stage.id);
+    const viewable = Boolean(snapshot && !stage.future);
+    const classes = ["step", done ? "is-done" : "", current ? "is-current" : "", viewable ? "is-viewable step--interactive" : ""].filter(Boolean).join(" ");
+    const attrs = viewable
+      ? `data-snapshot-stage="${stage.id}" aria-label="查看${stage.label}阶段任务快照" title="查看${stage.label}阶段任务快照"`
+      : "disabled";
     return `<button class="${classes}" type="button" ${attrs}><span class="step__bar"></span><span>${done ? "✓ " : ""}${escapeHtml(stage.label)}</span></button>`;
   }).join("");
   const job = project.active_job;
   const jobRow = job
     ? `<div class="job-progress" role="status"><span class="spinner" aria-hidden="true"></span><strong>正在${escapeHtml(jobLabel(job.operation))}…</strong><span>刷新页面不会丢失进度。</span><button class="btn btn--secondary" type="button" data-action="cancel_job">取消任务</button></div>`
     : '<div class="job-progress" role="status"><span class="badge badge--success">已同步</span><span>当前没有正在运行的后台任务。</span></div>';
-  return `<section class="panel section ia-section progress-card"><div class="section__head"><div><h2>创作进度</h2><p>当前分支 ${escapeHtml(project.branch || "main")} · 检查点 ${escapeHtml(project.checkpoint_id.slice(-8))}</p></div><div class="section__actions"><span class="badge badge--info">${escapeHtml(PHASE_LABELS[project.phase] || project.phase)}</span><button class="btn btn--secondary" type="button" data-action="open_branches">${icons.branch}<span>分支管理</span></button></div></div><div class="stepper" aria-label="工作流进度">${steps}</div>${jobRow}</section>`;
+  return `<section class="panel section ia-section progress-card"><div class="section__head"><div><h2>创作进度</h2><p>当前分支 ${escapeHtml(project.branch || "main")} · 检查点 ${escapeHtml(project.checkpoint_id.slice(-8))} · 点击已保存阶段回看任务快照</p></div><div class="section__actions"><span class="badge badge--info">${escapeHtml(PHASE_LABELS[project.phase] || project.phase)}</span><button class="btn btn--secondary" type="button" data-action="open_branches">${icons.branch}<span>查看分支</span></button></div></div><div class="stepper" aria-label="工作流进度">${steps}</div>${jobRow}</section>`;
 }
 
 function stagePanel(title, subtitle, body, status = "") {
@@ -380,9 +387,8 @@ async function runJob(operation) {
 }
 
 function wireWorkspace() {
-  content.querySelectorAll("[data-stage-view]").forEach((button) => button.addEventListener("click", () => {
-    state.focusStage = button.dataset.stageView;
-    void render();
+  content.querySelectorAll("[data-snapshot-stage]").forEach((button) => button.addEventListener("click", () => {
+    openSnapshotDialog(button.dataset.snapshotStage);
   }));
   content.querySelectorAll("button[data-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.action;
@@ -529,6 +535,81 @@ async function createProject(event) {
   finally { button.disabled = false; button.textContent = "创建工程"; }
 }
 
+function automaticBranchName(stage, date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${stage.replaceAll("_", "-")}-${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function snapshotDocument(snapshot, type) {
+  return (snapshot?.documents?.[type] || []).at(-1) || null;
+}
+
+function snapshotContent(stage, item) {
+  const snapshot = item.snapshot || {};
+  if (stage === "intake") return taskSummary(snapshot.task_card || {});
+  if (stage === "intake_clarify") {
+    const answers = snapshot.clarification_answers || {};
+    const questions = snapshot.question_card?.questions || [];
+    if (!questions.length) return '<p class="snapshot-empty">该检查点尚未生成澄清问题。</p>';
+    return `<ol class="snapshot-list">${questions.map((question) => {
+      const answer = answers[question.field]?.answer;
+      const options = (question.options || []).map((option) => option.label).join(" / ");
+      return `<li><strong>${escapeHtml(question.prompt)}</strong>${answer ? `<span class="snapshot-answer">回答：${escapeHtml(answer)}</span>` : options ? `<span>${escapeHtml(options)}</span>` : ""}</li>`;
+    }).join("")}</ol>`;
+  }
+  const document = snapshotDocument(snapshot, stage);
+  if (!document) return '<p class="snapshot-empty">该阶段的输入已保存，产物尚未生成。</p>';
+  return `<article class="document snapshot-document">${renderMarkdown(document.markdown_body)}</article>`;
+}
+
+function openSnapshotDialog(stage) {
+  if (!state.project) return;
+  const item = stageSnapshotMap().get(stage);
+  if (!item) { toast("该阶段还没有可回看的任务快照。", true); return; }
+  const label = STATE_LABELS[stage] || STAGES.find((entry) => entry.id === stage)?.label || stage;
+  const blocked = Boolean(state.project.active_job);
+  const dialog = document.createElement("dialog");
+  dialog.className = "dialog snapshot-dialog";
+  dialog.setAttribute("aria-labelledby", "snapshot-dialog-title");
+  dialog.innerHTML = `<div class="dialog__head"><div><p class="eyebrow">Task snapshot</p><h2 id="snapshot-dialog-title">${escapeHtml(label)} · 历史快照</h2><p>回看不会改变当前工程进度。</p></div><button class="icon-btn" type="button" data-dialog-close aria-label="关闭"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><div class="dialog__body snapshot-dialog__body"><div class="snapshot-meta"><span class="badge badge--info">只读快照</span><span>第 ${item.sequence} 个检查点 · ${escapeHtml(formatDate(item.updated_at))}</span></div>${snapshotContent(stage, item)}${blocked ? '<div class="callout callout--warning">后台任务运行期间不能从快照创建分支。</div>' : ""}<div class="field-error" id="snapshot-branch-error" role="alert"></div></div><div class="dialog__foot snapshot-dialog__foot"><small>新分支会回到该阶段的输入边界并重新执行；原分支保持不变。</small><button class="btn btn--secondary" type="button" data-dialog-close>关闭</button><button class="btn btn--primary" type="button" data-snapshot-branch ${blocked ? "disabled" : ""}>重跑此阶段并创建分支</button></div>`;
+  document.body.append(dialog);
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.querySelectorAll("[data-dialog-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
+  dialog.querySelector("[data-snapshot-branch]").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const errorNode = dialog.querySelector("#snapshot-branch-error");
+    button.disabled = true;
+    button.textContent = "正在创建分支…";
+    try {
+      const name = automaticBranchName(stage);
+      state.project = await api.createBranch(state.project.project_id, {
+        name,
+        checkpoint_id: item.checkpoint_id,
+        mode: "rerun_stage",
+        stage,
+      });
+      state.branches = await api.branches(state.project.project_id);
+      state.focusStage = null;
+      dialog.close();
+      await loadProjects();
+      await render();
+      toast(`已从${label}快照创建并切换到分支 ${name}。`);
+      const operation = {
+        intake: "start_clarification",
+        intake_clarify: "start_clarification",
+        narrative_structure: "generate_narrative",
+        slide_outline: "generate_outline",
+      }[stage];
+      if (operation) await runJob(operation);
+    } catch (error) {
+      errorNode.textContent = error.message;
+      button.disabled = false;
+      button.textContent = "重跑此阶段并创建分支";
+    }
+  });
+  dialog.showModal();
+}
+
 async function openBranchDialog() {
   if (!state.project) { toast("请先打开一个工程。", true); return; }
   let payload;
@@ -545,8 +626,7 @@ async function openBranchDialog() {
     const meta = [lineage, head ? `${STATE_LABELS[head.state] || head.state} · ${formatDate(head.updated_at)}` : null].filter(Boolean).join(" · ");
     return `<div class="branch-item${item.current ? " is-current" : ""}"><div class="branch-item__name"><span>${escapeHtml(item.name)}</span>${item.current ? '<span class="badge badge--success">当前分支</span>' : ""}</div><div class="branch-item__meta">${escapeHtml(meta)}</div>${!item.current ? `<button class="btn btn--primary branch-item__actions" type="button" data-branch-switch="${escapeHtml(item.head_checkpoint_id)}" ${blocked ? "disabled" : ""}>切换到此分支</button>` : ""}</div>`;
   }).join("");
-  const options = payload.checkpoints.map((checkpoint) => `<option value="${escapeHtml(checkpoint.checkpoint_id)}" ${checkpoint.checkpoint_id === state.project.checkpoint_id ? "selected" : ""}>${escapeHtml(checkpoint.branch)} · ${escapeHtml(STATE_LABELS[checkpoint.state] || checkpoint.state)} · ${escapeHtml(formatDate(checkpoint.updated_at))}</option>`).join("");
-  dialog.innerHTML = `<div class="dialog__head"><div><p class="eyebrow">Version branches</p><h2 id="branch-dialog-title">查看与切换分支</h2></div><button class="icon-btn" type="button" data-dialog-close aria-label="关闭"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><div class="dialog__body"><p class="hint">切换分支只改变当前查看与继续的位置，各分支历史保持不变。</p><div class="branch-list">${items}</div><form class="branch-create" id="branch-create-form"><h3>创建新分支</h3><p>可以从当前或任一历史检查点继续探索新的叙事方向。</p>${blocked ? '<div class="callout callout--warning">后台任务运行期间不能创建或切换分支。</div>' : ""}<div class="field"><label for="branch-name">分支名称</label><input class="input" id="branch-name" name="name" required minlength="2" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,63}" placeholder="story-angle-b"></div><div class="field"><label for="branch-checkpoint">起点检查点</label><select class="input" id="branch-checkpoint" name="checkpoint_id">${options}</select></div><div class="field-error" id="branch-error" role="alert"></div><div class="button-row"><button class="btn btn--primary" type="submit" ${blocked ? "disabled" : ""}>创建并切换</button></div></form></div><div class="dialog__foot"><button class="btn btn--secondary" type="button" data-dialog-close>关闭</button></div>`;
+  dialog.innerHTML = `<div class="dialog__head"><div><p class="eyebrow">Version branches</p><h2 id="branch-dialog-title">查看与切换分支</h2></div><button class="icon-btn" type="button" data-dialog-close aria-label="关闭"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><div class="dialog__body"><p class="hint">在这里查看和切换已有分支；点击创作进度卡中的阶段快照可创建分支。</p>${blocked ? '<div class="callout callout--warning">后台任务运行期间不能切换分支。</div>' : ""}<div class="branch-list">${items}</div></div><div class="dialog__foot"><button class="btn btn--secondary" type="button" data-dialog-close>关闭</button></div>`;
   document.body.append(dialog);
   dialog.addEventListener("close", () => dialog.remove());
   dialog.querySelectorAll("[data-dialog-close]").forEach((button) => button.addEventListener("click", () => dialog.close()));
@@ -563,23 +643,6 @@ async function openBranchDialog() {
       toast(`已切换到分支 ${state.project.branch}。`);
     } catch (error) { button.disabled = false; button.textContent = "切换到此分支"; toast(error.message, true); }
   }));
-  dialog.querySelector("#branch-create-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const submit = form.querySelector('button[type="submit"]');
-    const errorNode = form.querySelector("#branch-error");
-    submit.disabled = true;
-    submit.textContent = "正在创建…";
-    try {
-      state.project = await api.createBranch(state.project.project_id, { name: form.elements.name.value.trim(), checkpoint_id: form.elements.checkpoint_id.value });
-      state.branches = await api.branches(state.project.project_id);
-      state.focusStage = null;
-      dialog.close();
-      await loadProjects();
-      await render();
-      toast(`已创建并切换到分支 ${state.project.branch}。`);
-    } catch (error) { errorNode.textContent = error.message; submit.disabled = false; submit.textContent = "创建并切换"; }
-  });
   dialog.showModal();
 }
 
