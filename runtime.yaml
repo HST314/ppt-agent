@@ -7,6 +7,9 @@ max_tool_rounds: 20
 max_read_chars_per_call: 20000
 max_read_chars_per_job: 80000
 sample_page_count: 2
+full_deck_max_files: 384
+full_deck_max_file_bytes: 4000000
+full_deck_max_total_bytes: 50000000
 skills_root: skills
 offline_mode: false
 source_config_revision: null

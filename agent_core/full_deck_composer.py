@@ -26,6 +26,12 @@ class ComposerSource(StrictModel):
 
 
 class ComposerPage(StrictModel):
+    slot_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        pattern=r"^slot_[a-f0-9]{24}$",
+    )
     slide_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     title: str = Field(min_length=1, max_length=160)
     source_slide_number: int = Field(ge=1, le=1000)
@@ -101,6 +107,7 @@ class CompositionSource(StrictModel):
 
 
 class CompositionSlide(StrictModel):
+    slot_id: str | None = None
     slide_id: str
     title: str
     source_slide_number: int
@@ -380,6 +387,7 @@ def compose_full_deck(spec: FullDeckComposerInput) -> FullDeckComposition:
                 f"page content graph changed during composition: {page.source_slide_id}"
             )
         slide_manifests.append(CompositionSlide(
+            slot_id=page.slot_id,
             slide_id=page.slide_id,
             title=page.title,
             source_slide_number=page.source_slide_number,

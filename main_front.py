@@ -52,6 +52,7 @@ class StartJobRequest(StrictRequest):
         "generate_sample",
         "regenerate_sample",
         "revise_sample",
+        "generate_full_deck",
     ]
     checkpoint_id: str = Field(min_length=1, max_length=128)
     feedback: str | None = Field(default=None, min_length=1, max_length=4000)
@@ -200,6 +201,8 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
     )
     public_manifest = deepcopy(manifest)
     public_manifest.pop("full_deck_revisions", None)
+    if active_job and active_job.get("operation") == "generate_full_deck":
+        public_manifest["phase"] = "generating"
     return {
         **public_manifest,
         # Revision history stays durable in the manifest/checkpoints; the UI
@@ -232,7 +235,7 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
             }
             for item in reversed(full_deck_revisions)
         ],
-        "full_deck_attempts": [],
+        "full_deck_attempts": store.full_deck_attempts(),
         "capabilities": capabilities(manifest, active_job=active_job is not None),
         "active_job": active_job,
         "progress_snapshots": store.progress_snapshots(),
@@ -355,8 +358,18 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
         "generate_sample": lambda: workflow.generate_sample(request.checkpoint_id),
         "regenerate_sample": lambda: workflow.generate_sample(request.checkpoint_id, regenerate=True),
         "revise_sample": lambda: workflow.generate_sample(request.checkpoint_id, feedback=request.feedback),
+        "generate_full_deck": lambda cancel_requested: workflow.generate_full_deck(
+            request.checkpoint_id,
+            cancel_requested=cancel_requested,
+        ),
     }
-    return jobs.submit(project_id, request.operation, request.checkpoint_id, actions[request.operation])
+    return jobs.submit(
+        project_id,
+        request.operation,
+        request.checkpoint_id,
+        actions[request.operation],
+        cancellable=request.operation == "generate_full_deck",
+    )
 
 
 @app.get("/api/jobs/{job_id}")

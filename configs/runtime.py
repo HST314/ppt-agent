@@ -12,7 +12,13 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-ModelState = Literal["intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"]
+ModelState = Literal[
+    "intake_clarify",
+    "narrative_structure",
+    "slide_outline",
+    "ppt_sample",
+    "ppt_full",
+]
 
 
 class _ModelCallParameters(BaseModel):
@@ -64,6 +70,9 @@ class RuntimePolicy(BaseModel):
     max_read_chars_per_call: int = Field(default=20_000, ge=100, le=100_000)
     max_read_chars_per_job: int = Field(default=80_000, ge=100, le=500_000)
     sample_page_count: int = Field(default=2, ge=1, le=6)
+    full_deck_max_files: int = Field(default=384, ge=16, le=512)
+    full_deck_max_file_bytes: int = Field(default=4_000_000, ge=100_000, le=8_000_000)
+    full_deck_max_total_bytes: int = Field(default=50_000_000, ge=1_000_000, le=64_000_000)
     skills_root: str = "skills"
     offline_mode: bool = False
     source_config_revision: str | None = None
@@ -101,7 +110,13 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_state_bindings(self) -> "ModelConfig":
-        expected = {"intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"}
+        expected = {
+            "intake_clarify",
+            "narrative_structure",
+            "slide_outline",
+            "ppt_sample",
+            "ppt_full",
+        }
         actual = [item.state for item in self.state_bindings]
         if len(actual) != len(set(actual)):
             raise ValueError("state bindings must be unique")
@@ -168,7 +183,13 @@ class RuntimeConfigUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_state_bindings(self) -> "RuntimeConfigUpdate":
-        expected = {"intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"}
+        expected = {
+            "intake_clarify",
+            "narrative_structure",
+            "slide_outline",
+            "ppt_sample",
+            "ppt_full",
+        }
         actual = [item.state for item in self.model_bindings]
         if len(actual) != len(set(actual)) or set(actual) != expected:
             raise ValueError("settings must include one binding for every generative state")

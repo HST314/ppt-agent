@@ -238,6 +238,60 @@ class ModelGateway:
             return "# 叙事结构\n\n## 核心观点\n让听众先看见结论，再理解证据，最后对下一步形成共识。\n\n## 叙事主线\n1. 为什么现在必须关注\n2. 发生了什么以及关键洞察\n3. 我们准备如何行动\n\n## 节奏与证据\n开场快速建立共同语境，中段用少量关键事实推动判断，结尾收束为明确行动。"
         if state == "slide_outline":
             return "# 逐页大纲\n\n## 第 1 页｜封面\n- 本页目的：建立主题与场合\n- 核心信息：演示主题与汇报人\n- 视觉方向：克制留白与清晰标题\n\n## 第 2 页｜结论先行\n- 本页目的：让听众立即理解核心判断\n- 核心信息：一句话主结论与三项支撑\n- 视觉方向：大数字与三列摘要\n\n## 第 3 页｜背景与机会\n- 本页目的：解释为什么现在需要行动\n- 核心信息：背景变化、机会窗口、潜在风险\n- 视觉方向：简洁趋势图\n\n## 第 4 页｜行动方案\n- 本页目的：形成下一步共识\n- 核心信息：责任、节奏与成功标准\n- 视觉方向：三阶段路线图"
+        if state == "ppt_full":
+            target_match = re.search(
+                r"FULL_DECK_TARGET_SLIDE_NUMBERS:\s*(\[[^\n]*\])",
+                prompt,
+            )
+            target_numbers = json.loads(target_match.group(1)) if target_match else [1]
+            pages_match = re.search(
+                r"FULL_DECK_SEGMENT_PAGES_JSON:\s*(\[[^\n]*\])",
+                prompt,
+            )
+            page_specs = json.loads(pages_match.group(1)) if pages_match else []
+            title_by_number = {
+                int((page.get("outline_ref") or {}).get("source_slide_number")): page.get("title")
+                for page in page_specs
+                if (page.get("outline_ref") or {}).get("source_slide_number") is not None
+            }
+            slides = [
+                {
+                    "slide_id": f"full-{number}",
+                    "title": title_by_number.get(number, f"第 {number} 页"),
+                    "source_slide_number": number,
+                }
+                for number in target_numbers
+            ]
+            sections = "".join(
+                f'<section class="slide{" is-active" if index == 0 else ""}" '
+                f'data-slide-id="{slide["slide_id"]}"><p class="eyebrow">FULL DECK</p>'
+                f'<h1>{slide["title"]}</h1><p>围绕已确认叙事推进第 {slide["source_slide_number"]} 页。</p>'
+                f'<footer>{slide["source_slide_number"]:02d}</footer></section>'
+                for index, slide in enumerate(slides)
+            )
+            segment_html = (
+                '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<title>全稿页段</title><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}'
+                'body{font-family:Arial,sans-serif;background:#edf4f8;color:#102a43}.slide{position:absolute;inset:0;display:none;padding:8vh 7vw}'
+                '.slide.is-active{display:grid;align-content:space-between}.eyebrow{font-weight:800;letter-spacing:.16em;color:#0f766e}'
+                'h1{font-size:clamp(38px,6vw,76px);max-width:1000px;margin:0}footer{font-size:20px;font-weight:800}'
+                '.nav{position:fixed;right:24px;bottom:20px;display:flex;gap:8px}.nav button{width:48px;height:44px}</style></head><body>'
+                + sections
+                + '<nav class="nav" aria-label="幻灯片导航"><button id="prev" aria-label="上一页">←</button><button id="next" aria-label="下一页">→</button></nav>'
+                '<script>const s=[...document.querySelectorAll(".slide")];let i=0;function go(n){s[i].classList.remove("is-active");i=(n+s.length)%s.length;s[i].classList.add("is-active")}prev.onclick=()=>go(i-1);next.onclick=()=>go(i+1);addEventListener("keydown",e=>{if(e.key==="ArrowLeft")go(i-1);if(e.key==="ArrowRight"||e.key===" ")go(i+1)})</script>'
+                '</body></html>'
+            )
+            return json.dumps({
+                "source_slide_numbers": target_numbers,
+                "entrypoint": "index.html",
+                "title": f"第 {target_numbers[0]}–{target_numbers[-1]} 页",
+                "slide_count": len(slides),
+                "slides": slides,
+                "files": [
+                    {"path": "index.html", "content": segment_html, "encoding": "utf-8"}
+                ],
+            }, ensure_ascii=False)
         match = re.search(r"SAMPLE_PAGE_COUNT:\s*(\d+)", prompt)
         page_count = int(match.group(1)) if match else 2
         preserved_match = re.search(r"PRESERVE_SOURCE_SLIDE_NUMBERS:\s*(\[[^\n]*\]|none)", prompt)

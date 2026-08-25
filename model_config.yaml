@@ -33,3 +33,12 @@ state_bindings:
     fallback_model: null
     base_url: https://ark.cn-beijing.volces.com/api/v3
     api_key_env: ARK_API_KEY
+  - state: ppt_full
+    model_role: reasoning_llm
+    provider: ark
+    model: deepseek-v4-flash-ga-260731
+    parameters:
+      max_tokens: 32768
+    fallback_model: null
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: ARK_API_KEY

@@ -12,7 +12,7 @@ def test_default_runtime_is_valid() -> None:
     runtime = ManagedRuntime(Path(__file__).parents[1])
 
     assert runtime.policy.stream_model_output is False
-    assert len(runtime.models.state_bindings) == 4
+    assert len(runtime.models.state_bindings) == 5
     assert runtime.policy.sample_page_count == 2
     assert runtime.policy.max_tool_rounds == 20
     assert {binding.provider for binding in runtime.models.state_bindings} == {"ark"}
@@ -22,6 +22,10 @@ def test_default_runtime_is_valid() -> None:
         "https://ark.cn-beijing.volces.com/api/v3"
     }
     assert runtime.models.binding_for("ppt_sample").parameters == {"max_tokens": 16_384}
+    assert runtime.models.binding_for("ppt_full").parameters == {"max_tokens": 32_768}
+    assert runtime.policy.full_deck_max_files == 384
+    assert runtime.policy.full_deck_max_file_bytes == 4_000_000
+    assert runtime.policy.full_deck_max_total_bytes == 50_000_000
     assert "api_key_env" not in runtime.public_context()["model_bindings"][0]
 
 

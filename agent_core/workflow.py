@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -10,6 +9,11 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from agent_core.full_deck_generation import (
+    FullDeckGenerationError,
+    generate_full_deck as run_full_deck_generation,
+    pending_full_deck_segments,
+)
 from agent_core.models import (
     DocumentRevision,
     FullDeck,
@@ -29,6 +33,13 @@ from agent_core.full_deck_composer import (
     FullDeckComposerError,
     normalized_page_content_graph,
 )
+from agent_core.workflow_support import (
+    current_full_deck_revision as _current_full_deck_revision,
+    generation_provenance,
+    outline_slide_catalog as _outline_slide_catalog,
+    package_model as _package_model,
+    stable_hash,
+)
 from configs.runtime import ManagedRuntime
 from model_router.client import ModelGateway, ModelOutputError, SYSTEM_MESSAGE
 from runtime.package_tool import DraftPackage, PackageToolError
@@ -43,11 +54,6 @@ from storage.project_store import (
 DocumentType = Literal["narrative_structure", "slide_outline"]
 SAMPLE_HTML_CHAR_BUDGET = 7_000
 SAMPLE_MAX_REPAIR_ATTEMPTS = 2
-OUTLINE_PAGE_HEADING = re.compile(
-    r"^\s{0,3}#{2,6}\s+第\s*(?P<number>\d+)\s*页(?:\s*[｜|:：—-]\s*(?P<title>.*?))?\s*$",
-    re.MULTILINE,
-)
-OUTLINE_FALLBACK_HEADING = re.compile(r"^\s{0,3}##\s+(?P<title>\S.*?)\s*$", re.MULTILINE)
 
 
 class WorkflowError(RuntimeError):
@@ -76,29 +82,6 @@ class _SlideMarkupParser(HTMLParser):
         classes = set((attributes.get("class") or "").split())
         if "slide" in classes:
             self.slide_ids.append(attributes.get("data-slide-id"))
-
-
-def _outline_slide_catalog(markdown: str) -> list[dict[str, Any]]:
-    matches = list(OUTLINE_PAGE_HEADING.finditer(markdown))
-    if matches:
-        catalog = [
-            {
-                "source_slide_number": int(match.group("number")),
-                "title": (match.group("title") or f"第 {match.group('number')} 页").strip(),
-            }
-            for match in matches
-        ]
-    else:
-        # Existing projects may predate the numbered-outline contract. Treat
-        # their level-two headings as ordered pages so they remain editable.
-        catalog = [
-            {"source_slide_number": index, "title": match.group("title").strip()}
-            for index, match in enumerate(OUTLINE_FALLBACK_HEADING.finditer(markdown), start=1)
-        ]
-    numbers = [item["source_slide_number"] for item in catalog]
-    if not numbers or len(numbers) != len(set(numbers)):
-        raise WorkflowError("approved outline must contain uniquely numbered slide headings")
-    return catalog
 
 
 def _package_slide_ids(draft: DraftPackage) -> list[str]:
@@ -220,30 +203,6 @@ def _validate_package_output(
     return output
 
 
-def stable_hash(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _package_model(package: dict[str, Any]) -> HtmlPptPackage:
-    """Discard storage-only file metadata at the immutable package boundary."""
-
-    return HtmlPptPackage.model_validate({
-        key: value
-        for key, value in package.items()
-        if key in {"entrypoint", "title", "slide_count", "slides", "package_hash"}
-    } | {
-        "files": [
-            {
-                key: value
-                for key, value in item.items()
-                if key in {"path", "content", "encoding", "media_type", "origin"}
-            }
-            for item in package.get("files", [])
-        ],
-    })
-
-
 def _initialize_full_deck(
     outline: dict[str, Any],
     sample: dict[str, Any],
@@ -338,29 +297,6 @@ def _initialize_full_deck(
     return root, revision
 
 
-def generation_provenance(skill_index: list[dict[str, str]], traces: list[dict[str, Any]], output: str) -> dict[str, Any]:
-    skill_reads = sorted(
-        (
-            {
-                "path": trace["path"],
-                "content_hash": trace["content_hash"],
-                "offset": trace["offset"],
-                "end": trace["end"],
-            }
-            for trace in traces
-            if trace.get("type") == "tool_call" and trace.get("tool") == "read"
-        ),
-        key=lambda item: (item["path"], item["content_hash"], item["offset"], item["end"]),
-    )
-    return {
-        "skill_index": skill_index,
-        "skills_hash": stable_hash(skill_index),
-        "skill_reads": skill_reads,
-        "skill_reads_hash": stable_hash(skill_reads),
-        "output_hash": "sha256:" + hashlib.sha256(output.encode()).hexdigest(),
-    }
-
-
 def _current_sample(manifest: dict[str, Any]) -> dict[str, Any] | None:
     current_hash = manifest.get("current_sample_revision_hash")
     return next(
@@ -369,18 +305,6 @@ def _current_sample(manifest: dict[str, Any]) -> dict[str, Any] | None:
             if item.get("revision_hash") == current_hash
         ),
         (manifest.get("samples") or [None])[-1],
-    )
-
-
-def _current_full_deck_revision(manifest: dict[str, Any]) -> dict[str, Any] | None:
-    root = manifest.get("full_deck") or {}
-    current_hash = root.get("current_revision_hash")
-    return next(
-        (
-            item for item in manifest.get("full_deck_revisions", [])
-            if item.get("revision_hash") == current_hash
-        ),
-        None,
     )
 
 
@@ -409,7 +333,7 @@ def _sample_can_enter_full_deck(
             item["source_slide_number"]
             for item in _outline_slide_catalog(outline["markdown_body"])
         }
-    except (KeyError, WorkflowError):
+    except (KeyError, ValueError, WorkflowError):
         return False
     return set(numbers).issubset(outline_numbers)
 
@@ -509,6 +433,7 @@ class Workflow:
         skills_hash: str,
         json_mode: bool = False,
         parent_prompt_call_id: str | None = None,
+        audit_context: dict[str, Any] | None = None,
     ) -> str:
         self.gateway.last_messages = None
         binding = self.runtime.models.binding_for(state)
@@ -531,6 +456,7 @@ class Workflow:
                 "provider": binding.provider,
                 "model": binding.model,
                 "parameters": parameters,
+                **(audit_context or {}),
             },
             parent_prompt_call_id=parent_prompt_call_id,
         )
@@ -1150,6 +1076,18 @@ class Workflow:
             if str(exc) == "stale_revision":
                 raise ConflictError("stale_revision:工程已更新，请刷新后重试。") from exc
             raise
+
+    def generate_full_deck(
+        self,
+        checkpoint_id: str,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        return run_full_deck_generation(
+            self,
+            checkpoint_id,
+            cancel_requested=cancel_requested,
+        )
 
     def restore_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
         """Move the current sample pointer without creating a new revision."""

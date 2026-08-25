@@ -301,5 +301,100 @@ class PromptAuditMixin:
             })
         return result
 
+    def full_deck_attempts(self) -> list[dict[str, Any]]:
+        """Return the newest full-deck generation's segment/repair audit summary."""
+
+        self._ensure_database()
+        with self._connect() as connection:
+            latest = connection.execute(
+                """
+                SELECT parameters_json FROM prompt_calls
+                WHERE state = 'ppt_full'
+                ORDER BY started_at DESC, prompt_call_id DESC LIMIT 1
+                """
+            ).fetchone()
+            if latest is None:
+                return []
+            latest_parameters = json.loads(latest["parameters_json"])
+            generation_id = latest_parameters.get("generation_id")
+            if not generation_id:
+                return []
+            rows = connection.execute(
+                """
+                SELECT prompt_call_id, parent_prompt_call_id, status, messages_json,
+                       parameters_json, started_at, completed_at, error_json,
+                       output_ref
+                FROM prompt_calls
+                WHERE state = 'ppt_full'
+                  AND json_extract(parameters_json, '$.generation_id') = ?
+                ORDER BY started_at, prompt_call_id LIMIT 240
+                """,
+                (generation_id,),
+            ).fetchall()
+        decoded: list[tuple[Any, dict[str, Any]]] = []
+        for row in rows:
+            parameters = json.loads(row["parameters_json"]) if row["parameters_json"] else {}
+            decoded.append((row, parameters))
+        attempt_by_segment: dict[str, int] = {}
+        result: list[dict[str, Any]] = []
+        for row, parameters in decoded:
+            target = parameters.get("target_slide_numbers") or []
+            segment_key = ",".join(str(number) for number in target)
+            attempt_by_segment[segment_key] = attempt_by_segment.get(segment_key, 0) + 1
+            messages = json.loads(row["messages_json"]) if row["messages_json"] else []
+            declared_tool_calls = [
+                call
+                for message in messages
+                if message.get("role") == "assistant"
+                for call in (message.get("tool_calls") or [])
+            ]
+            error = json.loads(row["error_json"]) if row["error_json"] else None
+            published = row["status"] == "completed" and bool(row["output_ref"])
+            if published:
+                reason = "页段通过契约校验，完整全稿已通过 Composer 发布。"
+            elif row["status"] == "started":
+                reason = "页段正在生成，尚未进入最终组装。"
+            elif row["status"] == "conflicted":
+                reason = "组装完成时工程版本已变化，因此未发布。"
+            elif error and error.get("code") in {
+                "full_deck_segment_invalid",
+                "full_deck_target_mismatch",
+                "full_deck_composition_failed",
+                "full_deck_package_invalid",
+            }:
+                reason = " ".join(
+                    str(error.get("message") or "页段未通过契约校验。").split()
+                )[:300]
+            else:
+                reason = "页段生成未完成，因此未发布全稿。"
+            result.append({
+                "attempt": attempt_by_segment[segment_key],
+                "prompt_call_id": row["prompt_call_id"],
+                "status": row["status"],
+                "published": published,
+                "reason": reason,
+                "failure_code": (error or {}).get("code"),
+                "target_slide_numbers": target,
+                "segment_range": (
+                    f"{target[0]}–{target[-1]} 页" if target else "未知页段"
+                ),
+                "tool_rounds": sum(
+                    bool(message.get("tool_calls"))
+                    for message in messages
+                    if message.get("role") == "assistant"
+                ),
+                "tool_call_count": len(declared_tool_calls),
+                "skill_read_count": sum(
+                    (call.get("function") or {}).get("name") == "read"
+                    for call in declared_tool_calls
+                ),
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "provider": parameters.get("provider"),
+                "model": parameters.get("model"),
+                "composer_version": parameters.get("composer_version"),
+            })
+        return result
+
     def export_prompt_calls_jsonl(self) -> str:
         return "".join(json_text(item) + "\n" for item in self.prompt_calls())

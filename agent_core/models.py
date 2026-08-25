@@ -133,7 +133,9 @@ class PackageSlide(StrictModel):
 
 class PackageFile(StrictModel):
     path: str = Field(min_length=1, max_length=240)
-    content: str = Field(min_length=1, max_length=3_000_000)
+    # Base64 expands binary resources by roughly one third. Keep this string
+    # ceiling above the configurable 8 MB raw-file maximum.
+    content: str = Field(min_length=1, max_length=12_000_000)
     encoding: Literal["utf-8", "base64"] = "utf-8"
     media_type: str = Field(default="application/octet-stream", min_length=1, max_length=160)
     origin: str = Field(default="model_output", min_length=1, max_length=500)
@@ -163,7 +165,7 @@ class HtmlPptPackage(StrictModel):
     title: str = Field(min_length=1, max_length=160)
     slide_count: int = Field(ge=1, le=80)
     slides: list[PackageSlide] = Field(min_length=1, max_length=80)
-    files: list[PackageFile] = Field(min_length=1, max_length=96)
+    files: list[PackageFile] = Field(min_length=1, max_length=512)
     package_hash: str | None = Field(default=None, pattern=r"^sha256:[a-f0-9]{64}$")
 
     @model_validator(mode="after")
@@ -177,7 +179,10 @@ class HtmlPptPackage(StrictModel):
             raise ValueError("slide_count must match slides")
         if len({item.slide_id for item in self.slides}) != len(self.slides):
             raise ValueError("slide_id values must be unique")
-        if sum(len(item.content_bytes()) for item in self.files) > 15_000_000:
+        # Workflow-specific DraftPackage limits keep samples at 96 files / 15 MB.
+        # The immutable package model also carries composed full decks, whose
+        # explicit runtime ceiling is intentionally higher.
+        if sum(len(item.content_bytes()) for item in self.files) > 64_000_000:
             raise ValueError("package exceeds the total size limit")
         expected = self.content_hash()
         if self.package_hash is not None and self.package_hash != expected:

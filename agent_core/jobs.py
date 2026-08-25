@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at TEXT,
     finished_at TEXT,
     error_json TEXT,
-    owner_pid INTEGER
+    owner_pid INTEGER,
+    cancellable INTEGER NOT NULL DEFAULT 0,
+    cancel_requested INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS jobs_project_time_idx ON jobs(project_id, created_at, job_id);
 CREATE INDEX IF NOT EXISTS jobs_dedup_idx ON jobs(project_id, operation, checkpoint_id, status);
@@ -97,6 +99,14 @@ class JobRegistry:
             }
             if "owner_pid" not in columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN owner_pid INTEGER")
+            if "cancellable" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN cancellable INTEGER NOT NULL DEFAULT 0"
+                )
+            if "cancel_requested" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -106,6 +116,8 @@ class JobRegistry:
     def _record(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item.pop("owner_pid", None)
+        item["cancellable"] = bool(item.get("cancellable"))
+        item["cancel_requested"] = bool(item.get("cancel_requested"))
         item["error"] = json.loads(item.pop("error_json")) if item.get("error_json") else None
         return item
 
@@ -128,14 +140,17 @@ class JobRegistry:
             """
             INSERT INTO jobs(
                 job_id, project_id, operation, checkpoint_id, status,
-                created_at, started_at, finished_at, error_json, owner_pid
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, started_at, finished_at, error_json, owner_pid,
+                cancellable, cancel_requested
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
                 status = excluded.status,
                 started_at = excluded.started_at,
                 finished_at = excluded.finished_at,
                 error_json = excluded.error_json,
-                owner_pid = excluded.owner_pid
+                owner_pid = excluded.owner_pid,
+                cancellable = excluded.cancellable,
+                cancel_requested = MAX(jobs.cancel_requested, excluded.cancel_requested)
             """,
             (
                 record["job_id"], record["project_id"], record["operation"],
@@ -143,6 +158,8 @@ class JobRegistry:
                 record.get("started_at"), record.get("finished_at"),
                 json.dumps(record.get("error"), ensure_ascii=False) if record.get("error") else None,
                 record.get("_owner_pid"),
+                int(bool(record.get("cancellable"))),
+                int(bool(record.get("cancel_requested"))),
             ),
         )
 
@@ -189,11 +206,17 @@ class JobRegistry:
                 record = self._record(row)
                 if process_is_alive(row["owner_pid"]):
                     continue
-                record.update(
-                    status="failed",
-                    finished_at=utc_now(),
-                    error={"code": "process_restarted", "message": "服务重启，请从上一成功点重试。"},
-                )
+                if record.get("cancellable") and record.get("cancel_requested"):
+                    record.update(status="cancelled", finished_at=utc_now(), error=None)
+                else:
+                    record.update(
+                        status="failed",
+                        finished_at=utc_now(),
+                        error={
+                            "code": "process_restarted",
+                            "message": "服务重启，请从上一成功点重试。",
+                        },
+                    )
                 self._upsert(connection, record)
                 self._insert_event(connection, record)
 
@@ -217,7 +240,9 @@ class JobRegistry:
         project_id: str,
         operation: str,
         checkpoint_id: str,
-        action: Callable[[], Any],
+        action: Callable[..., Any],
+        *,
+        cancellable: bool = False,
     ) -> dict[str, Any]:
         with self.lock, self._transaction() as connection:
             row = connection.execute(
@@ -242,6 +267,8 @@ class JobRegistry:
                 "finished_at": None,
                 "error": None,
                 "_owner_pid": os.getpid(),
+                "cancellable": cancellable,
+                "cancel_requested": False,
             }
             self._upsert(connection, record)
             self._insert_event(connection, record)
@@ -253,14 +280,32 @@ class JobRegistry:
             self._upsert(connection, record)
             self._insert_event(connection, record)
 
-    def _run(self, record: dict[str, Any], action: Callable[[], Any]) -> None:
+    def _cancel_requested(self, job_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT cancel_requested FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def _run(self, record: dict[str, Any], action: Callable[..., Any]) -> None:
         record.update(status="running", started_at=utc_now())
         self._write(record)
         try:
-            action()
+            if record.get("cancellable"):
+                action(lambda: self._cancel_requested(record["job_id"]))
+            else:
+                action()
             record["status"] = "succeeded"
+        except JobCancelled:
+            record.update(
+                status="cancelled",
+                cancel_requested=True,
+                error=None,
+            )
         except Exception as exc:
             record.update(status="failed", error=public_job_error(exc))
+        record["cancel_requested"] = self._cancel_requested(record["job_id"])
         record["finished_at"] = utc_now()
         self._write(record)
 
@@ -323,11 +368,30 @@ class JobRegistry:
         if record["status"] not in {"queued", "running"}:
             return record
         future = self.futures.get(job_id)
-        if not future or not future.cancel():
+        if future and future.cancel():
+            record.update(
+                status="cancelled",
+                finished_at=utc_now(),
+                error=None,
+                cancel_requested=True,
+            )
+            self._write(record)
+            return record
+        if not record.get("cancellable"):
             raise RuntimeError("running jobs cannot be interrupted safely")
-        record.update(status="cancelled", finished_at=utc_now(), error=None)
-        self._write(record)
-        return record
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET cancel_requested = 1 WHERE job_id = ?",
+                (job_id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO job_events(job_id, at, status, operation, error_json)
+                VALUES(?, ?, 'cancellation_requested', ?, NULL)
+                """,
+                (job_id, utc_now(), record["operation"]),
+            )
+        return self.get(job_id)
 
     def events(self, job_id: str) -> list[dict[str, Any]]:
         self.get(job_id)
@@ -348,3 +412,7 @@ class JobRegistry:
             }
             for row in rows
         ]
+
+
+class JobCancelled(RuntimeError):
+    """A cooperative job stopped before publishing any project mutation."""
