@@ -10,6 +10,18 @@ from agent_core.jobs import JobRegistry
 from configs.runtime import ManagedRuntime
 
 
+def finish_job(client: TestClient, response) -> dict:
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    for _ in range(100):
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["status"] not in {"queued", "running"}:
+            break
+        time.sleep(0.01)
+    assert job["status"] == "succeeded", job
+    return job
+
+
 def test_api_drives_project_to_narrative(
     tmp_path: Path,
     monkeypatch,
@@ -70,6 +82,101 @@ def test_api_rejects_unknown_request_fields(tmp_path: Path, monkeypatch) -> None
     assert response.status_code == 422
 
 
+def test_api_requires_feedback_only_for_sample_revision(tmp_path: Path, monkeypatch) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    client = TestClient(main_front.app)
+
+    missing = client.post("/api/projects/not-created/jobs", json={
+        "operation": "revise_sample",
+        "checkpoint_id": "checkpoint_value",
+    })
+    misplaced = client.post("/api/projects/not-created/jobs", json={
+        "operation": "generate_sample",
+        "checkpoint_id": "checkpoint_value",
+        "feedback": "should not be accepted",
+    })
+
+    assert missing.status_code == 422
+    assert misplaced.status_code == 422
+
+
+def test_api_drives_sample_generation_feedback_and_approval(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    client = TestClient(main_front.app)
+    project_id = "sample-api"
+
+    project = client.post("/api/projects", json={
+        "project_id": project_id,
+        "task_card": {"title": "样品演示", "objective": "确认视觉方向"},
+    }).json()
+    finish_job(client, client.post(f"/api/projects/{project_id}/jobs", json={
+        "operation": "start_clarification",
+        "checkpoint_id": project["checkpoint_id"],
+    }))
+    project = client.get(f"/api/projects/{project_id}").json()
+    card = project["question_card"]
+    project = client.post(f"/api/projects/{project_id}/clarification", json={
+        "checkpoint_id": project["checkpoint_id"],
+        "question_card_id": card["question_card_id"],
+        "answers": {question["question_id"]: "answer" for question in card["questions"]},
+    }).json()
+
+    for operation, document_type in (
+        ("generate_narrative", "narrative_structure"),
+        ("generate_outline", "slide_outline"),
+    ):
+        finish_job(client, client.post(f"/api/projects/{project_id}/jobs", json={
+            "operation": operation,
+            "checkpoint_id": project["checkpoint_id"],
+        }))
+        project = client.get(f"/api/projects/{project_id}").json()
+        document = project["documents"][document_type][-1]
+        project = client.post(f"/api/projects/{project_id}/documents/{document_type}/approve", json={
+            "checkpoint_id": project["checkpoint_id"],
+            "revision_hash": document["revision_hash"],
+        }).json()
+
+    assert project["state"] == "ppt_sample"
+    assert project["sample_page_count"] == 2
+    finish_job(client, client.post(f"/api/projects/{project_id}/jobs", json={
+        "operation": "generate_sample",
+        "checkpoint_id": project["checkpoint_id"],
+    }))
+    project = client.get(f"/api/projects/{project_id}").json()
+    assert len(project["samples"][-1]["pages"]) == 2
+
+    finish_job(client, client.post(f"/api/projects/{project_id}/jobs", json={
+        "operation": "revise_sample",
+        "checkpoint_id": project["checkpoint_id"],
+        "feedback": "标题更有冲击力，减少辅助文字",
+    }))
+    project = client.get(f"/api/projects/{project_id}").json()
+    revised = project["samples"][-1]
+    assert len(project["samples"]) == 1
+    assert revised["revision"] == 2
+    assert revised["feedback"] == "标题更有冲击力，减少辅助文字"
+
+    approved = client.post(f"/api/projects/{project_id}/samples/approve", json={
+        "checkpoint_id": project["checkpoint_id"],
+        "revision_hash": revised["revision_hash"],
+    })
+    assert approved.status_code == 200
+    assert approved.json()["phase"] == "completed"
+    sample_snapshot = next(
+        item for item in approved.json()["progress_snapshots"] if item["stage"] == "ppt_sample"
+    )
+    assert "html" not in sample_snapshot["snapshot"]["samples"][-1]["pages"][0]
+
+
 def test_api_updates_runtime_and_switches_branches(tmp_path: Path, monkeypatch) -> None:
     app_root = tmp_path / "app"
     app_root.mkdir()
@@ -85,6 +192,7 @@ def test_api_updates_runtime_and_switches_branches(tmp_path: Path, monkeypatch) 
 
     context = client.get("/api/runtime-context").json()
     context["model_bindings"][2]["model"] = "outline-preview-v2"
+    context["policy"]["sample_page_count"] = 3
     update = client.put("/api/runtime-context", json={
         "model_config_id": "api-editable",
         "model_bindings": context["model_bindings"],
@@ -92,12 +200,14 @@ def test_api_updates_runtime_and_switches_branches(tmp_path: Path, monkeypatch) 
     })
     assert update.status_code == 200
     assert update.json()["model_bindings"][2]["model"] == "outline-preview-v2"
+    assert update.json()["policy"]["sample_page_count"] == 3
     assert "api_key_env" not in update.json()["model_bindings"][2]
 
     project = client.post("/api/projects", json={
         "project_id": "branch-demo",
         "task_card": {"title": "分支演示", "objective": "验证切换"},
     }).json()
+    assert project["sample_page_count"] == 3
     main_head = project["checkpoint_id"]
     created = client.post("/api/projects/branch-demo/branches", json={
         "checkpoint_id": main_head,

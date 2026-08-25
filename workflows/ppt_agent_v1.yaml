@@ -4,12 +4,14 @@ states:
   - intake_clarify
   - narrative_structure
   - slide_outline
+  - ppt_sample
 terminal_states:
-  - slide_outline
+  - ppt_sample
   - blocked
   - cancelled
 transitions:
   intake: [intake_clarify]
   intake_clarify: [narrative_structure]
   narrative_structure: [slide_outline]
-  slide_outline: []
+  slide_outline: [ppt_sample]
+  ppt_sample: []

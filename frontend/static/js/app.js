@@ -1,5 +1,6 @@
 import { api } from "./api.js";
 import { renderMarkdown } from "./markdown.js";
+import { hydrateSampleFrame as hydrateFrame, readySampleBody, sampleBody, selectSamplePage as selectPage } from "./samples.js";
 
 const icons = {
   file: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 13h6M9 17h5"/></svg>',
@@ -12,7 +13,7 @@ const STAGES = [
   { id: "intake_clarify", label: "澄清问题" },
   { id: "narrative_structure", label: "叙事结构" },
   { id: "slide_outline", label: "逐页大纲" },
-  { id: "ppt_sample", label: "PPT 样品", future: true },
+  { id: "ppt_sample", label: "PPT 样品" },
   { id: "ppt_full", label: "PPT 全稿", future: true },
   { id: "acceptance", label: "确认验收", future: true },
 ];
@@ -22,6 +23,7 @@ const STATE_LABELS = {
   intake_clarify: "澄清问题",
   narrative_structure: "叙事结构",
   slide_outline: "逐页大纲",
+  ppt_sample: "PPT 样品",
 };
 
 const PHASE_LABELS = {
@@ -36,6 +38,7 @@ const MODEL_STATE_LABELS = {
   intake_clarify: "澄清问题",
   narrative_structure: "叙事结构",
   slide_outline: "逐页大纲",
+  ppt_sample: "PPT 样品",
 };
 
 const EVENT_LABELS = {
@@ -45,13 +48,17 @@ const EVENT_LABELS = {
   document_generated: "生成文档",
   document_revised: "保存文档修订",
   document_approved: "确认文档",
+  sample_stage_started: "进入样品阶段",
+  sample_generated: "生成 PPT 样品",
+  sample_revised: "根据意见修改样品",
+  sample_approved: "确认 PPT 样品",
   branch_created: "创建分支",
   branch_switched: "切换分支",
 };
 
 const state = {
   projects: [], project: null, branches: null, runtime: null,
-  view: "workspace", busy: false, focusStage: null,
+  view: "workspace", busy: false, focusStage: null, samplePageIndex: 0,
 };
 
 const content = document.querySelector("#content");
@@ -98,8 +105,12 @@ function currentDocument(type) {
   return history.at(-1) || null;
 }
 
+function currentSample() {
+  return state.project?.samples?.at(-1) || null;
+}
+
 function activeStageIndex(project = state.project) {
-  return { intake: 0, intake_clarify: 1, narrative_structure: 2, slide_outline: 3 }[project?.state] ?? 0;
+  return { intake: 0, intake_clarify: 1, narrative_structure: 2, slide_outline: 3, ppt_sample: 4 }[project?.state] ?? 0;
 }
 
 function stageSnapshotMap(project = state.project) {
@@ -113,6 +124,9 @@ function jobLabel(operation) {
     generate_outline: "生成逐页大纲",
     regenerate_narrative: "重新生成叙事结构",
     regenerate_outline: "重新生成逐页大纲",
+    generate_sample: "生成 PPT 样品",
+    regenerate_sample: "重新生成 PPT 样品",
+    revise_sample: "根据修改意见调整 PPT 样品",
   })[operation] || "执行后台任务";
 }
 
@@ -141,10 +155,11 @@ function progressCard() {
   const project = state.project;
   const active = activeStageIndex();
   const outlineApproved = currentDocument("slide_outline")?.status === "approved";
+  const sampleApproved = currentSample()?.status === "approved";
   const snapshots = stageSnapshotMap(project);
   const steps = STAGES.map((stage, index) => {
-    const done = index < active || (index === 3 && outlineApproved);
-    const current = index === active && !(index === 3 && outlineApproved);
+    const done = index < active || (index === 3 && outlineApproved) || (index === 4 && sampleApproved);
+    const current = index === active && !(index === 3 && outlineApproved && state.project.state === "slide_outline") && !(index === 4 && sampleApproved);
     const snapshot = snapshots.get(stage.id);
     const viewable = Boolean(snapshot && !stage.future);
     const classes = ["step", done ? "is-done" : "", current ? "is-current" : "", viewable ? "is-viewable step--interactive" : ""].filter(Boolean).join(" ");
@@ -197,13 +212,47 @@ function documentView(type) {
   if (!document) return readyDocumentView(type);
   const narrative = type === "narrative_structure";
   const approved = document.status === "approved";
-  const complete = !narrative && approved;
-  const callout = complete ? '<div class="callout"><strong>一期制作完成。</strong> 逐页大纲已确认，可作为后续 PPT 样品制作的输入。</div>' : "";
+  const legacyComplete = !narrative && approved && state.project.state === "slide_outline" && state.project.phase === "completed";
+  const callout = legacyComplete ? '<div class="callout"><strong>逐页大纲已确认。</strong> 现在可以继续生成 PPT 样品。</div>' : "";
+  const continueAction = narrative
+    ? '<button class="btn btn--primary" data-action="continue_outline">查看逐页大纲</button>'
+    : state.project.capabilities?.includes("start_sample_stage")
+      ? '<button class="btn btn--primary" data-action="enter_sample">进入 PPT 样品</button>'
+      : state.project.state === "ppt_sample"
+        ? '<button class="btn btn--primary" data-action="continue_sample">查看 PPT 样品</button>'
+        : "";
   const actions = approved
-    ? `<div class="sticky-actions"><p>编辑会创建新修订，并使该阶段确认${narrative ? "及下游大纲" : ""}失效。</p><div class="button-row"><button class="btn btn--secondary" data-action="edit_document" data-type="${type}">编辑此修订</button>${narrative ? '<button class="btn btn--primary" data-action="continue_outline">查看逐页大纲</button>' : ""}</div></div>`
+    ? `<div class="sticky-actions"><p>编辑会创建新修订，并使该阶段确认${narrative ? "及下游产物" : "及 PPT 样品"}失效。</p><div class="button-row"><button class="btn btn--secondary" data-action="edit_document" data-type="${type}">编辑此修订</button>${continueAction}</div></div>`
     : `<div class="sticky-actions"><p>保存编辑会创建新修订；重新生成会保留当前版本历史。</p><div class="button-row"><button class="btn btn--secondary" data-action="regenerate_document" data-type="${type}">重新生成</button><button class="btn btn--secondary" data-action="edit_document" data-type="${type}">编辑</button><button class="btn btn--primary" data-action="approve_document" data-type="${type}">确认并继续</button></div></div>`;
   const status = `<div class="document-status"><span class="badge ${approved ? "badge--success" : "badge--warning"}">${approved ? "已确认" : "待确认"}</span><span class="badge badge--info">修订 ${document.revision}</span></div>`;
   return stagePanel(narrative ? "叙事结构" : "逐页大纲", narrative ? "故事如何推进" : "每一页讲什么", `${callout}<article class="document">${renderMarkdown(document.markdown_body)}</article>${actions}`, status);
+}
+
+function samplePageCount() {
+  return state.project?.sample_page_count || state.runtime?.policy?.sample_page_count || 2;
+}
+
+function readySampleView() {
+  const count = samplePageCount();
+  const preview = readySampleBody(count, icons.spark);
+  return stagePanel("PPT 样品", "确认视觉语言、信息层级与版式方向", preview, `<span class="badge badge--warning">${count} 页 · 待生成</span>`);
+}
+
+function hydrateSampleFrame() {
+  hydrateFrame(content, currentSample(), state.samplePageIndex);
+}
+
+function selectSamplePage(index) {
+  const sample = currentSample();
+  if (selectPage(content, sample, index)) state.samplePageIndex = index;
+}
+
+function sampleView() {
+  const sample = currentSample();
+  if (!sample) return readySampleView();
+  const view = sampleBody(sample, state.samplePageIndex, escapeHtml);
+  state.samplePageIndex = view.pageIndex;
+  return stagePanel("PPT 样品", "在大画框中检查代表性页面，再用自然语言让 AI 调整", view.body, view.status);
 }
 
 function loadingPanel(message) {
@@ -215,22 +264,24 @@ function workspaceMarkup() {
   let stage;
   if (state.focusStage === "narrative_structure" && currentDocument("narrative_structure")) stage = documentView("narrative_structure");
   else if (state.focusStage === "slide_outline" && currentDocument("slide_outline")) stage = documentView("slide_outline");
+  else if (state.focusStage === "ppt_sample" && currentSample()) stage = sampleView();
   else if (state.project.active_job) stage = loadingPanel(`正在${jobLabel(state.project.active_job.operation)}…`);
   else if (state.project.state === "intake") stage = intakeView();
   else if (state.project.state === "intake_clarify") stage = clarificationView();
   else if (state.project.state === "narrative_structure") stage = state.project.phase === "ready_to_generate" ? readyDocumentView("narrative_structure") : documentView("narrative_structure");
-  else stage = state.project.phase === "ready_to_generate" ? readyDocumentView("slide_outline") : documentView("slide_outline");
+  else if (state.project.state === "slide_outline") stage = state.project.phase === "ready_to_generate" ? readyDocumentView("slide_outline") : documentView("slide_outline");
+  else stage = state.project.phase === "ready_to_generate" ? readySampleView() : sampleView();
   return `${progressCard()}<div class="workspace">${stage}</div>`;
 }
 
 function welcomeMarkup() {
-  return `<div class="hero"><section class="panel hero__main"><p class="eyebrow">Presentation workspace</p><h1>从想法到逐页大纲</h1><p>PPT Agent 把关键决策留给你，把叙事组织交给 Agent。澄清、生成、编辑、确认和分支都保存在可恢复检查点中。</p><button class="btn btn--primary" data-action="new_project">新建 PPT 工程</button></section><aside class="panel hero__aside"><div><span class="stat-label">一期范围</span><div class="stat-value">4 个阶段</div></div><div class="hint">任务卡 → 澄清问题 → 叙事结构 → 逐页大纲</div></aside></div>`;
+  return `<div class="hero"><section class="panel hero__main"><p class="eyebrow">Presentation workspace</p><h1>从想法到可视化样品</h1><p>PPT Agent 把关键决策留给你，把叙事组织与样品设计交给 Agent。澄清、生成、编辑、确认和分支都保存在可恢复检查点中。</p><button class="btn btn--primary" data-action="new_project">新建 PPT 工程</button></section><aside class="panel hero__aside"><div><span class="stat-label">当前范围</span><div class="stat-value">5 个阶段</div></div><div class="hint">任务卡 → 澄清问题 → 叙事结构 → 逐页大纲 → PPT 样品</div></aside></div>`;
 }
 
 function settingsMarkup(ctx) {
   const cards = ctx.model_bindings.map((binding) => `<article class="model-card" data-model-state="${binding.state}"><div class="model-card__head"><div><h3>${escapeHtml(MODEL_STATE_LABELS[binding.state] || binding.state)}</h3><small>${escapeHtml(binding.state)}</small></div><span class="badge badge--info">推理模型</span></div><div class="field"><label for="provider-${binding.state}">Provider</label><input class="input" id="provider-${binding.state}" data-field="provider" list="provider-options" required value="${escapeHtml(binding.provider)}"></div><div class="field"><label for="model-${binding.state}">模型</label><input class="input" id="model-${binding.state}" data-field="model" required value="${escapeHtml(binding.model)}"></div><div class="field"><label for="base-url-${binding.state}">Base URL</label><input class="input" id="base-url-${binding.state}" data-field="base_url" type="url" placeholder="https://api.openai.com/v1" value="${escapeHtml(binding.base_url || "")}"><small>留空时使用 SDK 默认地址。</small></div><div class="field"><label for="fallback-${binding.state}">备用模型</label><input class="input" id="fallback-${binding.state}" data-field="fallback_model" value="${escapeHtml(binding.fallback_model || "")}" placeholder="可选"></div><div class="field"><label for="parameters-${binding.state}">调用参数（JSON）</label><textarea class="input json-input" id="parameters-${binding.state}" data-field="parameters" spellcheck="false">${escapeHtml(JSON.stringify(binding.parameters || {}, null, 2))}</textarea></div></article>`).join("");
   const p = ctx.policy;
-  return `<div class="page-head"><div><p class="eyebrow">Runtime configuration</p><h1>设置</h1><p class="lede">模型路由与运行策略会写回配置文件并立即生效；密钥值始终只从环境变量读取。</p></div><span class="badge badge--success">可编辑</span></div><form id="settings-form"><section class="panel section ia-section"><div class="section__head"><div><h2>模型配置</h2><p>每个一期阶段可独立选择 Provider、模型、服务地址与调用参数。</p></div><div class="field" style="margin:0;min-width:210px"><label for="model-config-id">配置 ID</label><input class="input" id="model-config-id" name="model_config_id" required value="${escapeHtml(ctx.model_config_id)}"></div></div><datalist id="provider-options"><option value="mock"><option value="openai"><option value="azure"><option value="openai-compatible"></datalist><div class="settings-grid">${cards}</div></section><section class="panel section ia-section"><div class="section__head"><div><h2>运行策略</h2><p>控制澄清预算、工具轮次、超时和 Skill 读取预算。</p></div><span class="badge badge--info">runtime.yaml</span></div><div class="settings-field-grid"><div class="field"><label for="max-auto-questions">单轮自动提问上限</label><input class="input" id="max-auto-questions" name="max_auto_questions" type="number" min="0" max="8" required value="${p.max_auto_questions}"></div><div class="field"><label for="clarification-budget">澄清问题总预算</label><input class="input" id="clarification-budget" name="clarification_total_budget" type="number" min="0" max="30" required value="${p.clarification_total_budget}"></div><div class="field"><label for="question-preference">提问偏好</label><select class="input" id="question-preference" name="question_preference"><option value="proactive" ${p.question_preference === "proactive" ? "selected" : ""}>主动澄清</option><option value="minimal" ${p.question_preference === "minimal" ? "selected" : ""}>最少提问</option><option value="none" ${p.question_preference === "none" ? "selected" : ""}>不主动提问</option></select></div><div class="field"><label for="model-timeout">模型超时（秒）</label><input class="input" id="model-timeout" name="model_timeout_seconds" type="number" min="1" max="600" step="1" required value="${p.model_timeout_seconds}"></div><div class="field"><label for="max-tool-rounds">最大工具轮次</label><input class="input" id="max-tool-rounds" name="max_tool_rounds" type="number" min="0" max="20" required value="${p.max_tool_rounds}"></div><div class="field"><label for="read-per-call">单次读取上限（字符）</label><input class="input" id="read-per-call" name="max_read_chars_per_call" type="number" min="100" max="100000" required value="${p.max_read_chars_per_call}"></div><div class="field"><label for="read-per-job">单任务读取上限（字符）</label><input class="input" id="read-per-job" name="max_read_chars_per_job" type="number" min="100" max="500000" required value="${p.max_read_chars_per_job}"></div></div><div class="config-hashes"><div class="hint"><strong>运行配置哈希</strong><div class="code">${escapeHtml(ctx.runtime_hash)}</div></div><div class="hint"><strong>模型配置哈希</strong><div class="code">${escapeHtml(ctx.model_hash)}</div></div></div></section><section class="panel section ia-section"><div class="section__head"><div><h2>Agent 权限与 Skills</h2><p>${escapeHtml(ctx.read_permission)}</p></div><span class="badge badge--info">只读</span></div><div class="question-list">${ctx.skills.map((skill) => `<div class="question-card"><strong>${escapeHtml(skill.name)}</strong><p class="question-impact">${escapeHtml(skill.description)}</p><code class="code">${escapeHtml(skill.path)}</code></div>`).join("") || '<p class="lede">当前没有可用 Skill。</p>'}</div></section><div class="settings-actions"><div><strong>保存后立即用于下一次模型调用</strong><p>已创建工程的历史产物不会被改写。</p><div class="field-error" id="settings-error" role="alert"></div></div><button class="btn btn--primary" id="save-settings" type="submit">保存设置</button></div></form>`;
+  return `<div class="page-head"><div><p class="eyebrow">Runtime configuration</p><h1>设置</h1><p class="lede">模型路由与运行策略会写回配置文件并立即生效；密钥值始终只从环境变量读取。</p></div><span class="badge badge--success">可编辑</span></div><form id="settings-form"><section class="panel section ia-section"><div class="section__head"><div><h2>模型配置</h2><p>每个生成阶段可独立选择 Provider、模型、服务地址与调用参数。</p></div><div class="field" style="margin:0;min-width:210px"><label for="model-config-id">配置 ID</label><input class="input" id="model-config-id" name="model_config_id" required value="${escapeHtml(ctx.model_config_id)}"></div></div><datalist id="provider-options"><option value="ark"><option value="mock"><option value="openai"><option value="azure"><option value="openai-compatible"></datalist><div class="settings-grid">${cards}</div></section><section class="panel section ia-section"><div class="section__head"><div><h2>运行策略</h2><p>控制样品页数、澄清预算、工具轮次、超时和 Skill 读取预算。</p></div><span class="badge badge--info">runtime.yaml</span></div><div class="settings-field-grid"><div class="field"><label for="sample-page-count">HTML 样品页数</label><input class="input" id="sample-page-count" name="sample_page_count" type="number" min="1" max="6" required value="${p.sample_page_count}"><small>默认 2 页，下一次生成或重生成时生效。</small></div><div class="field"><label for="max-auto-questions">单轮自动提问上限</label><input class="input" id="max-auto-questions" name="max_auto_questions" type="number" min="0" max="8" required value="${p.max_auto_questions}"></div><div class="field"><label for="clarification-budget">澄清问题总预算</label><input class="input" id="clarification-budget" name="clarification_total_budget" type="number" min="0" max="30" required value="${p.clarification_total_budget}"></div><div class="field"><label for="question-preference">提问偏好</label><select class="input" id="question-preference" name="question_preference"><option value="proactive" ${p.question_preference === "proactive" ? "selected" : ""}>主动澄清</option><option value="minimal" ${p.question_preference === "minimal" ? "selected" : ""}>最少提问</option><option value="none" ${p.question_preference === "none" ? "selected" : ""}>不主动提问</option></select></div><div class="field"><label for="model-timeout">模型超时（秒）</label><input class="input" id="model-timeout" name="model_timeout_seconds" type="number" min="1" max="600" step="1" required value="${p.model_timeout_seconds}"></div><div class="field"><label for="max-tool-rounds">最大工具轮次</label><input class="input" id="max-tool-rounds" name="max_tool_rounds" type="number" min="0" max="20" required value="${p.max_tool_rounds}"></div><div class="field"><label for="read-per-call">单次读取上限（字符）</label><input class="input" id="read-per-call" name="max_read_chars_per_call" type="number" min="100" max="100000" required value="${p.max_read_chars_per_call}"></div><div class="field"><label for="read-per-job">单任务读取上限（字符）</label><input class="input" id="read-per-job" name="max_read_chars_per_job" type="number" min="100" max="500000" required value="${p.max_read_chars_per_job}"></div></div><div class="config-hashes"><div class="hint"><strong>运行配置哈希</strong><div class="code">${escapeHtml(ctx.runtime_hash)}</div></div><div class="hint"><strong>模型配置哈希</strong><div class="code">${escapeHtml(ctx.model_hash)}</div></div></div></section><section class="panel section ia-section"><div class="section__head"><div><h2>Agent 权限与 Skills</h2><p>${escapeHtml(ctx.read_permission)}</p></div><span class="badge badge--info">只读</span></div><div class="question-list">${ctx.skills.map((skill) => `<div class="question-card"><strong>${escapeHtml(skill.name)}</strong><p class="question-impact">${escapeHtml(skill.description)}</p><code class="code">${escapeHtml(skill.path)}</code></div>`).join("") || '<p class="lede">当前没有可用 Skill。</p>'}</div></section><div class="settings-actions"><div><strong>保存后立即用于下一次模型调用</strong><p>已创建工程的历史产物不会被改写。</p><div class="field-error" id="settings-error" role="alert"></div></div><button class="btn btn--primary" id="save-settings" type="submit">保存设置</button></div></form>`;
 }
 
 function readSettingsForm(form) {
@@ -265,6 +316,7 @@ function readSettingsForm(form) {
       max_tool_rounds: number("max_tool_rounds"),
       max_read_chars_per_call: number("max_read_chars_per_call"),
       max_read_chars_per_job: number("max_read_chars_per_job"),
+      sample_page_count: number("sample_page_count"),
     },
   };
 }
@@ -285,8 +337,10 @@ async function render() {
   if (state.view === "workspace") {
     content.innerHTML = workspaceMarkup();
     wireWorkspace();
+    hydrateSampleFrame();
     return;
   }
+  hydrateFrame(content, null, 0);
   content.innerHTML = '<section class="panel section"><div class="empty-state"><span class="spinner" aria-hidden="true"></span><p>正在读取…</p></div></section>';
   try {
     if (state.view === "status") {
@@ -336,6 +390,7 @@ async function openProject(id) {
     state.project = project;
     state.branches = branches;
     state.focusStage = null;
+    state.samplePageIndex = 0;
     state.view = "workspace";
     sidebarPinned = false;
     applySidebar(false);
@@ -374,19 +429,21 @@ async function pollJob(jobId) {
   }
 }
 
-async function runJob(operation) {
-  if (!state.project) return;
+async function runJob(operation, extra = {}) {
+  if (!state.project) return false;
   setBusy(true);
   try {
-    const job = await api.startJob(state.project.project_id, { operation, checkpoint_id: state.project.checkpoint_id });
+    const job = await api.startJob(state.project.project_id, { operation, checkpoint_id: state.project.checkpoint_id, ...extra });
     state.project.active_job = job;
     await render();
     void pollJob(job.job_id);
-  } catch (error) { toast(error.message, true); }
+    return true;
+  } catch (error) { toast(error.message, true); return false; }
   finally { setBusy(false); }
 }
 
 function wireWorkspace() {
+  content.querySelectorAll("[data-sample-page]").forEach((button) => button.addEventListener("click", () => selectSamplePage(Number(button.dataset.samplePage))));
   content.querySelectorAll("[data-snapshot-stage]").forEach((button) => button.addEventListener("click", () => {
     openSnapshotDialog(button.dataset.snapshotStage);
   }));
@@ -397,16 +454,22 @@ function wireWorkspace() {
     if (action === "start_clarification") await runJob("start_clarification");
     if (action === "generate_narrative") await runJob("generate_narrative");
     if (action === "generate_outline") await runJob("generate_outline");
+    if (action === "generate_sample") await runJob("generate_sample");
     if (action === "continue_outline") { state.focusStage = "slide_outline"; await render(); }
+    if (action === "continue_sample") { state.focusStage = "ppt_sample"; await render(); }
+    if (action === "enter_sample") await enterSampleStage();
     if (action === "edit_document") openEditor(button.dataset.type);
     if (action === "regenerate_document") await runJob(button.dataset.type === "narrative_structure" ? "regenerate_narrative" : "regenerate_outline");
     if (action === "approve_document") await approveDocument(button.dataset.type);
+    if (action === "regenerate_sample") await runJob("regenerate_sample");
+    if (action === "approve_sample") await approveSample();
     if (action === "cancel_job" && state.project?.active_job) {
       try { await api.cancelJob(state.project.active_job.job_id); toast("已提交取消请求。"); }
       catch (error) { toast(error.message, true); }
     }
   }));
   document.querySelector("#clarification-form")?.addEventListener("submit", submitClarification);
+  document.querySelector("#sample-feedback-form")?.addEventListener("submit", submitSampleFeedback);
 }
 
 function wireSettings() {
@@ -461,6 +524,55 @@ async function approveDocument(type) {
     state.focusStage = null;
     state.branches = await api.branches(state.project.project_id);
     await render();
+  } catch (error) { toast(error.message, true); }
+  finally { setBusy(false); }
+}
+
+async function enterSampleStage() {
+  setBusy(true);
+  try {
+    state.project = await api.enterSample(state.project.project_id, state.project.checkpoint_id);
+    state.focusStage = null;
+    state.samplePageIndex = 0;
+    state.branches = await api.branches(state.project.project_id);
+    await render();
+  } catch (error) { toast(error.message, true); }
+  finally { setBusy(false); }
+}
+
+async function submitSampleFeedback(event) {
+  event.preventDefault();
+  const feedback = String(new FormData(event.currentTarget).get("feedback") || "").trim();
+  const errorNode = document.querySelector("#sample-feedback-error");
+  if (!feedback) {
+    errorNode.textContent = "请先输入希望 AI 调整的内容。";
+    event.currentTarget.elements.feedback.focus();
+    return;
+  }
+  errorNode.textContent = "";
+  const submit = event.currentTarget.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  submit.innerHTML = '<span class="spinner" aria-hidden="true"></span>正在提交…';
+  const started = await runJob("revise_sample", { feedback });
+  if (!started && submit.isConnected) {
+    submit.disabled = false;
+    submit.textContent = "让 AI 修改";
+  }
+}
+
+async function approveSample() {
+  const sample = currentSample();
+  if (!sample) return;
+  setBusy(true);
+  try {
+    state.project = await api.approveSample(state.project.project_id, {
+      checkpoint_id: state.project.checkpoint_id,
+      revision_hash: sample.revision_hash,
+    });
+    state.focusStage = null;
+    state.branches = await api.branches(state.project.project_id);
+    await render();
+    toast("PPT 样品已确认。");
   } catch (error) { toast(error.message, true); }
   finally { setBusy(false); }
 }
@@ -527,6 +639,7 @@ async function createProject(event) {
     });
     state.branches = await api.branches(state.project.project_id);
     state.view = "workspace";
+    state.samplePageIndex = 0;
     projectDialog.close();
     await loadProjects();
     await render();
@@ -556,6 +669,11 @@ function snapshotContent(stage, item) {
       const options = (question.options || []).map((option) => option.label).join(" / ");
       return `<li><strong>${escapeHtml(question.prompt)}</strong>${answer ? `<span class="snapshot-answer">回答：${escapeHtml(answer)}</span>` : options ? `<span>${escapeHtml(options)}</span>` : ""}</li>`;
     }).join("")}</ol>`;
+  }
+  if (stage === "ppt_sample") {
+    const sample = (snapshot.samples || []).at(-1);
+    if (!sample) return '<p class="snapshot-empty">该阶段的输入已保存，样品尚未生成。</p>';
+    return `<div class="sample-snapshot-summary"><strong>${sample.pages.length} 页 HTML 样品</strong><span>修订 ${sample.revision} · ${sample.status === "approved" ? "已确认" : "待确认"}</span><ol>${sample.pages.map((page) => `<li>${escapeHtml(page.title)}</li>`).join("")}</ol></div>`;
   }
   const document = snapshotDocument(snapshot, stage);
   if (!document) return '<p class="snapshot-empty">该阶段的输入已保存，产物尚未生成。</p>';
@@ -599,6 +717,7 @@ function openSnapshotDialog(stage) {
         intake_clarify: "start_clarification",
         narrative_structure: "generate_narrative",
         slide_outline: "generate_outline",
+        ppt_sample: "generate_sample",
       }[stage];
       if (operation) await runJob(operation);
     } catch (error) {

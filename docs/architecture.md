@@ -1,9 +1,9 @@
-# 一期架构
+# 当前架构
 
 ## 边界
 
 - `main_front.py`：HTTP 输入校验与静态前端，不承担业务判断。
-- `agent_core/workflow.py`：阶段 capability、澄清、文档生成、修订、确认和失效规则。
+- `agent_core/workflow.py`：阶段 capability、澄清、文档/样品生成、修订、确认和失效规则。
 - `storage/project_store.py`：原子 Manifest、Checkpoint、事件、分支创建和分支头切换。
 - `model_router/client.py`：阶段模型绑定、工具循环与输出边界。
 - `runtime/read_tool.py`：限定在 `skills_root` 内的只读 UTF-8 文件访问。
@@ -12,13 +12,14 @@
 
 工作区采用“顶部创作进度卡 + 下方当前阶段主渲染区”。服务按当前分支谱系投影每个已到达阶段的不可变任务快照；点击阶段卡可只读回看，并从该快照回到阶段输入边界创建重跑分支。分支切换只允许移动到已登记的分支头，不改写历史；后台 Job 运行时禁止创建或切换分支。设置更新不接受密钥值，服务在同一配置锁内校验并原子更新 `runtime.yaml` 与 `model_config.yaml`，后续模型调用使用热重载后的配置。默认运行绑定使用 Ark 的 `deepseek-v4-flash-ga-260731` 文本推理模型，密钥从 `ARK_API_KEY` 读取。
 
-## 文档规则
+## 产物规则
 
-叙事结构与逐页大纲正文不设业务 Schema，外围信封记录 revision、hash、父 revision、创建者、确认状态以及模型、运行配置和工具读取来源。编辑永远创建新修订。叙事结构的编辑会把既有逐页大纲标记为 stale。
+叙事结构与逐页大纲正文不设业务 Schema，外围信封记录 revision、hash、父 revision、创建者、确认状态以及模型、运行配置和工具读取来源。PPT 样品使用最小页面信封（`page_id/title/html`），页数由运行设置控制，默认 2；修改意见会让 Agent 基于当前页面生成新修订。编辑永远创建新修订。叙事结构的编辑会把既有逐页大纲和样品标记为 stale，逐页大纲的编辑会把既有样品标记为 stale。
 
 ## 安全
 
 - HTTP 请求体上限 512 KiB，Pydantic 请求模型拒绝未知字段。
 - Markdown 前端渲染先进行 HTML 编码，仅支持少量结构语法。
+- 样品 HTML 在服务端拒绝脚本、事件处理器、危险标签和外部资源；前端只写入无权限 `sandbox` iframe 的 `srcdoc`，并注入禁止脚本、联网、表单、对象和嵌套框架的 CSP。
 - `read` 拒绝绝对路径、`..`、越界、符号链接逃逸、未知扩展名和超预算读取。
 - 模型密钥只通过配置指定的环境变量读取，不进入项目快照、设置接口或日志。

@@ -112,4 +112,30 @@ class ModelGateway:
             }, ensure_ascii=False)
         if state == "narrative_structure":
             return "# 叙事结构\n\n## 核心观点\n让听众先看见结论，再理解证据，最后对下一步形成共识。\n\n## 叙事主线\n1. 为什么现在必须关注\n2. 发生了什么以及关键洞察\n3. 我们准备如何行动\n\n## 节奏与证据\n开场快速建立共同语境，中段用少量关键事实推动判断，结尾收束为明确行动。"
-        return "# 逐页大纲\n\n## 第 1 页｜封面\n- 本页目的：建立主题与场合\n- 核心信息：演示主题与汇报人\n- 视觉方向：克制留白与清晰标题\n\n## 第 2 页｜结论先行\n- 本页目的：让听众立即理解核心判断\n- 核心信息：一句话主结论与三项支撑\n- 视觉方向：大数字与三列摘要\n\n## 第 3 页｜背景与机会\n- 本页目的：解释为什么现在需要行动\n- 核心信息：背景变化、机会窗口、潜在风险\n- 视觉方向：简洁趋势图\n\n## 第 4 页｜行动方案\n- 本页目的：形成下一步共识\n- 核心信息：责任、节奏与成功标准\n- 视觉方向：三阶段路线图"
+        if state == "slide_outline":
+            return "# 逐页大纲\n\n## 第 1 页｜封面\n- 本页目的：建立主题与场合\n- 核心信息：演示主题与汇报人\n- 视觉方向：克制留白与清晰标题\n\n## 第 2 页｜结论先行\n- 本页目的：让听众立即理解核心判断\n- 核心信息：一句话主结论与三项支撑\n- 视觉方向：大数字与三列摘要\n\n## 第 3 页｜背景与机会\n- 本页目的：解释为什么现在需要行动\n- 核心信息：背景变化、机会窗口、潜在风险\n- 视觉方向：简洁趋势图\n\n## 第 4 页｜行动方案\n- 本页目的：形成下一步共识\n- 核心信息：责任、节奏与成功标准\n- 视觉方向：三阶段路线图"
+        match = re.search(r"SAMPLE_PAGE_COUNT:\s*(\d+)", prompt)
+        page_count = int(match.group(1)) if match else 2
+        pages = []
+        for index in range(1, page_count + 1):
+            accent = "#6d28d9" if index % 2 else "#be185d"
+            pages.append({
+                "page_id": f"sample_{index}",
+                "title": "核心判断" if index == 1 else f"行动方向 {index}",
+                "html": (
+                    "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+                    "<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{"
+                    "font-family:Arial,'Microsoft YaHei',sans-serif;background:#f8f5ff;color:#171126}"
+                    ".slide{height:100%;padding:76px 88px;display:grid;align-content:space-between}"
+                    ".kicker{font-size:22px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:"
+                    + accent
+                    + "}.title{max-width:900px;font-size:68px;line-height:1.08;margin:22px 0}.rule{height:8px;width:120px;background:"
+                    + accent
+                    + ";border-radius:8px}.foot{display:flex;justify-content:space-between;font-size:20px;color:#655d72}"
+                    "</style></head><body><main class='slide'><div><div class='kicker'>PPT Agent Sample</div>"
+                    f"<h1 class='title'>{'结论先行，让每一页都推动决策' if index == 1 else '把洞察转化为清晰的行动路径'}</h1>"
+                    "<div class='rule'></div></div><div class='foot'><span>视觉样品</span>"
+                    f"<span>{index:02d}</span></div></main></body></html>"
+                ),
+            })
+        return json.dumps({"pages": pages}, ensure_ascii=False)

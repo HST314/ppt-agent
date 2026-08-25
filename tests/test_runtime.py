@@ -12,7 +12,8 @@ def test_default_runtime_is_valid() -> None:
     runtime = ManagedRuntime(Path(__file__).parents[1])
 
     assert runtime.policy.stream_model_output is False
-    assert len(runtime.models.state_bindings) == 3
+    assert len(runtime.models.state_bindings) == 4
+    assert runtime.policy.sample_page_count == 2
     assert {binding.provider for binding in runtime.models.state_bindings} == {"ark"}
     assert {binding.model for binding in runtime.models.state_bindings} == {"deepseek-v4-flash-ga-260731"}
     assert {binding.api_key_env for binding in runtime.models.state_bindings} == {"ARK_API_KEY"}

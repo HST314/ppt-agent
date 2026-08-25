@@ -9,7 +9,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_core.jobs import JobRegistry
 from agent_core.models import TaskCard
@@ -24,7 +24,7 @@ PROJECTS_ROOT = Path(os.getenv("PPT_AGENT_PROJECTS_ROOT", FRONTEND_ROOT / "data"
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 MAX_REQUEST_BYTES = 512 * 1024
 
-app = FastAPI(title="PPT Agent Studio", version="0.1.0")
+app = FastAPI(title="PPT Agent Studio", version="0.2.0")
 runtime = ManagedRuntime(APP_ROOT)
 runtime_config_lock = threading.RLock()
 jobs = JobRegistry(PROJECTS_ROOT / ".jobs")
@@ -40,8 +40,26 @@ class CreateProjectRequest(StrictRequest):
 
 
 class StartJobRequest(StrictRequest):
-    operation: Literal["start_clarification", "generate_narrative", "generate_outline", "regenerate_narrative", "regenerate_outline"]
+    operation: Literal[
+        "start_clarification",
+        "generate_narrative",
+        "generate_outline",
+        "regenerate_narrative",
+        "regenerate_outline",
+        "generate_sample",
+        "regenerate_sample",
+        "revise_sample",
+    ]
     checkpoint_id: str = Field(min_length=1, max_length=128)
+    feedback: str | None = Field(default=None, min_length=1, max_length=4000)
+
+    @model_validator(mode="after")
+    def validate_feedback(self) -> "StartJobRequest":
+        if self.operation == "revise_sample" and not (self.feedback and self.feedback.strip()):
+            raise ValueError("revise_sample requires feedback")
+        if self.operation != "revise_sample" and self.feedback is not None:
+            raise ValueError("feedback is only accepted for revise_sample")
+        return self
 
 
 class ClarificationRequest(StrictRequest):
@@ -60,11 +78,15 @@ class ApproveRequest(StrictRequest):
     revision_hash: str
 
 
+class CheckpointRequest(StrictRequest):
+    checkpoint_id: str = Field(min_length=1, max_length=128)
+
+
 class BranchRequest(StrictRequest):
     checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
     name: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
     mode: Literal["fork_after", "rerun_stage"] = "fork_after"
-    stage: Literal["intake", "intake_clarify", "narrative_structure", "slide_outline"] | None = None
+    stage: Literal["intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"] | None = None
 
 
 class BranchSwitchRequest(StrictRequest):
@@ -108,8 +130,16 @@ def store_for(project_id: str) -> ProjectStore:
 def project_view(store: ProjectStore) -> dict[str, Any]:
     manifest = store.read()
     latest_job = jobs.latest_for_project(store.project_id)
+    with runtime_config_lock:
+        sample_page_count = runtime.policy.sample_page_count
+    latest_sample = manifest.get("samples", [])[-1:]
     return {
         **manifest,
+        # Revision history stays durable in the manifest/checkpoints; the UI
+        # only needs the current HTML payload and should not download every
+        # prior sample on each poll.
+        "samples": latest_sample,
+        "sample_page_count": sample_page_count,
         "capabilities": capabilities(manifest),
         "active_job": latest_job if latest_job and latest_job["status"] in {"queued", "running"} else None,
         "progress_snapshots": store.progress_snapshots(),
@@ -181,6 +211,9 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
         "generate_outline": lambda: workflow.generate_document("slide_outline", request.checkpoint_id),
         "regenerate_narrative": lambda: workflow.generate_document("narrative_structure", request.checkpoint_id, regenerate=True),
         "regenerate_outline": lambda: workflow.generate_document("slide_outline", request.checkpoint_id, regenerate=True),
+        "generate_sample": lambda: workflow.generate_sample(request.checkpoint_id),
+        "regenerate_sample": lambda: workflow.generate_sample(request.checkpoint_id, regenerate=True),
+        "revise_sample": lambda: workflow.generate_sample(request.checkpoint_id, feedback=request.feedback),
     }
     return jobs.submit(project_id, request.operation, request.checkpoint_id, actions[request.operation])
 
@@ -235,6 +268,24 @@ def approve_document(project_id: str, document_type: Literal["narrative_structur
     with runtime_config_lock:
         current_runtime = runtime
     Workflow(store, current_runtime).approve_document(document_type, request.checkpoint_id, request.revision_hash)
+    return project_view(store)
+
+
+@app.post("/api/projects/{project_id}/samples/enter")
+def enter_sample_stage(project_id: str, request: CheckpointRequest) -> dict[str, Any]:
+    store = store_for(project_id)
+    with runtime_config_lock:
+        current_runtime = runtime
+    Workflow(store, current_runtime).start_sample_stage(request.checkpoint_id)
+    return project_view(store)
+
+
+@app.post("/api/projects/{project_id}/samples/approve")
+def approve_sample(project_id: str, request: ApproveRequest) -> dict[str, Any]:
+    store = store_for(project_id)
+    with runtime_config_lock:
+        current_runtime = runtime
+    Workflow(store, current_runtime).approve_sample(request.checkpoint_id, request.revision_hash)
     return project_view(store)
 
 

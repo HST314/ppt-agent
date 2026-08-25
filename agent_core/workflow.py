@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from agent_core.models import DocumentRevision, Question, QuestionCard, TaskCard
+from agent_core.models import DocumentRevision, Question, QuestionCard, SampleOutput, SampleRevision, TaskCard
 from configs.runtime import ManagedRuntime
 from model_router.client import ModelGateway
 from runtime.read_tool import SkillReader
@@ -65,10 +65,22 @@ def capabilities(manifest: dict[str, Any]) -> list[str]:
             caps.append("generate_outline")
         elif phase == "waiting_human_approval":
             caps.extend(["edit_outline", "approve_outline", "regenerate_outline"])
+        elif phase == "completed":
+            caps.append("start_sample_stage")
+    elif state == "ppt_sample":
+        if phase == "ready_to_generate":
+            caps.append("generate_sample")
+        elif phase == "waiting_human_approval":
+            caps.extend(["revise_sample", "approve_sample", "regenerate_sample"])
     if manifest.get("documents", {}).get("narrative_structure") and "edit_narrative" not in caps:
         caps.append("edit_narrative")
     if manifest.get("documents", {}).get("slide_outline") and "edit_outline" not in caps:
         caps.append("edit_outline")
+    current_sample = (manifest.get("samples") or [None])[-1]
+    if current_sample and current_sample.get("status") != "stale":
+        for capability in ("revise_sample", "regenerate_sample"):
+            if capability not in caps:
+                caps.append(capability)
     return caps
 
 
@@ -252,6 +264,8 @@ class Workflow:
             if document_type == "narrative_structure":
                 for prior in value["documents"]["slide_outline"]:
                     prior["status"] = "stale"
+            for prior in value.get("samples", []):
+                prior["status"] = "stale"
             value.update(state=document_type, phase="waiting_human_approval")
             return value
 
@@ -275,13 +289,122 @@ class Workflow:
             if document_type == "narrative_structure":
                 value.update(state="slide_outline", phase="ready_to_generate")
             else:
-                value.update(state="slide_outline", phase="completed")
+                value.update(state="ppt_sample", phase="ready_to_generate")
             return value
 
         return self.store.update(
             apply,
             "document_approved",
             {"document_type": document_type, "revision_hash": revision_hash},
+            expected_checkpoint_id=checkpoint_id,
+        )
+
+    def start_sample_stage(self, checkpoint_id: str) -> dict[str, Any]:
+        """Move legacy completed-outline projects into the newly added sample stage."""
+
+        manifest = self.store.read()
+        self._require(manifest, "start_sample_stage", checkpoint_id)
+        outline = self._current(manifest, "slide_outline")
+        if not outline or outline["status"] != "approved":
+            raise ConflictError("approved outline required")
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            value.setdefault("samples", [])
+            value.update(state="ppt_sample", phase="ready_to_generate")
+            return value
+
+        return self.store.update(
+            apply,
+            "sample_stage_started",
+            {},
+            expected_checkpoint_id=checkpoint_id,
+        )
+
+    def generate_sample(
+        self,
+        checkpoint_id: str,
+        *,
+        feedback: str | None = None,
+        regenerate: bool = False,
+    ) -> dict[str, Any]:
+        manifest = self.store.read()
+        normalized_feedback = feedback.strip() if feedback else None
+        capability = "revise_sample" if normalized_feedback else "regenerate_sample" if regenerate else "generate_sample"
+        self._require(manifest, capability, checkpoint_id)
+        outline = self._current(manifest, "slide_outline")
+        if not outline or outline["status"] != "approved":
+            raise ConflictError("approved outline required")
+        history = manifest.get("samples", [])
+        current = history[-1] if history else None
+        if normalized_feedback and not current:
+            raise WorkflowError("sample not found")
+
+        page_count = self.runtime.policy.sample_page_count
+        skill_index = SkillReader(self.runtime.skills_root, per_call=1000, per_job=1000).index()
+        template, template_hash = self._template("ppt_sample.md")
+        previous = json.dumps((current or {}).get("pages", []), ensure_ascii=False)
+        prompt = (
+            template
+            + f"\n\nSAMPLE_PAGE_COUNT: {page_count}\n"
+            + f"Task card:\n{json.dumps(manifest['task_card'], ensure_ascii=False)}\n"
+            + f"Approved slide outline:\n{outline['markdown_body']}\n"
+            + f"Previous sample pages:\n{previous if current else 'none'}\n"
+            + f"Revision feedback:\n{normalized_feedback or 'none'}\n"
+            + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
+        )
+        text, traces = self.gateway.generate("ppt_sample", prompt, json_mode=True)
+        output = SampleOutput.model_validate(self.gateway.parse_json(text))
+        if len(output.pages) != page_count:
+            raise WorkflowError(f"model must return exactly {page_count} sample pages")
+        if len({page.page_id for page in output.pages}) != len(output.pages):
+            raise WorkflowError("sample page ids must be unique")
+        serialized = json.dumps([page.model_dump() for page in output.pages], ensure_ascii=False, sort_keys=True)
+        sample = SampleRevision.create(
+            output.pages,
+            revision=len(history) + 1,
+            parent=current["revision_hash"] if current else None,
+            feedback=normalized_feedback,
+            provenance={
+                **generation_provenance(skill_index, traces, serialized),
+                "upstream_revision_hash": outline["revision_hash"],
+                "model_config_hash": self.runtime.model_hash,
+                "runtime_config_hash": self.runtime.runtime_hash,
+                "template_id": "ppt_sample",
+                "template_version": 1,
+                "template_hash": template_hash,
+                "sample_page_count": page_count,
+                "traces": traces,
+            },
+        )
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            value.setdefault("samples", []).append(sample.model_dump())
+            value.update(state="ppt_sample", phase="waiting_human_approval")
+            return value
+
+        return self.store.update(
+            apply,
+            "sample_revised" if normalized_feedback else "sample_generated",
+            {"revision_hash": sample.revision_hash, "page_count": len(sample.pages)},
+            expected_checkpoint_id=checkpoint_id,
+        )
+
+    def approve_sample(self, checkpoint_id: str, revision_hash: str) -> dict[str, Any]:
+        manifest = self.store.read()
+        self._require(manifest, "approve_sample", checkpoint_id)
+        current = (manifest.get("samples") or [None])[-1]
+        if not current or current["revision_hash"] != revision_hash:
+            raise ConflictError("stale_revision")
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            value["samples"][-1]["status"] = "approved"
+            value.update(state="ppt_sample", phase="completed")
+            return value
+
+        return self.store.update(
+            apply,
+            "sample_approved",
+            {"revision_hash": revision_hash},
             expected_checkpoint_id=checkpoint_id,
         )
 

@@ -12,6 +12,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+ModelState = Literal["intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"]
+
+
 class _ModelCallParameters(BaseModel):
     """Browser-editable inference controls passed to chat completions."""
 
@@ -60,6 +63,7 @@ class RuntimePolicy(BaseModel):
     max_tool_rounds: int = Field(default=8, ge=0, le=20)
     max_read_chars_per_call: int = Field(default=20_000, ge=100, le=100_000)
     max_read_chars_per_job: int = Field(default=80_000, ge=100, le=500_000)
+    sample_page_count: int = Field(default=2, ge=1, le=6)
     skills_root: str = "skills"
     offline_mode: bool = False
     source_config_revision: str | None = None
@@ -76,7 +80,7 @@ class RuntimePolicy(BaseModel):
 class ModelBinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    state: Literal["intake_clarify", "narrative_structure", "slide_outline"]
+    state: ModelState
     model_role: Literal["reasoning_llm"] = "reasoning_llm"
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
@@ -97,12 +101,12 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_state_bindings(self) -> "ModelConfig":
-        expected = {"intake_clarify", "narrative_structure", "slide_outline"}
+        expected = {"intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"}
         actual = [item.state for item in self.state_bindings]
         if len(actual) != len(set(actual)):
             raise ValueError("state bindings must be unique")
         if set(actual) != expected:
-            raise ValueError("model config must bind intake_clarify, narrative_structure and slide_outline")
+            raise ValueError("model config must bind every generative workflow state")
         return self
 
     def binding_for(self, state: str) -> ModelBinding:
@@ -124,7 +128,7 @@ class EditableModelBinding(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    state: Literal["intake_clarify", "narrative_structure", "slide_outline"]
+    state: ModelState
     model_role: Literal["reasoning_llm"] = "reasoning_llm"
     provider: str = Field(min_length=1, max_length=80)
     model: str = Field(min_length=1, max_length=200)
@@ -146,6 +150,7 @@ class EditableRuntimePolicy(BaseModel):
     max_tool_rounds: int = Field(ge=0, le=20)
     max_read_chars_per_call: int = Field(ge=100, le=100_000)
     max_read_chars_per_job: int = Field(ge=100, le=500_000)
+    sample_page_count: int = Field(ge=1, le=6)
 
     @model_validator(mode="after")
     def validate_read_budget(self) -> "EditableRuntimePolicy":
@@ -163,10 +168,10 @@ class RuntimeConfigUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_state_bindings(self) -> "RuntimeConfigUpdate":
-        expected = {"intake_clarify", "narrative_structure", "slide_outline"}
+        expected = {"intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"}
         actual = [item.state for item in self.model_bindings]
         if len(actual) != len(set(actual)) or set(actual) != expected:
-            raise ValueError("settings must include one binding for every phase-one state")
+            raise ValueError("settings must include one binding for every generative state")
         return self
 
 

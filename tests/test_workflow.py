@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_core.models import TaskCard, digest
+from agent_core.models import SampleOutput, SamplePage, TaskCard, digest
 from agent_core.workflow import Workflow, capabilities, stable_hash
 from configs.runtime import ManagedRuntime
 from storage.project_store import ConflictError, ProjectStore
@@ -19,7 +19,7 @@ def workflow(tmp_path: Path, mock_runtime: ManagedRuntime) -> Workflow:
     return Workflow(store, runtime)
 
 
-def test_phase_one_happy_path(workflow: Workflow) -> None:
+def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> None:
     manifest = workflow.store.read()
     assert capabilities(manifest) == ["inspect", "branch", "start_clarification"]
 
@@ -46,7 +46,78 @@ def test_phase_one_happy_path(workflow: Workflow) -> None:
     manifest = workflow.generate_document("slide_outline", manifest["checkpoint_id"])
     outline = manifest["documents"]["slide_outline"][-1]
     manifest = workflow.approve_document("slide_outline", manifest["checkpoint_id"], outline["revision_hash"])
+    assert manifest["state"] == "ppt_sample"
+    assert manifest["phase"] == "ready_to_generate"
+
+    manifest = workflow.generate_sample(manifest["checkpoint_id"])
+    sample = manifest["samples"][-1]
+    assert len(sample["pages"]) == 2
+    assert sample["provenance"]["sample_page_count"] == 2
+    assert {"revise_sample", "approve_sample", "regenerate_sample"} <= set(capabilities(manifest))
+
+    manifest = workflow.generate_sample(manifest["checkpoint_id"], feedback="放大主标题并减少文字")
+    revised = manifest["samples"][-1]
+    assert revised["revision"] == 2
+    assert revised["parent_revision_hash"] == sample["revision_hash"]
+    assert revised["feedback"] == "放大主标题并减少文字"
+
+    workflow.runtime.policy = workflow.runtime.policy.model_copy(update={"sample_page_count": 3})
+    manifest = workflow.generate_sample(manifest["checkpoint_id"], regenerate=True)
+    regenerated = manifest["samples"][-1]
+    assert regenerated["revision"] == 3
+    assert len(regenerated["pages"]) == 3
+
+    manifest = workflow.approve_sample(manifest["checkpoint_id"], regenerated["revision_hash"])
     assert manifest["phase"] == "completed"
+    assert manifest["samples"][-1]["status"] == "approved"
+    assert {"revise_sample", "regenerate_sample"} <= set(capabilities(manifest))
+    sample_snapshot = next(
+        item for item in workflow.store.progress_snapshots() if item["stage"] == "ppt_sample"
+    )
+    branched = workflow.store.fork(
+        sample_snapshot["checkpoint_id"],
+        "sample-rerun",
+        mode="rerun_stage",
+        stage="ppt_sample",
+    )
+    assert branched["state"] == "ppt_sample"
+    assert branched["phase"] == "ready_to_generate"
+    assert branched["samples"] == []
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<script>alert(1)</script>",
+        '<img src="https://example.com/tracker.png">',
+        '<img src="/relative-tracker.png">',
+        '<div onclick="alert(1)">unsafe</div>',
+        '<style>@import "https://example.com/theme.css";</style>',
+    ],
+)
+def test_sample_page_rejects_active_or_external_html(html: str) -> None:
+    with pytest.raises(ValueError, match="active or external"):
+        SamplePage(page_id="sample_1", title="Unsafe", html=html)
+
+
+def test_sample_page_allows_passive_inline_content() -> None:
+    page = SamplePage(
+        page_id="sample_1",
+        title="Inline",
+        html='<style>.mark{background-image:url("data:image/png;base64,AA==")}</style><a href="#detail">内容</a>',
+    )
+
+    assert page.page_id == "sample_1"
+
+
+def test_sample_output_caps_total_html_size() -> None:
+    pages = [
+        SamplePage(page_id=f"sample_{index}", title="Large", html="x" * 130_000)
+        for index in range(4)
+    ]
+
+    with pytest.raises(ValueError, match="total size limit"):
+        SampleOutput(pages=pages)
 
 
 def test_stale_checkpoint_cannot_mutate(workflow: Workflow) -> None:
@@ -137,9 +208,9 @@ def test_progress_snapshots_drive_stage_rerun_branch(workflow: Workflow) -> None
 
     snapshots = workflow.store.progress_snapshots()
     assert [item["stage"] for item in snapshots] == [
-        "intake", "intake_clarify", "narrative_structure", "slide_outline"
+        "intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample"
     ]
-    assert all(item["completed"] for item in snapshots)
+    assert [item["completed"] for item in snapshots] == [True, True, True, True, False]
     narrative_snapshot = next(item for item in snapshots if item["stage"] == "narrative_structure")
     assert narrative_snapshot["snapshot"]["documents"]["narrative_structure"][-1]["status"] == "approved"
 
@@ -153,6 +224,7 @@ def test_progress_snapshots_drive_stage_rerun_branch(workflow: Workflow) -> None
     assert branched["state"] == "narrative_structure"
     assert branched["phase"] == "ready_to_generate"
     assert branched["documents"] == {"narrative_structure": [], "slide_outline": []}
+    assert branched["samples"] == []
     assert branched["clarification_answers"]
     assert branched["branches"]["main"] == completed["checkpoint_id"]
     assert branched["branch_meta"]["narrative-rerun"]["mode"] == "rerun_stage"
@@ -163,6 +235,39 @@ def test_progress_snapshots_drive_stage_rerun_branch(workflow: Workflow) -> None
         "intake", "intake_clarify", "narrative_structure"
     ]
     assert [item["completed"] for item in branched_progress] == [True, True, False]
+
+
+def test_completed_outline_from_previous_release_can_enter_sample_stage(workflow: Workflow) -> None:
+    manifest = workflow.store.read()
+    manifest = workflow.start_clarification(manifest["checkpoint_id"])
+    card = manifest["question_card"]
+    manifest = workflow.answer_clarification(
+        manifest["checkpoint_id"],
+        card["question_card_id"],
+        {question["question_id"]: "answer" for question in card["questions"]},
+    )
+    manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
+    narrative = manifest["documents"]["narrative_structure"][-1]
+    manifest = workflow.approve_document(
+        "narrative_structure", manifest["checkpoint_id"], narrative["revision_hash"]
+    )
+    manifest = workflow.generate_document("slide_outline", manifest["checkpoint_id"])
+    outline = manifest["documents"]["slide_outline"][-1]
+    manifest = workflow.approve_document(
+        "slide_outline", manifest["checkpoint_id"], outline["revision_hash"]
+    )
+    legacy = workflow.store.update(
+        lambda value: value | {"state": "slide_outline", "phase": "completed"},
+        "legacy_fixture",
+        {},
+        expected_checkpoint_id=manifest["checkpoint_id"],
+    )
+
+    assert "start_sample_stage" in capabilities(legacy)
+    migrated = workflow.start_sample_stage(legacy["checkpoint_id"])
+
+    assert migrated["state"] == "ppt_sample"
+    assert migrated["phase"] == "ready_to_generate"
 
 
 def test_concurrent_edits_from_same_checkpoint_use_atomic_cas(workflow: Workflow, monkeypatch) -> None:

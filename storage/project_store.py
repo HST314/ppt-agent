@@ -15,7 +15,7 @@ from agent_core.models import utc_now
 
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 CHECKPOINT_ID = re.compile(r"^checkpoint_[a-f0-9]{24}$")
-STAGE_IDS = ("intake", "intake_clarify", "narrative_structure", "slide_outline")
+STAGE_IDS = ("intake", "intake_clarify", "narrative_structure", "slide_outline", "ppt_sample")
 
 
 class ConflictError(RuntimeError):
@@ -74,6 +74,7 @@ class ProjectStore:
                 "clarification_answers": {},
                 "question_card": None,
                 "documents": {"narrative_structure": [], "slide_outline": []},
+                "samples": [],
                 "checkpoint_id": checkpoint,
                 "active_job_id": None,
                 "created_at": utc_now(),
@@ -196,7 +197,13 @@ class ProjectStore:
 
         active_index = STAGE_IDS.index(manifest["state"])
         outline = self._latest_document(manifest, "slide_outline")
-        completed_through = 3 if outline and outline.get("status") == "approved" else active_index - 1
+        sample = (manifest.get("samples") or [None])[-1]
+        if sample and sample.get("status") == "approved":
+            completed_through = 4
+        elif outline and outline.get("status") == "approved":
+            completed_through = 3
+        else:
+            completed_through = active_index - 1
 
         def boundary(stage: str) -> dict[str, Any] | None:
             matches: list[dict[str, Any]]
@@ -219,11 +226,22 @@ class ProjectStore:
                     and (self._latest_document(item, stage) or {}).get("status") == "approved"
                 ]
                 return matches[-1] if matches else None
+            if stage == "slide_outline":
+                matches = [
+                    item for item in lineage
+                    if item.get("state") in {"slide_outline", "ppt_sample"}
+                    and (
+                        item.get("phase") == "completed"
+                        or item.get("state") == "ppt_sample"
+                    )
+                    and (self._latest_document(item, stage) or {}).get("status") == "approved"
+                ]
+                return matches[0] if matches else None
             matches = [
                 item for item in lineage
-                if item.get("state") == "slide_outline"
+                if item.get("state") == "ppt_sample"
                 and item.get("phase") == "completed"
-                and (self._latest_document(item, stage) or {}).get("status") == "approved"
+                and ((item.get("samples") or [None])[-1] or {}).get("status") == "approved"
             ]
             return matches[-1] if matches else None
 
@@ -239,6 +257,14 @@ class ProjectStore:
                 snapshot = None
             if snapshot is None:
                 continue
+            public_snapshot = deepcopy(snapshot)
+            if public_snapshot.get("samples"):
+                current_sample = deepcopy(public_snapshot["samples"][-1])
+                current_sample["pages"] = [
+                    {"page_id": page["page_id"], "title": page["title"]}
+                    for page in current_sample.get("pages", [])
+                ]
+                public_snapshot["samples"] = [current_sample]
             response.append({
                 "checkpoint_id": snapshot["checkpoint_id"],
                 "branch": snapshot.get("branch", "main"),
@@ -248,7 +274,7 @@ class ProjectStore:
                 "updated_at": snapshot["updated_at"],
                 "sequence": sequence[snapshot["checkpoint_id"]],
                 "completed": completed,
-                "snapshot": deepcopy(snapshot),
+                "snapshot": public_snapshot,
             })
         return response
 
@@ -266,6 +292,7 @@ class ProjectStore:
                 question_card=None,
                 clarification_answers={},
                 documents={"narrative_structure": [], "slide_outline": []},
+                samples=[],
             )
         elif stage == "narrative_structure":
             if not value.get("clarification_answers"):
@@ -274,13 +301,21 @@ class ProjectStore:
                 state="narrative_structure",
                 phase="ready_to_generate",
                 documents={"narrative_structure": [], "slide_outline": []},
+                samples=[],
             )
-        else:
+        elif stage == "slide_outline":
             narrative = self._latest_document(value, "narrative_structure")
             if not narrative or narrative.get("status") != "approved":
                 raise ValueError("outline rerun requires an approved narrative")
             value["documents"]["slide_outline"] = []
+            value["samples"] = []
             value.update(state="slide_outline", phase="ready_to_generate")
+        else:
+            outline = self._latest_document(value, "slide_outline")
+            if not outline or outline.get("status") != "approved":
+                raise ValueError("sample rerun requires an approved outline")
+            value["samples"] = []
+            value.update(state="ppt_sample", phase="ready_to_generate")
         return value
 
     def fork(

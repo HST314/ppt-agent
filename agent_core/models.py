@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> str:
@@ -88,5 +90,74 @@ class DocumentRevision(StrictModel):
             parent_revision_hash=parent,
             markdown_body=markdown,
             created_by=created_by,
+            provenance=provenance or {},
+        )
+
+
+class SamplePage(StrictModel):
+    page_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    title: str = Field(min_length=1, max_length=160)
+    html: str = Field(min_length=1, max_length=150_000)
+
+    @field_validator("html")
+    @classmethod
+    def validate_isolated_html(cls, value: str) -> str:
+        """Keep model HTML passive before it reaches a sandboxed srcdoc frame."""
+
+        forbidden = re.compile(
+            r"<\s*(?:script|iframe|object|embed|form|base|link)\b"
+            r"|<\s*meta\b[^>]*http-equiv\s*="
+            r"|\son[a-z]+\s*="
+            r"|\b(?:src|href)\s*=\s*['\"]?\s*(?:https?:|//|javascript:)"
+            r"|\b(?:src|href)\s*=\s*['\"]\s*(?!data:|#)"
+            r"|\b(?:src|href)\s*=\s*(?!['\"])(?!data:|#)[^\s>]+"
+            r"|@import\b"
+            r"|url\s*\(\s*['\"]\s*(?!data:|#)"
+            r"|url\s*\(\s*(?!['\"])(?!data:|#)",
+            re.IGNORECASE,
+        )
+        if forbidden.search(value):
+            raise ValueError("sample HTML contains active or external content")
+        return value.strip()
+
+
+class SampleOutput(StrictModel):
+    pages: list[SamplePage] = Field(min_length=1, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_total_size(self) -> "SampleOutput":
+        if sum(len(page.html) for page in self.pages) > 500_000:
+            raise ValueError("sample HTML exceeds the total size limit")
+        return self
+
+
+class SampleRevision(StrictModel):
+    sample_id: str = "sample_ppt"
+    revision: int
+    revision_hash: str
+    parent_revision_hash: str | None = None
+    pages: list[SamplePage] = Field(min_length=1, max_length=6)
+    feedback: str | None = Field(default=None, max_length=4000)
+    status: Literal["pending_approval", "approved", "stale"] = "pending_approval"
+    created_at: str = Field(default_factory=utc_now)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def create(
+        cls,
+        pages: list[SamplePage],
+        *,
+        revision: int,
+        parent: str | None,
+        feedback: str | None,
+        provenance: dict[str, Any] | None = None,
+    ) -> "SampleRevision":
+        serialized = json.dumps([page.model_dump() for page in pages], ensure_ascii=False, sort_keys=True)
+        return cls(
+            revision=revision,
+            revision_hash=digest(f"ppt_sample\n{revision}\n{serialized}"),
+            parent_revision_hash=parent,
+            pages=pages,
+            feedback=feedback,
             provenance=provenance or {},
         )
