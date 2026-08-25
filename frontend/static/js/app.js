@@ -318,6 +318,8 @@ function fullDeckView() {
     selectedHash: revision.revision_hash,
     sample: headSample(),
     canGenerate: capabilities.includes("generate_full_deck"),
+    canRegenerate: capabilities.includes("regenerate_full_deck"),
+    canRevise: capabilities.includes("revise_full_deck"),
     canBranch: capabilities.includes("branch_full_deck_revision"),
   });
   return `<section class="panel section ia-section stage"><div class="section__head"><div><h2 id="full-deck-title" tabindex="-1">HTML-PPT 全稿</h2><p>浏览完整页面清单、安全预览和不可变修订历史</p></div>${view.status}</div><div class="panel__body">${view.body}</div></section>`;
@@ -634,9 +636,14 @@ function wireWorkspace() {
     if (action === "approve_sample") await approveSample();
     if (action === "branch_sample_revision") await branchFromSampleRevision(button.dataset.revisionHash);
     if (action === "generate_full_deck") await runJob("generate_full_deck");
-    if (action === "regenerate_full_deck") await runJob("regenerate_full_deck", {
-      revision_hash: state.project.full_deck_revision?.revision_hash,
-    });
+    if (action === "regenerate_full_deck") {
+      const original = button.innerHTML;
+      button.innerHTML = '<span class="spinner" aria-hidden="true"></span>正在启动重新生成…';
+      const started = await runJob("regenerate_full_deck", {
+        revision_hash: state.project.full_deck_revision?.revision_hash,
+      });
+      if (!started && button.isConnected) button.innerHTML = original;
+    }
     if (action === "branch_full_deck_revision") await branchFromFullDeckRevision(button.dataset.revisionHash);
     if (action === "cancel_job" && state.project?.active_job) {
       try { await api.cancelJob(state.project.active_job.job_id); toast("已提交取消请求。"); }
@@ -787,7 +794,7 @@ async function submitFullDeckFeedback(event) {
   errorNode.textContent = "";
   const submit = event.currentTarget.querySelector('button[type="submit"]');
   submit.disabled = true;
-  submit.innerHTML = '<span class="spinner" aria-hidden="true"></span>正在提交…';
+  submit.innerHTML = '<span class="spinner" aria-hidden="true"></span>正在启动全稿修改…';
   const started = await runJob("revise_full_deck", {
     revision_hash: revision.revision_hash,
     feedback,

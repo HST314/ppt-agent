@@ -9,7 +9,13 @@ from typing import Any, Literal
 import html5lib
 from pydantic import Field, model_validator
 
-from agent_core.models import HtmlPptPackage, PackageFile, PackageSlide, StrictModel
+from agent_core.models import (
+    FullDeckPackage,
+    HtmlPptPackage,
+    PackageFile,
+    PackageSlide,
+    StrictModel,
+)
 
 
 COMPOSER_VERSION = "full-deck-composer-v1"
@@ -436,6 +442,205 @@ def compose_full_deck(spec: FullDeckComposerInput) -> FullDeckComposition:
             )
             for page in spec.pages
         ],
+        files=[deepcopy(item) for _, item in sorted(output_files.items())],
+    )
+    return FullDeckComposition(manifest=manifest, package=package)
+
+
+def compose_full_deck_revision(
+    *,
+    title: str,
+    parent_package: FullDeckPackage,
+    replacement_sources: list[ComposerSource],
+    replacement_pages: list[ComposerPage],
+    ordered_pages: list[ComposerPage],
+) -> FullDeckComposition:
+    """Replace declared pages while carrying unchanged parent files byte-for-byte."""
+
+    parent_manifest = CompositionManifest.model_validate(
+        parent_package.composition_manifest
+    )
+    replacement = compose_full_deck(FullDeckComposerInput(
+        title=title,
+        sources=replacement_sources,
+        pages=replacement_pages,
+    ))
+    parent_slide_by_slot = {
+        slide.slot_id: slide for slide in parent_manifest.slides
+    }
+    parent_slots = set(parent_slide_by_slot)
+    if (
+        None in parent_slots
+        or len(parent_slide_by_slot) != len(parent_manifest.slides)
+        or parent_manifest.slide_count != len(parent_manifest.slides)
+    ):
+        raise FullDeckComposerError("parent composition has invalid page identities")
+    replacement_slide_by_slot = {
+        slide.slot_id: slide for slide in replacement.manifest.slides
+    }
+    replacement_slots = set(replacement_slide_by_slot)
+    if not replacement_slots or replacement_slots != {
+        page.slot_id for page in replacement_pages
+    }:
+        raise FullDeckComposerError("replacement pages do not match their manifest")
+    ordered_slots = [page.slot_id for page in ordered_pages]
+    if (
+        None in ordered_slots
+        or len(ordered_slots) != len(set(ordered_slots))
+        or set(ordered_slots) != parent_slots
+        or not replacement_slots.issubset(parent_slots)
+    ):
+        raise FullDeckComposerError(
+            "revision must preserve the parent's complete ordered page set"
+        )
+
+    slides: list[CompositionSlide] = []
+    for page in ordered_pages:
+        source = (
+            replacement_slide_by_slot.get(page.slot_id)
+            if page.slot_id in replacement_slots
+            else parent_slide_by_slot.get(page.slot_id)
+        )
+        if source is None:
+            raise FullDeckComposerError(
+                f"ordered page is absent from parent and replacement: {page.slot_id}"
+            )
+        if (
+            source.slide_id != page.slide_id
+            or source.title != page.title
+            or source.source_slide_number != page.source_slide_number
+        ):
+            raise FullDeckComposerError(
+                f"ordered page metadata changed during revision: {page.slot_id}"
+            )
+        slides.append(source)
+
+    parent_source_ids = {
+        slide.source_id
+        for slide in slides
+        if slide.slot_id not in replacement_slots
+    }
+    replacement_source_ids = {
+        slide.source_id
+        for slide in slides
+        if slide.slot_id in replacement_slots
+    }
+    if parent_source_ids.intersection(replacement_source_ids):
+        raise FullDeckComposerError("parent and replacement source IDs must be disjoint")
+    sources = [
+        source
+        for source in parent_manifest.sources
+        if source.source_id in parent_source_ids
+    ] + [
+        source
+        for source in replacement.manifest.sources
+        if source.source_id in replacement_source_ids
+    ]
+    if {source.source_id for source in sources} != (
+        parent_source_ids | replacement_source_ids
+    ):
+        raise FullDeckComposerError("revision source manifest is incomplete")
+
+    parent_files = {item.path: item for item in parent_package.files}
+    replacement_files = {item.path: item for item in replacement.package.files}
+    output_files: dict[str, PackageFile] = {}
+
+    def copy_file(
+        path: str,
+        candidates: dict[str, PackageFile],
+        expected_hash: str | None = None,
+    ) -> PackageFile:
+        item = candidates.get(path)
+        if item is None:
+            raise FullDeckComposerError(f"revision source file is missing: {path}")
+        if expected_hash is not None and _hash_bytes(item.content_bytes()) != expected_hash:
+            raise FullDeckComposerError(f"revision source file hash changed: {path}")
+        existing = output_files.get(path)
+        if existing is not None and existing.content_bytes() != item.content_bytes():
+            raise FullDeckComposerError(f"revision file collision: {path}")
+        output_files[path] = deepcopy(item)
+        return item
+
+    for source in parent_manifest.sources:
+        if source.source_id not in parent_source_ids:
+            continue
+        for resource in source.resources:
+            copy_file(resource.output_path, parent_files, resource.content_hash)
+    for source in replacement.manifest.sources:
+        if source.source_id not in replacement_source_ids:
+            continue
+        for resource in source.resources:
+            copy_file(resource.output_path, replacement_files, resource.content_hash)
+    source_by_id = {source.source_id: source for source in sources}
+    for slide in slides:
+        document = copy_file(
+            slide.document_path,
+            replacement_files if slide.slot_id in replacement_slots else parent_files,
+        )
+        if slide.source_slide_content_hash != slide.composed_slide_content_hash:
+            raise FullDeckComposerError(
+                f"revision page content graph is not faithful: {slide.slot_id}"
+            )
+        source = source_by_id[slide.source_id]
+        graph = _content_graph_from_hashes(
+            slide_id=slide.source_slide_id,
+            document=document.content_bytes(),
+            resources=[
+                ContentGraphResource(
+                    path=resource.source_path,
+                    content_hash=resource.content_hash,
+                )
+                for resource in source.resources
+            ],
+        )
+        if graph.content_hash != slide.composed_slide_content_hash:
+            raise FullDeckComposerError(
+                f"revision page content graph changed: {slide.slot_id}"
+            )
+
+    manifest = CompositionManifest(
+        input_hash=_stable_hash({
+            "composer_version": COMPOSER_VERSION,
+            "operation": "compose_full_deck_revision",
+            "title": title,
+            "parent_package_hash": parent_package.package_hash,
+            "replacement_input_hash": replacement.manifest.input_hash,
+            "pages": [page.model_dump() for page in ordered_pages],
+        }),
+        title=title,
+        slide_count=len(slides),
+        sources=sources,
+        slides=slides,
+    )
+    output_files["composition_manifest.json"] = PackageFile(
+        path="composition_manifest.json",
+        content=json.dumps(
+            manifest.model_dump(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        media_type="application/json; charset=utf-8",
+        origin="composer:manifest",
+    )
+    output_files["index.html"] = PackageFile(
+        path="index.html",
+        content=_outer_index(FullDeckComposerInput(
+            title=title,
+            sources=replacement_sources,
+            pages=replacement_pages,
+        ), slides),
+        media_type="text/html; charset=utf-8",
+        origin="composer:shell",
+    )
+    package = HtmlPptPackage(
+        title=title,
+        slide_count=len(ordered_pages),
+        slides=[PackageSlide(
+            slide_id=page.slide_id,
+            title=page.title,
+            source_slide_number=page.source_slide_number,
+        ) for page in ordered_pages],
         files=[deepcopy(item) for _, item in sorted(output_files.items())],
     )
     return FullDeckComposition(manifest=manifest, package=package)

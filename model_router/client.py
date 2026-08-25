@@ -4,6 +4,7 @@ import json
 import os
 import re
 from copy import deepcopy
+from html import escape
 from typing import Any
 
 from openai import OpenAI
@@ -239,24 +240,62 @@ class ModelGateway:
         if state == "slide_outline":
             return "# 逐页大纲\n\n## 第 1 页｜封面\n- 本页目的：建立主题与场合\n- 核心信息：演示主题与汇报人\n- 视觉方向：克制留白与清晰标题\n\n## 第 2 页｜结论先行\n- 本页目的：让听众立即理解核心判断\n- 核心信息：一句话主结论与三项支撑\n- 视觉方向：大数字与三列摘要\n\n## 第 3 页｜背景与机会\n- 本页目的：解释为什么现在需要行动\n- 核心信息：背景变化、机会窗口、潜在风险\n- 视觉方向：简洁趋势图\n\n## 第 4 页｜行动方案\n- 本页目的：形成下一步共识\n- 核心信息：责任、节奏与成功标准\n- 视觉方向：三阶段路线图"
         if state == "ppt_full":
+            operation_match = re.search(r"FULL_DECK_OPERATION:\s*(\w+)", prompt)
+            operation = operation_match.group(1) if operation_match else None
             target_match = re.search(
                 r"FULL_DECK_TARGET_SLIDE_NUMBERS:\s*(\[[^\n]*\])",
                 prompt,
             )
-            target_numbers = json.loads(target_match.group(1)) if target_match else [1]
+            mandatory_match = re.search(
+                r"FULL_DECK_MANDATORY_SLIDE_NUMBERS:\s*(\[[^\n]*\])",
+                prompt,
+            )
             pages_match = re.search(
-                r"FULL_DECK_SEGMENT_PAGES_JSON:\s*(\[[^\n]*\])",
+                r"FULL_DECK_(?:SEGMENT_PAGES|REVISION_PAGE_SPECS)_JSON:\s*(\[[^\n]*\])",
                 prompt,
             )
             page_specs = json.loads(pages_match.group(1)) if pages_match else []
+            mandatory_numbers = (
+                json.loads(mandatory_match.group(1)) if mandatory_match else []
+            )
+            if target_match:
+                target_numbers = json.loads(target_match.group(1))
+            elif operation == "revise_full_deck":
+                feedback_match = re.search(r"USER_FEEDBACK:\s*(\"[^\n]*\")", prompt)
+                feedback = json.loads(feedback_match.group(1)) if feedback_match else ""
+                requested = [
+                    int(number)
+                    for number in re.findall(r"第\s*(\d+)\s*页", feedback)
+                ]
+                available = [
+                    int((page.get("outline_ref") or {}).get("source_slide_number"))
+                    for page in page_specs
+                    if (page.get("outline_ref") or {}).get("source_slide_number") is not None
+                ]
+                selected = set(mandatory_numbers + requested)
+                if not selected and available:
+                    selected.add(available[0])
+                target_numbers = [number for number in available if number in selected]
+            else:
+                target_numbers = [1]
             title_by_number = {
                 int((page.get("outline_ref") or {}).get("source_slide_number")): page.get("title")
                 for page in page_specs
                 if (page.get("outline_ref") or {}).get("source_slide_number") is not None
             }
+            slot_by_number = {
+                int((page.get("outline_ref") or {}).get("source_slide_number")): page.get("slot_id")
+                for page in page_specs
+                if (page.get("outline_ref") or {}).get("source_slide_number") is not None
+            }
+            changed_slot_ids = [slot_by_number[number] for number in target_numbers]
+            feedback_match = re.search(r"USER_FEEDBACK:\s*(\"[^\n]*\")", prompt)
+            feedback_text = json.loads(feedback_match.group(1)) if feedback_match else ""
             slides = [
                 {
-                    "slide_id": f"full-{number}",
+                    "slide_id": (
+                        f"revision-{number}" if operation else f"full-{number}"
+                    ),
                     "title": title_by_number.get(number, f"第 {number} 页"),
                     "source_slide_number": number,
                 }
@@ -266,7 +305,11 @@ class ModelGateway:
                 f'<section class="slide{" is-active" if index == 0 else ""}" '
                 f'data-slide-id="{slide["slide_id"]}"><p class="eyebrow">FULL DECK</p>'
                 f'<h1>{slide["title"]}</h1><p>围绕已确认叙事推进第 {slide["source_slide_number"]} 页。</p>'
-                f'<footer>{slide["source_slide_number"]:02d}</footer></section>'
+                + (
+                    f'<p class="revision-note">{escape(feedback_text)}</p>'
+                    if operation else ""
+                )
+                + f'<footer>{slide["source_slide_number"]:02d}</footer></section>'
                 for index, slide in enumerate(slides)
             )
             segment_html = (
@@ -282,7 +325,7 @@ class ModelGateway:
                 '<script>const s=[...document.querySelectorAll(".slide")];let i=0;function go(n){s[i].classList.remove("is-active");i=(n+s.length)%s.length;s[i].classList.add("is-active")}prev.onclick=()=>go(i-1);next.onclick=()=>go(i+1);addEventListener("keydown",e=>{if(e.key==="ArrowLeft")go(i-1);if(e.key==="ArrowRight"||e.key===" ")go(i+1)})</script>'
                 '</body></html>'
             )
-            return json.dumps({
+            result = {
                 "source_slide_numbers": target_numbers,
                 "entrypoint": "index.html",
                 "title": f"第 {target_numbers[0]}–{target_numbers[-1]} 页",
@@ -291,7 +334,13 @@ class ModelGateway:
                 "files": [
                     {"path": "index.html", "content": segment_html, "encoding": "utf-8"}
                 ],
-            }, ensure_ascii=False)
+            }
+            if operation:
+                result.update(
+                    changed_slot_ids=changed_slot_ids,
+                    changed_source_slide_numbers=target_numbers,
+                )
+            return json.dumps(result, ensure_ascii=False)
         match = re.search(r"SAMPLE_PAGE_COUNT:\s*(\d+)", prompt)
         page_count = int(match.group(1)) if match else 2
         preserved_match = re.search(r"PRESERVE_SOURCE_SLIDE_NUMBERS:\s*(\[[^\n]*\]|none)", prompt)

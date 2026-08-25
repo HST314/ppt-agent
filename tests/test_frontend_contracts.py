@@ -65,7 +65,7 @@ def test_full_deck_workspace_contracts_match_the_sample_interaction_model() -> N
     assert 'id="full-deck-feedback-form"' in full_deck
     assert "完整页面清单" in full_deck
     assert all(label in full_deck for label in (
-        "已就绪", "待生成", "样品来源", "本次全稿生成尝试", "全稿修订历史",
+        "已就绪", "待生成", "样品来源", "本次全稿操作尝试", "全稿修订历史",
     ))
     assert 'data-full-deck-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"' in full_deck
     assert 'data-action="branch_full_deck_revision"' in full_deck
@@ -73,6 +73,24 @@ def test_full_deck_workspace_contracts_match_the_sample_interaction_model() -> N
     assert "aspect-ratio:16/9" in css
     assert ".full-deck-page-grid" in css
     assert "@media(max-width:767px)" in css
+
+
+def test_full_deck_revision_actions_expose_feedback_change_and_loading_context() -> None:
+    app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    full_deck = (ROOT / "frontend/static/js/full-deck.js").read_text(encoding="utf-8")
+    server = (ROOT / "main_front.py").read_text(encoding="utf-8")
+
+    assert all(operation in server for operation in (
+        '"revise_full_deck"', '"regenerate_full_deck"', "revision_hash",
+    ))
+    assert 'capabilities.includes("revise_full_deck")' in app
+    assert 'capabilities.includes("regenerate_full_deck")' in app
+    assert "正在启动全稿修改" in app
+    assert "正在启动重新生成" in app
+    assert "只有声明的变更页会获得新内容引用" in full_deck
+    assert "变更第 ${changedPages.map" in full_deck
+    assert "attempt.reason" in full_deck
+    assert 'role="alert"' in full_deck
 
 
 def test_full_deck_preview_is_sandboxed_and_uses_package_routes() -> None:

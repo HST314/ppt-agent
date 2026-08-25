@@ -14,6 +14,7 @@ from agent_core.full_deck_generation import (
     generate_full_deck as run_full_deck_generation,
     pending_full_deck_segments,
 )
+from agent_core.full_deck_revision import create_full_deck_revision
 from agent_core.models import (
     DocumentRevision,
     FullDeck,
@@ -371,7 +372,7 @@ def capabilities(
         current_full_deck = _current_full_deck_revision(manifest)
         if current_full_deck:
             caps.append("inspect_full_deck")
-            if not active_job:
+            if not active_job and current_full_deck.get("status") != "stale":
                 caps.extend([
                     "regenerate_full_deck",
                     "revise_full_deck",
@@ -1086,6 +1087,38 @@ class Workflow:
         return run_full_deck_generation(
             self,
             checkpoint_id,
+            cancel_requested=cancel_requested,
+        )
+
+    def revise_full_deck(
+        self,
+        checkpoint_id: str,
+        revision_hash: str,
+        feedback: str,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        return create_full_deck_revision(
+            self,
+            checkpoint_id,
+            revision_hash,
+            operation="revise_full_deck",
+            feedback=feedback,
+            cancel_requested=cancel_requested,
+        )
+
+    def regenerate_full_deck(
+        self,
+        checkpoint_id: str,
+        revision_hash: str,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        return create_full_deck_revision(
+            self,
+            checkpoint_id,
+            revision_hash,
+            operation="regenerate_full_deck",
             cancel_requested=cancel_requested,
         )
 

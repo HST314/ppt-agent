@@ -14,10 +14,12 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agent_core.jobs import JobRegistry
+from agent_core.jobs import ActiveJobError, JobRegistry
 from agent_core.models import TaskCard
 from agent_core.workflow import Workflow, capabilities
+from agent_core.workflow_support import stable_hash
 from configs.runtime import ManagedRuntime, RuntimeConfigUpdate
+from runtime.read_tool import SkillReader
 from storage.project_store import ConflictError, ProjectStore, list_projects
 
 
@@ -53,16 +55,32 @@ class StartJobRequest(StrictRequest):
         "regenerate_sample",
         "revise_sample",
         "generate_full_deck",
+        "regenerate_full_deck",
+        "revise_full_deck",
     ]
     checkpoint_id: str = Field(min_length=1, max_length=128)
+    revision_hash: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
     feedback: str | None = Field(default=None, min_length=1, max_length=4000)
 
     @model_validator(mode="after")
     def validate_feedback(self) -> "StartJobRequest":
-        if self.operation == "revise_sample" and not (self.feedback and self.feedback.strip()):
-            raise ValueError("revise_sample requires feedback")
-        if self.operation != "revise_sample" and self.feedback is not None:
-            raise ValueError("feedback is only accepted for revise_sample")
+        feedback_operations = {"revise_sample", "revise_full_deck"}
+        full_deck_revision_operations = {
+            "revise_full_deck", "regenerate_full_deck"
+        }
+        if self.operation in feedback_operations and not (
+            self.feedback and self.feedback.strip()
+        ):
+            raise ValueError(f"{self.operation} requires feedback")
+        if self.operation not in feedback_operations and self.feedback is not None:
+            raise ValueError("feedback is only accepted for revision operations")
+        if self.operation in full_deck_revision_operations and not self.revision_hash:
+            raise ValueError(f"{self.operation} requires revision_hash")
+        if self.operation not in full_deck_revision_operations and self.revision_hash is not None:
+            raise ValueError("revision_hash is only accepted for full-deck revision operations")
         return self
 
 
@@ -155,6 +173,17 @@ async def conflict_handler(_: Request, exc: ConflictError):
     return JSONResponse(status_code=409, content={"error": {"code": str(exc).split(":", 1)[0], "message": str(exc), "retryable": False}})
 
 
+@app.exception_handler(ActiveJobError)
+async def active_job_handler(_: Request, exc: ActiveJobError):
+    return JSONResponse(status_code=409, content={
+        "error": {
+            "code": "active_job",
+            "message": str(exc),
+            "retryable": False,
+        }
+    })
+
+
 def store_for(project_id: str) -> ProjectStore:
     if not PROJECT_ID.fullmatch(project_id):
         raise HTTPException(status_code=422, detail="工程 ID 格式无效")
@@ -162,6 +191,44 @@ def store_for(project_id: str) -> ProjectStore:
     if not store.exists():
         raise HTTPException(status_code=404, detail="工程不存在")
     return store
+
+
+def _full_deck_revision_summary(
+    revision: dict[str, Any],
+    current_revision_hash: str | None,
+) -> dict[str, Any]:
+    package = revision.get("package")
+    changed_slot_ids = revision.get("provenance", {}).get("changed_slot_ids", [])
+    changed_set = set(changed_slot_ids)
+    changed_pages = [
+        {
+            "slot_id": page["slot_id"],
+            "source_slide_number": (page.get("outline_ref") or {}).get(
+                "source_slide_number"
+            ),
+            "title": page["title"],
+        }
+        for page in revision.get("plan", {}).get("pages", [])
+        if page.get("slot_id") in changed_set
+    ]
+    return {
+        "full_deck_id": revision["full_deck_id"],
+        "revision": revision["revision"],
+        "revision_hash": revision["revision_hash"],
+        "parent_revision_hash": revision.get("parent_revision_hash"),
+        "feedback": revision.get("feedback"),
+        "status": revision["status"],
+        "created_at": revision["created_at"],
+        "page_count": len(revision.get("plan", {}).get("pages", [])),
+        "changed_slot_ids": changed_slot_ids,
+        "changed_pages": changed_pages,
+        "package": {
+            "title": package["title"],
+            "slide_count": package["slide_count"],
+            "file_count": len(package.get("files", [])),
+        } if package else None,
+        "current": revision.get("revision_hash") == current_revision_hash,
+    }
 
 
 def project_view(store: ProjectStore) -> dict[str, Any]:
@@ -201,7 +268,9 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
     )
     public_manifest = deepcopy(manifest)
     public_manifest.pop("full_deck_revisions", None)
-    if active_job and active_job.get("operation") == "generate_full_deck":
+    if active_job and active_job.get("operation") in {
+        "generate_full_deck", "regenerate_full_deck", "revise_full_deck"
+    }:
         public_manifest["phase"] = "generating"
     return {
         **public_manifest,
@@ -214,25 +283,7 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
         "sample_page_count": sample_page_count,
         "full_deck_revision": current_full_deck,
         "full_deck_revisions": [
-            {
-                "full_deck_id": item["full_deck_id"],
-                "revision": item["revision"],
-                "revision_hash": item["revision_hash"],
-                "parent_revision_hash": item.get("parent_revision_hash"),
-                "feedback": item.get("feedback"),
-                "status": item["status"],
-                "created_at": item["created_at"],
-                "page_count": len(item.get("plan", {}).get("pages", [])),
-                "changed_slot_ids": item.get("provenance", {}).get(
-                    "changed_slot_ids", []
-                ),
-                "package": {
-                    "title": item["package"]["title"],
-                    "slide_count": item["package"]["slide_count"],
-                    "file_count": len(item["package"].get("files", [])),
-                } if item.get("package") else None,
-                "current": item.get("revision_hash") == current_full_deck_hash,
-            }
+            _full_deck_revision_summary(item, current_full_deck_hash)
             for item in reversed(full_deck_revisions)
         ],
         "full_deck_attempts": store.full_deck_attempts(),
@@ -343,6 +394,36 @@ def get_project(project_id: str) -> dict[str, Any]:
     return project_view(store_for(project_id))
 
 
+def _full_deck_job_idempotency_key(
+    store: ProjectStore,
+    current_runtime: ManagedRuntime,
+    request: StartJobRequest,
+) -> str | None:
+    if request.operation not in {
+        "generate_full_deck", "regenerate_full_deck", "revise_full_deck"
+    }:
+        return None
+    manifest = store.read(latest_sample_only=True, include_sample_html=False)
+    root = manifest.get("full_deck") or {}
+    revision_hash = request.revision_hash or root.get("current_revision_hash")
+    skills_hash = stable_hash(SkillReader(
+        current_runtime.skills_root,
+        per_call=1000,
+        per_job=1000,
+    ).index())
+    return stable_hash({
+        "operation": request.operation,
+        "checkpoint_id": request.checkpoint_id,
+        "revision_hash": revision_hash,
+        "feedback_hash": (
+            stable_hash(request.feedback.strip()) if request.feedback else None
+        ),
+        "model_config_hash": current_runtime.model_hash,
+        "runtime_config_hash": current_runtime.runtime_hash,
+        "skills_hash": skills_hash,
+    })
+
+
 @app.post("/api/projects/{project_id}/jobs", status_code=202)
 def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
     store = store_for(project_id)
@@ -362,13 +443,29 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
             request.checkpoint_id,
             cancel_requested=cancel_requested,
         ),
+        "regenerate_full_deck": lambda cancel_requested: workflow.regenerate_full_deck(
+            request.checkpoint_id,
+            request.revision_hash or "",
+            cancel_requested=cancel_requested,
+        ),
+        "revise_full_deck": lambda cancel_requested: workflow.revise_full_deck(
+            request.checkpoint_id,
+            request.revision_hash or "",
+            request.feedback or "",
+            cancel_requested=cancel_requested,
+        ),
     }
     return jobs.submit(
         project_id,
         request.operation,
         request.checkpoint_id,
         actions[request.operation],
-        cancellable=request.operation == "generate_full_deck",
+        cancellable=request.operation in {
+            "generate_full_deck", "regenerate_full_deck", "revise_full_deck"
+        },
+        idempotency_key=_full_deck_job_idempotency_key(
+            store, current_runtime, request
+        ),
     )
 
 

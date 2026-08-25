@@ -198,6 +198,31 @@ class PromptAuditMixin:
                 ),
             )
 
+    def update_prompt_call_context(
+        self,
+        prompt_call_id: str,
+        context: dict[str, Any],
+    ) -> None:
+        """Attach validated model declarations while an audit call is still open."""
+
+        if not context:
+            return
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT status, parameters_json FROM prompt_calls WHERE prompt_call_id = ?",
+                (prompt_call_id,),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(prompt_call_id)
+            if row["status"] != "started":
+                raise RuntimeError("prompt_call_terminal")
+            parameters = json.loads(row["parameters_json"]) if row["parameters_json"] else {}
+            parameters.update(redact_for_audit(context))
+            connection.execute(
+                "UPDATE prompt_calls SET parameters_json = ? WHERE prompt_call_id = ?",
+                (json_text(parameters), prompt_call_id),
+            )
+
     def prompt_calls(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         self._ensure_database()
         with self._connect() as connection:
@@ -338,7 +363,12 @@ class PromptAuditMixin:
         attempt_by_segment: dict[str, int] = {}
         result: list[dict[str, Any]] = []
         for row, parameters in decoded:
-            target = parameters.get("target_slide_numbers") or []
+            operation = parameters.get("operation") or "generate_full_deck"
+            target = (
+                parameters.get("changed_source_slide_numbers")
+                or parameters.get("target_slide_numbers")
+                or []
+            )
             segment_key = ",".join(str(number) for number in target)
             attempt_by_segment[segment_key] = attempt_by_segment.get(segment_key, 0) + 1
             messages = json.loads(row["messages_json"]) if row["messages_json"] else []
@@ -351,7 +381,11 @@ class PromptAuditMixin:
             error = json.loads(row["error_json"]) if row["error_json"] else None
             published = row["status"] == "completed" and bool(row["output_ref"])
             if published:
-                reason = "页段通过契约校验，完整全稿已通过 Composer 发布。"
+                reason = (
+                    "修改页通过声明范围与来源保真校验，新全稿修订已发布。"
+                    if operation == "revise_full_deck"
+                    else "目标页通过契约校验，完整全稿已通过 Composer 发布。"
+                )
             elif row["status"] == "started":
                 reason = "页段正在生成，尚未进入最终组装。"
             elif row["status"] == "conflicted":
@@ -374,6 +408,8 @@ class PromptAuditMixin:
                 "published": published,
                 "reason": reason,
                 "failure_code": (error or {}).get("code"),
+                "operation": operation,
+                "changed_slot_ids": parameters.get("changed_slot_ids") or [],
                 "target_slide_numbers": target,
                 "segment_range": (
                     f"{target[0]}–{target[-1]} 页" if target else "未知页段"

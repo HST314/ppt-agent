@@ -1754,6 +1754,10 @@ class ProjectStore(PromptAuditMixin):
         result = []
         for revision in reversed(manifest.get("full_deck_revisions", [])):
             package = revision.get("package")
+            changed_slot_ids = revision.get("provenance", {}).get(
+                "changed_slot_ids", []
+            )
+            changed_set = set(changed_slot_ids)
             result.append({
                 "full_deck_id": revision["full_deck_id"],
                 "revision": revision["revision"],
@@ -1765,9 +1769,18 @@ class ProjectStore(PromptAuditMixin):
                 "source_checkpoint_id": checkpoints.get(revision["revision_hash"]),
                 "current": revision["revision_hash"] == current_hash,
                 "page_count": len(revision.get("plan", {}).get("pages", [])),
-                "changed_slot_ids": revision.get("provenance", {}).get(
-                    "changed_slot_ids", []
-                ),
+                "changed_slot_ids": changed_slot_ids,
+                "changed_pages": [
+                    {
+                        "slot_id": page["slot_id"],
+                        "source_slide_number": (page.get("outline_ref") or {}).get(
+                            "source_slide_number"
+                        ),
+                        "title": page["title"],
+                    }
+                    for page in revision.get("plan", {}).get("pages", [])
+                    if page.get("slot_id") in changed_set
+                ],
                 "package": {
                     "package_hash": package["package_hash"],
                     "entrypoint": package["entrypoint"],
@@ -1914,6 +1927,59 @@ class ProjectStore(PromptAuditMixin):
             )
             for item in package.get("files", [])
         ]
+
+    def full_deck_package_contents(
+        self,
+        revision_hash: str,
+    ) -> list[dict[str, Any]]:
+        """Load and verify one immutable full-deck package with one database read."""
+
+        if not REVISION_HASH.fullmatch(revision_hash):
+            raise ValueError("invalid revision hash")
+        self._ensure_database()
+        with self._connect() as connection:
+            manifest = self._raw_current(connection)
+            if revision_hash not in {
+                reference.get("revision_hash")
+                for reference in (manifest.get("full_deck") or {}).get(
+                    "revision_refs", []
+                )
+            }:
+                raise FileNotFoundError(revision_hash)
+            rows = connection.execute(
+                """
+                SELECT f.logical_path, f.media_type, f.origin,
+                       a.relative_path, a.sha256, a.size_bytes
+                FROM full_deck_package_files f
+                JOIN artifacts a ON a.artifact_id = f.artifact_id
+                WHERE f.revision_hash = ?
+                ORDER BY f.file_index
+                """,
+                (revision_hash,),
+            ).fetchall()
+        if not rows:
+            raise FileNotFoundError(revision_hash)
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            path = (self.root / row["relative_path"]).resolve()
+            if (
+                not path.is_relative_to(self.package_artifacts_root.resolve())
+                or not path.is_file()
+            ):
+                raise ConflictError("package_artifact_missing")
+            content = path.read_bytes()
+            if (
+                "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
+                or len(content) != row["size_bytes"]
+            ):
+                raise ConflictError("artifact_corrupt")
+            result.append({
+                "path": row["logical_path"],
+                "media_type": row["media_type"],
+                "origin": row["origin"],
+                "content": content,
+            })
+        return result
 
 def list_projects(root: Path) -> list[dict[str, Any]]:
     if not root.exists():

@@ -51,9 +51,14 @@ function attemptsBody(attempts, escapeHtml) {
   const cards = attempts.map((attempt, index) => {
     const published = Boolean(attempt.published);
     const range = attempt.segment_range || attempt.target_slide_numbers?.join("、") || "完整页面";
-    return `<li class="sample-attempt-card"><div class="sample-attempt-card__head"><strong>尝试 ${attempt.attempt || index + 1} · ${escapeHtml(range)}</strong><span class="badge ${published ? "badge--success" : "badge--warning"}">${published ? "已发布" : "未发布"}</span></div><p>${escapeHtml(attempt.reason || "等待结果")}</p><small>${attempt.tool_rounds || 0} 个工具轮次 · ${attempt.tool_call_count || 0} 次工具调用 · ${attempt.skill_read_count || 0} 次 Skill 读取 · ${escapeHtml(revisionDate(attempt.completed_at || attempt.started_at))}</small></li>`;
+    const operation = ({
+      revise_full_deck: "按意见修改",
+      regenerate_full_deck: "重新生成",
+      generate_full_deck: "首次生成",
+    })[attempt.operation] || "全稿操作";
+    return `<li class="sample-attempt-card"><div class="sample-attempt-card__head"><strong>${escapeHtml(operation)} · 尝试 ${attempt.attempt || index + 1} · ${escapeHtml(range)}</strong><span class="badge ${published ? "badge--success" : "badge--warning"}">${published ? "已发布" : "未发布"}</span></div><p>${escapeHtml(attempt.reason || "等待结果")}</p><small>${attempt.tool_rounds || 0} 个工具轮次 · ${attempt.tool_call_count || 0} 次工具调用 · ${attempt.skill_read_count || 0} 次 Skill 读取 · ${escapeHtml(revisionDate(attempt.completed_at || attempt.started_at))}</small></li>`;
   }).join("");
-  return `<section class="sample-attempts" aria-labelledby="full-deck-attempts-title" aria-live="polite"><div class="sample-history__head"><div><h3 id="full-deck-attempts-title">本次全稿生成尝试</h3><p>逐页段契约和最终组装均通过后，完整版本才会进入修订历史。</p></div><span class="badge badge--info">${attempts.length} 次</span></div><ol class="sample-attempt-list">${cards}</ol></section>`;
+  return `<section class="sample-attempts" aria-labelledby="full-deck-attempts-title" aria-live="polite"><div class="sample-history__head"><div><h3 id="full-deck-attempts-title">本次全稿操作尝试</h3><p>目标页声明、页面契约和最终组装均通过后，新版本才会进入修订历史。</p></div><span class="badge badge--info">${attempts.length} 次</span></div><ol class="sample-attempt-list">${cards}</ol></section>`;
 }
 
 function historyBody(history, selectedHash, options, escapeHtml) {
@@ -61,7 +66,11 @@ function historyBody(history, selectedHash, options, escapeHtml) {
   const cards = history.map((revision) => {
     const selected = revision.revision_hash === selectedHash;
     const [status, statusClass] = statusMeta(revision.status);
-    const changedCount = revision.changed_slot_ids?.length || 0;
+    const changedPages = revision.changed_pages || [];
+    const changedCount = changedPages.length || revision.changed_slot_ids?.length || 0;
+    const changedLabel = changedPages.length
+      ? ` · 变更第 ${changedPages.map((page) => page.source_slide_number || "补充").join("、")} 页`
+      : changedCount ? ` · 变更 ${changedCount} 页` : "";
     const packageInfo = revision.package;
     const description = revision.feedback || (revision.revision === 1
       ? "由已确认样品初始化"
@@ -69,14 +78,21 @@ function historyBody(history, selectedHash, options, escapeHtml) {
     const branchAction = selected && options.canBranch
       ? `<div class="full-deck-revision-card__actions"><button class="btn btn--secondary" type="button" data-action="branch_full_deck_revision" data-revision-hash="${escapeHtml(revision.revision_hash)}">从当前版本创建分支</button></div>`
       : "";
-    return `<article class="full-deck-revision-card${selected ? " is-selected" : ""}"><button class="full-deck-revision-card__selector" type="button" data-full-deck-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"><span class="sample-revision-card__number">R${revision.revision}</span><span class="sample-revision-card__content"><span class="sample-revision-card__title">修订 ${revision.revision}${selected ? '<span class="badge badge--success">当前</span>' : ""}<span class="badge ${statusClass}">${escapeHtml(status)}</span></span><p>${escapeHtml(description)}</p><small>${escapeHtml(revisionDate(revision.created_at))} · ${revision.page_count || packageInfo?.slide_count || 0} 页${changedCount ? ` · 变更 ${changedCount} 页` : ""}${packageInfo ? ` · ${packageInfo.file_count || 0} 个文件` : ""}</small></span></button>${branchAction}</article>`;
+    return `<article class="full-deck-revision-card${selected ? " is-selected" : ""}"><button class="full-deck-revision-card__selector" type="button" data-full-deck-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"><span class="sample-revision-card__number">R${revision.revision}</span><span class="sample-revision-card__content"><span class="sample-revision-card__title">修订 ${revision.revision}${selected ? '<span class="badge badge--success">当前</span>' : ""}<span class="badge ${statusClass}">${escapeHtml(status)}</span></span><p>${escapeHtml(description)}</p><small>${escapeHtml(revisionDate(revision.created_at))} · ${revision.page_count || packageInfo?.slide_count || 0} 页${changedLabel}${packageInfo ? ` · ${packageInfo.file_count || 0} 个文件` : ""}</small></span></button>${branchAction}</article>`;
   }).join("");
   return `<section class="full-deck-history" aria-labelledby="full-deck-history-title"><div class="sample-history__head"><div><h3 id="full-deck-history-title">全稿修订历史</h3><p>点击任意版本只移动当前指针，不会创建新修订；下一次操作会从选中版本继续。</p></div><span class="badge badge--info">${history.length} 个版本</span></div><div class="full-deck-revision-list">${cards}</div></section>`;
 }
 
-function feedbackBody(revision) {
+function feedbackBody(revision, options) {
   const packageReady = Boolean(revision.package);
-  return `<form class="sample-feedback full-deck-feedback" id="full-deck-feedback-form"><div class="field"><label for="full-deck-feedback">修改意见</label><textarea class="input" id="full-deck-feedback" name="feedback" maxlength="4000" required placeholder="例如：第 5 页把核心结论放进标题，并保持其余页面不变。" aria-describedby="full-deck-feedback-help"></textarea><small id="full-deck-feedback-help">AI 会从当前选中的全稿版本继续，并将成功修改保存为新的子修订。</small><div class="field-error" id="full-deck-feedback-error" role="alert"></div></div><div class="sample-feedback__actions"><button class="btn btn--secondary" type="button" data-action="regenerate_full_deck">${packageReady ? "重新生成" : "重新生成待完成页"}</button><button class="btn btn--primary" type="submit">让 AI 修改</button></div></form>`;
+  const regenerate = options.canRegenerate
+    ? `<button class="btn btn--secondary" type="button" data-action="regenerate_full_deck">${packageReady ? "重新生成非样品页" : "重新生成待完成页"}</button>`
+    : "";
+  const revise = options.canRevise
+    ? '<button class="btn btn--primary" type="submit">让 AI 修改</button>'
+    : "";
+  if (!regenerate && !revise) return "";
+  return `<form class="sample-feedback full-deck-feedback" id="full-deck-feedback-form"><div class="field"><label for="full-deck-feedback">修改意见</label><textarea class="input" id="full-deck-feedback" name="feedback" maxlength="4000" required placeholder="例如：第 5 页把核心结论放进标题，并保持其余页面不变。" aria-describedby="full-deck-feedback-help"></textarea><small id="full-deck-feedback-help">AI 会从当前选中的全稿版本继续；只有声明的变更页会获得新内容引用，成功后保存为不可变子修订。</small><div class="field-error" id="full-deck-feedback-error" role="alert"></div></div><div class="sample-feedback__actions">${regenerate}${revise}</div></form>`;
 }
 
 export function fullDeckBody(
@@ -101,7 +117,7 @@ export function fullDeckBody(
     ? '<div class="callout"><strong>当前全稿已确认。</strong> 历史版本仍可查看、切换和创建工程分支。</div>'
     : "";
   const plan = pagePlanBody(revision, options, escapeHtml);
-  const feedback = feedbackBody(revision);
+  const feedback = feedbackBody(revision, options);
   const attempts = attemptsBody(options.attempts || [], escapeHtml);
   const history = historyBody(
     options.history || [],

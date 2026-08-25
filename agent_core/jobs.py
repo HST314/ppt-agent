@@ -16,6 +16,10 @@ from agent_core.models import utc_now
 from agent_core.processes import process_is_alive
 
 
+class ActiveJobError(RuntimeError):
+    pass
+
+
 def public_job_error(exc: Exception) -> dict[str, str]:
     """Map internal failures to a bounded browser-safe error contract."""
 
@@ -41,7 +45,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_json TEXT,
     owner_pid INTEGER,
     cancellable INTEGER NOT NULL DEFAULT 0,
-    cancel_requested INTEGER NOT NULL DEFAULT 0
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    request_key TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_project_time_idx ON jobs(project_id, created_at, job_id);
 CREATE INDEX IF NOT EXISTS jobs_dedup_idx ON jobs(project_id, operation, checkpoint_id, status);
@@ -107,6 +112,12 @@ class JobRegistry:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
                 )
+            if "request_key" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN request_key TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_request_key_idx "
+                "ON jobs(project_id, request_key, status)"
+            )
             connection.commit()
         finally:
             connection.close()
@@ -141,8 +152,8 @@ class JobRegistry:
             INSERT INTO jobs(
                 job_id, project_id, operation, checkpoint_id, status,
                 created_at, started_at, finished_at, error_json, owner_pid,
-                cancellable, cancel_requested
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cancellable, cancel_requested, request_key
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
                 status = excluded.status,
                 started_at = excluded.started_at,
@@ -150,7 +161,8 @@ class JobRegistry:
                 error_json = excluded.error_json,
                 owner_pid = excluded.owner_pid,
                 cancellable = excluded.cancellable,
-                cancel_requested = MAX(jobs.cancel_requested, excluded.cancel_requested)
+                cancel_requested = MAX(jobs.cancel_requested, excluded.cancel_requested),
+                request_key = COALESCE(excluded.request_key, jobs.request_key)
             """,
             (
                 record["job_id"], record["project_id"], record["operation"],
@@ -160,6 +172,7 @@ class JobRegistry:
                 record.get("_owner_pid"),
                 int(bool(record.get("cancellable"))),
                 int(bool(record.get("cancel_requested"))),
+                record.get("request_key"),
             ),
         )
 
@@ -243,19 +256,37 @@ class JobRegistry:
         action: Callable[..., Any],
         *,
         cancellable: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        request_key = idempotency_key or f"{operation}\n{checkpoint_id}"
         with self.lock, self._transaction() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM jobs
-                WHERE project_id = ? AND operation = ? AND checkpoint_id = ?
+                WHERE project_id = ?
+                  AND (
+                    request_key = ?
+                    OR (request_key IS NULL AND operation = ? AND checkpoint_id = ?)
+                  )
                   AND status IN ('queued', 'running', 'succeeded')
                 ORDER BY created_at DESC, job_id DESC LIMIT 1
                 """,
-                (project_id, operation, checkpoint_id),
+                (project_id, request_key, operation, checkpoint_id),
             ).fetchone()
             if row:
                 return self._record(row)
+            active = connection.execute(
+                """
+                SELECT job_id FROM jobs
+                WHERE project_id = ? AND status IN ('queued', 'running')
+                ORDER BY created_at DESC, job_id DESC LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if active:
+                raise ActiveJobError(
+                    "active_job:请等待当前任务结束后再启动新的生成操作。"
+                )
             record = {
                 "job_id": "job_" + uuid4().hex,
                 "project_id": project_id,
@@ -269,6 +300,7 @@ class JobRegistry:
                 "_owner_pid": os.getpid(),
                 "cancellable": cancellable,
                 "cancel_requested": False,
+                "request_key": request_key,
             }
             self._upsert(connection, record)
             self._insert_event(connection, record)
