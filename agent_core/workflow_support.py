@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Collection
 from typing import Any
 
 from agent_core.models import HtmlPptPackage
@@ -16,6 +17,13 @@ OUTLINE_FALLBACK_HEADING = re.compile(
     r"^\s{0,3}##\s+(?P<title>\S.*?)\s*$",
     re.MULTILINE,
 )
+# Loose per-page image plan line: optional list marker, the keyword, a full- or
+# half-width colon, then image names separated by ，、 or ,.
+OUTLINE_IMAGE_LINE = re.compile(
+    r"^\s{0,3}(?:[-*+]\s+)?配图\s*[:：]\s*(?P<names>\S.*?)\s*$",
+    re.MULTILINE,
+)
+OUTLINE_IMAGE_NAME_SEPARATORS = "，、,"
 
 
 def outline_slide_catalog(markdown: str) -> list[dict[str, Any]]:
@@ -42,6 +50,56 @@ def outline_slide_catalog(markdown: str) -> list[dict[str, Any]]:
     if not numbers or len(numbers) != len(set(numbers)):
         raise ValueError("approved outline must contain uniquely numbered slide headings")
     return catalog
+
+
+def outline_page_image_map(
+    markdown: str,
+    image_names: Collection[str],
+) -> dict[int, list[str]]:
+    """Loosely collect the per-page image plans (「配图：」 lines) of an outline.
+
+    Keys match the ``source_slide_number`` values ``outline_slide_catalog``
+    reports (falling back to positional numbering when no numbered headings
+    exist). Only names present in ``image_names`` (typically the current
+    project image manifest) are kept; anything else on the line — unknown
+    names, stray tokens — is silently ignored. Pages without a usable plan
+    are omitted. ``outline_slide_catalog`` itself is unaffected.
+    """
+
+    available = set(image_names)
+    matches = list(OUTLINE_PAGE_HEADING.finditer(markdown))
+    if matches:
+        pages: list[tuple[int, re.Match[str]]] = [
+            (int(match.group("number")), match) for match in matches
+        ]
+    else:
+        pages = [
+            (index, match)
+            for index, match in enumerate(
+                OUTLINE_FALLBACK_HEADING.finditer(markdown),
+                start=1,
+            )
+        ]
+    result: dict[int, list[str]] = {}
+    for position, (number, heading) in enumerate(pages):
+        body_start = heading.end()
+        body_end = (
+            pages[position + 1][1].start()
+            if position + 1 < len(pages)
+            else len(markdown)
+        )
+        names: list[str] = []
+        for line in OUTLINE_IMAGE_LINE.finditer(markdown, body_start, body_end):
+            for token in re.split(
+                f"[{OUTLINE_IMAGE_NAME_SEPARATORS}]", line.group("names")
+            ):
+                name = token.strip()
+                if not name or name not in available or name in names:
+                    continue
+                names.append(name)
+        if names:
+            result[number] = names
+    return result
 
 
 def stable_hash(value: Any) -> str:

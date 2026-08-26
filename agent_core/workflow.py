@@ -68,11 +68,57 @@ from storage.project_store import (
     ProjectStore,
     mark_full_deck_stale,
 )
+from storage.project_images import (
+    IMAGES_DIR_NAME,
+    project_image_manifest,
+    read_image_descriptions,
+)
 
 
 DocumentType = Literal["narrative_structure", "slide_outline"]
 SAMPLE_HTML_CHAR_BUDGET = 7_000
 SAMPLE_MAX_REPAIR_ATTEMPTS = 2
+PROJECT_IMAGE_SUMMARY_CHARS = 300
+
+
+def _outline_images_prompt_section(
+    images_template: str,
+    images_manifest: list[dict[str, Any]],
+    descriptions: dict[str, str],
+) -> str:
+    """Append-only outline block: usage rules plus the full description texts."""
+
+    description_blocks = [
+        f"[{path}]\n{text}" for path, text in sorted(descriptions.items())
+    ]
+    return (
+        f"\n\n{images_template.strip()}\n\n"
+        f"PROJECT_IMAGES_JSON: {json.dumps(images_manifest, ensure_ascii=False)}\n"
+        "PROJECT_IMAGE_DESCRIPTIONS:\n"
+        + "\n".join(description_blocks)
+    )
+
+
+def _sample_images_prompt_section(
+    images_template: str,
+    images_manifest: list[dict[str, Any]],
+    descriptions: dict[str, str],
+    summary_chars: int = PROJECT_IMAGE_SUMMARY_CHARS,
+) -> str:
+    """Append-only sample block: usage rules plus truncated per-image summaries."""
+
+    summary_blocks = []
+    for entry in images_manifest:
+        text = descriptions.get(entry["description_path"], "")
+        if len(text) > summary_chars:
+            text = text[:summary_chars] + "…"
+        summary_blocks.append(f"[{entry['image_path']}]\n{text}")
+    return (
+        f"\n\n{images_template.strip()}\n\n"
+        f"PROJECT_IMAGES_JSON: {json.dumps(images_manifest, ensure_ascii=False)}\n"
+        "PROJECT_IMAGE_SUMMARIES:\n"
+        + "\n".join(summary_blocks)
+    )
 
 
 class WorkflowError(RuntimeError):
@@ -807,6 +853,20 @@ class Workflow:
             f"Approved upstream document:\n{(upstream or {}).get('markdown_body', 'none')}\n"
             f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
         )
+        images_root: Path | None = None
+        if document_type == "slide_outline":
+            images_manifest = project_image_manifest(self.store.root)
+            if images_manifest:
+                # With materials the outline prompt gains an append-only
+                # section; with an empty manifest the prompt (and the whole
+                # downstream chain) stays byte-for-byte identical.
+                images_root = (self.store.root / IMAGES_DIR_NAME).resolve()
+                images_template, _ = self._template("slide_outline_images.md")
+                prompt += _outline_images_prompt_section(
+                    images_template,
+                    images_manifest,
+                    read_image_descriptions(self.store.root),
+                )
         skills_hash = stable_hash(skill_index)
         prompt_call_id = self._start_prompt_audit(
             state,
@@ -817,7 +877,12 @@ class Workflow:
         )
         traces: list[dict[str, Any]] = []
         try:
-            markdown, traces = self.gateway.generate(state, prompt)
+            if images_root is not None:
+                markdown, traces = generate_with_legacy_gateway(
+                    self.gateway, state, prompt, images_root=images_root
+                )
+            else:
+                markdown, traces = self.gateway.generate(state, prompt)
         except Exception as exc:
             self._fail_prompt_audit(prompt_call_id, exc, traces)
             raise
@@ -1017,6 +1082,19 @@ class Workflow:
             + f"Revision feedback:\n{normalized_feedback or 'none'}\n"
             + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
         )
+        images_manifest = project_image_manifest(self.store.root)
+        images_root: Path | None = None
+        if images_manifest:
+            # With materials the sample prompt gains an append-only section
+            # and the draft/gateway gain the project images root (registering
+            # copy_project_image); with an empty manifest nothing changes.
+            images_root = (self.store.root / IMAGES_DIR_NAME).resolve()
+            images_template, _ = self._template("ppt_sample_images.md")
+            prompt += _sample_images_prompt_section(
+                images_template,
+                images_manifest,
+                read_image_descriptions(self.store.root),
+            )
         traces: list[dict[str, Any]] = []
         prompt_call_ids: list[str] = []
         repair_attempts = 0
@@ -1040,7 +1118,7 @@ class Workflow:
             "parent_sample_revision_hash": current.get("revision_hash") if current else None,
         }
         for attempt in range(SAMPLE_MAX_REPAIR_ATTEMPTS + 1):
-            draft = DraftPackage(self.runtime.skills_root)
+            draft = DraftPackage(self.runtime.skills_root, images_root=images_root)
             if current and current.get("package"):
                 draft.ingest(current["package"].get("files", []))
             prompt_call_id = self._start_prompt_audit(
@@ -1064,12 +1142,17 @@ class Workflow:
                 # Custom/legacy gateway adapters may reject newer generate()
                 # capabilities (package_draft, images_root) with a TypeError;
                 # generate_with_legacy_gateway retries without just those.
+                generate_kwargs: dict[str, Any] = {
+                    "json_mode": True,
+                    "package_draft": draft,
+                }
+                if images_root is not None:
+                    generate_kwargs["images_root"] = images_root
                 text, attempt_traces = generate_with_legacy_gateway(
                     self.gateway,
                     "ppt_sample",
                     current_prompt,
-                    json_mode=True,
-                    package_draft=draft,
+                    **generate_kwargs,
                 )
             except Exception as exc:
                 self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
