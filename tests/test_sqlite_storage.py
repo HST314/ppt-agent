@@ -696,6 +696,21 @@ def test_generation_session_cas_directives_and_active_session_uniqueness(
     assert store.active_full_deck_generation_session(
         session.full_deck_id, "main"
     )["session_id"] == session.session_id
+    audit = store.full_deck_generation_audit(session.full_deck_id)
+    assert audit["truncated"] == {
+        "sessions": False,
+        "batches": False,
+        "pages": False,
+        "directives": False,
+        "packages": False,
+        "package_files": False,
+    }
+    assert audit["sessions"][0]["directives"][0]["directive_id"] == (
+        directive.directive_id
+    )
+    assert audit["sessions"][0]["directives"][0]["content"] == (
+        "后续页面减少装饰元素。"
+    )
 
 
 def test_generation_batch_commit_preview_read_and_restart_recovery(
@@ -752,6 +767,14 @@ def test_generation_batch_commit_preview_read_and_restart_recovery(
     assert committed["batches"][0]["status"] == "succeeded"
     assert committed["pages"][0]["generation_status"] == "ready"
     assert committed["latest_preview_package_id"] == preview.package_id
+    audit = store.full_deck_generation_audit(session.full_deck_id)
+    audited_session = audit["sessions"][0]
+    audited_segment = next(
+        item for item in audited_session["packages"] if item["kind"] == "segment"
+    )
+    assert audited_segment["package_hash"] == segment.package_hash
+    assert audited_segment["files"][0]["artifact_id"].startswith("sha256:")
+    assert audited_segment["files"][0]["sha256"].startswith("sha256:")
 
     restarted = ProjectStore(root, "generation-restart")
     restored = restarted.full_deck_generation_session(session.session_id)

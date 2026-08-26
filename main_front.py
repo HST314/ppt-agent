@@ -507,7 +507,10 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
     with runtime_config_lock:
         current_runtime = runtime
     workflow = Workflow(store, current_runtime)
-    if request.operation == "generate_full_deck":
+    if (
+        request.operation == "generate_full_deck"
+        and current_runtime.policy.full_deck_batched_generation_enabled
+    ):
         _, job = start_full_deck_session_job(
             _full_deck_session_route_context(),
             project_id,
@@ -524,6 +527,10 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
         "generate_sample": lambda: workflow.generate_sample(request.checkpoint_id),
         "regenerate_sample": lambda: workflow.generate_sample(request.checkpoint_id, regenerate=True),
         "revise_sample": lambda: workflow.generate_sample(request.checkpoint_id, feedback=request.feedback),
+        "generate_full_deck": lambda cancel_requested: workflow.generate_full_deck(
+            request.checkpoint_id,
+            cancel_requested=cancel_requested,
+        ),
         "regenerate_full_deck": lambda cancel_requested: workflow.regenerate_full_deck(
             request.checkpoint_id,
             request.revision_hash or "",
@@ -1135,6 +1142,12 @@ def export_project_audit(project_id: str) -> JSONResponse:
     store = store_for(project_id)
     manifest = store.read(latest_sample_only=True, include_sample_html=False)
     snapshots = store.progress_snapshots()
+    full_deck_root = manifest.get("full_deck") or {}
+    generation_audit = (
+        store.full_deck_generation_audit(full_deck_root["full_deck_id"])
+        if full_deck_root.get("full_deck_id")
+        else {"sessions": [], "truncated": {}}
+    )
     payload = {
         "format": "ppt-agent-audit-v1",
         "exported_at": utc_now(),
@@ -1148,8 +1161,13 @@ def export_project_audit(project_id: str) -> JSONResponse:
         "full_deck": manifest.get("full_deck"),
         "full_deck_revisions": store.full_deck_history()[:500]
         if manifest.get("full_deck") else [],
+        "full_deck_generation": generation_audit,
         "limits": {
             "full_deck_revisions": 500,
+            "full_deck_generation_sessions": 100,
+            "full_deck_generation_rows": 5000,
+            "full_deck_generation_packages": 1000,
+            "full_deck_generation_package_files": 5000,
             "timeline": 2000,
             "prompt_calls": 500,
         },

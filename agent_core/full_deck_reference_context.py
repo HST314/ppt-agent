@@ -136,6 +136,6 @@ def full_deck_package_reference_tool(
     )
     return PackageReferenceTool(
         sources,
-        per_call=runtime.policy.max_read_chars_per_call,
-        per_job=runtime.policy.max_read_chars_per_job,
+        per_call=runtime.policy.full_deck_reference_max_read_chars_per_call,
+        per_job=runtime.policy.full_deck_reference_max_read_chars_per_batch,
     )

@@ -636,6 +636,104 @@ def test_full_deck_generation_session_api_start_is_idempotent_and_scoped(
     assert final_session["status"] == "cancelled"
 
 
+def test_full_deck_generation_feature_rollback_preserves_session_evidence(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    workflow, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-feature-rollback",
+    )
+    session = workflow.start_full_deck_generation_session(
+        entered["checkpoint_id"]
+    )
+    mock_runtime.policy = mock_runtime.policy.model_copy(
+        update={"full_deck_batched_generation_enabled": False}
+    )
+    client = TestClient(main_front.app)
+    session_url = (
+        "/api/projects/session-feature-rollback/full-deck/generation-sessions/"
+        f"{session['session_id']}"
+    )
+
+    existing = client.get(session_url)
+    rejected = client.post(
+        "/api/projects/session-feature-rollback/full-deck/generation-sessions",
+        json={
+            "checkpoint_id": entered["checkpoint_id"],
+            "revision_hash": entered["full_deck"]["current_revision_hash"],
+        },
+    )
+    audit = client.get(
+        "/api/projects/session-feature-rollback/audit/export"
+    ).json()
+
+    assert existing.status_code == 200
+    assert existing.json()["session_id"] == session["session_id"]
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == (
+        "full_deck_batched_generation_disabled"
+    )
+    assert audit["full_deck_generation"]["sessions"][0]["session_id"] == (
+        session["session_id"]
+    )
+
+
+def test_disabled_batched_generation_keeps_legacy_full_deck_actions_available(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    mock_runtime.policy = mock_runtime.policy.model_copy(
+        update={"full_deck_batched_generation_enabled": False}
+    )
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    _, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="legacy-full-deck-rollback",
+    )
+    client = TestClient(main_front.app)
+
+    generated = finish_job(client, client.post(
+        "/api/projects/legacy-full-deck-rollback/jobs",
+        json={
+            "operation": "generate_full_deck",
+            "checkpoint_id": entered["checkpoint_id"],
+        },
+    ))
+    assert generated["session_id"] is None
+    project = client.get("/api/projects/legacy-full-deck-rollback").json()
+    first_revision = project["full_deck_revision"]
+    assert project["full_deck_generation_session"] is None
+    assert client.get(first_revision["preview_url"]).status_code == 200
+    assert client.get(first_revision["export_url"]).status_code == 200
+
+    revised = finish_job(client, client.post(
+        "/api/projects/legacy-full-deck-rollback/jobs",
+        json={
+            "operation": "revise_full_deck",
+            "checkpoint_id": project["checkpoint_id"],
+            "revision_hash": first_revision["revision_hash"],
+            "feedback": "强化最后一页的行动结论。",
+        },
+    ))
+    assert revised["status"] == "succeeded"
+    updated = client.get("/api/projects/legacy-full-deck-rollback").json()
+    assert updated["full_deck_revision"]["revision_hash"] != (
+        first_revision["revision_hash"]
+    )
+
+
 def test_full_deck_generation_session_controls_preview_and_conflicts(
     tmp_path: Path,
     monkeypatch,
@@ -839,3 +937,26 @@ def test_full_deck_generation_pause_and_retry_api_are_versioned_and_idempotent(
     assert completed["status"] == "completed"
     project = client.get("/api/projects/session-api-retry").json()
     assert project["full_deck_generation_session"]["status"] == "completed"
+    audit = client.get("/api/projects/session-api-retry/audit/export").json()
+    generation = audit["full_deck_generation"]
+    audited_session = generation["sessions"][0]
+    prompt_call_ids = {
+        item["prompt_call_id"] for item in audit["prompt_calls"]
+    }
+    batch_prompt_call_ids = {
+        prompt_call_id
+        for batch in audited_session["batches"]
+        for prompt_call_id in batch["prompt_call_ids"]
+    }
+    assert audited_session["published_revision_hash"] == (
+        project["full_deck_revision"]["revision_hash"]
+    )
+    assert batch_prompt_call_ids
+    assert batch_prompt_call_ids <= prompt_call_ids
+    assert audited_session["packages"]
+    assert all(package["files"] for package in audited_session["packages"])
+    assert all(
+        file["sha256"].startswith("sha256:")
+        for package in audited_session["packages"]
+        for file in package["files"]
+    )

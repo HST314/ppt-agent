@@ -139,6 +139,18 @@ def start_full_deck_session_job(
     return snapshot, job
 
 
+def _require_batched_generation_enabled(
+    context: FullDeckSessionRouteContext,
+) -> None:
+    if context.current_runtime().policy.full_deck_batched_generation_enabled:
+        return
+    raise FullDeckSessionAPIError(
+        409,
+        "full_deck_batched_generation_disabled",
+        "分批全稿生成当前未启用。",
+    )
+
+
 def _session_job_response(
     store: ProjectStore,
     project_id: str,
@@ -168,6 +180,7 @@ def build_full_deck_session_router(
         project_id: str,
         request: FullDeckGenerationStartRequest,
     ) -> dict[str, Any]:
+        _require_batched_generation_enabled(context)
         store = context.store_for(project_id)
         manifest = store.read(latest_sample_only=True, include_sample_html=False)
         root = manifest.get("full_deck") or {}

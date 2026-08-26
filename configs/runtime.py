@@ -71,6 +71,13 @@ class RuntimePolicy(BaseModel):
     max_read_chars_per_call: int = Field(default=20_000, ge=100, le=100_000)
     max_read_chars_per_job: int = Field(default=80_000, ge=100, le=500_000)
     sample_page_count: int = Field(default=2, ge=1, le=6)
+    full_deck_batched_generation_enabled: bool = False
+    full_deck_reference_max_read_chars_per_call: int = Field(
+        default=20_000, ge=100, le=100_000
+    )
+    full_deck_reference_max_read_chars_per_batch: int = Field(
+        default=80_000, ge=100, le=500_000
+    )
     full_deck_max_files: int = Field(default=384, ge=16, le=512)
     full_deck_max_file_bytes: int = Field(default=4_000_000, ge=100_000, le=8_000_000)
     full_deck_max_total_bytes: int = Field(default=50_000_000, ge=1_000_000, le=64_000_000)
@@ -84,6 +91,14 @@ class RuntimePolicy(BaseModel):
     def validate_read_budget(self) -> "RuntimePolicy":
         if self.max_read_chars_per_call > self.max_read_chars_per_job:
             raise ValueError("max_read_chars_per_call cannot exceed the per-job budget")
+        if (
+            self.full_deck_reference_max_read_chars_per_call
+            > self.full_deck_reference_max_read_chars_per_batch
+        ):
+            raise ValueError(
+                "full_deck_reference_max_read_chars_per_call cannot exceed "
+                "the per-batch budget"
+            )
         return self
 
 
@@ -247,6 +262,21 @@ class ManagedRuntime:
             "policy": {
                 name: getattr(self.policy, name)
                 for name in EditableRuntimePolicy.model_fields
+            },
+            "features": {
+                "full_deck_batched_generation_enabled": (
+                    self.policy.full_deck_batched_generation_enabled
+                ),
+            },
+            "full_deck_limits": {
+                name: getattr(self.policy, name)
+                for name in (
+                    "full_deck_reference_max_read_chars_per_call",
+                    "full_deck_reference_max_read_chars_per_batch",
+                    "full_deck_max_files",
+                    "full_deck_max_file_bytes",
+                    "full_deck_max_total_bytes",
+                )
             },
             "runtime_hash": self.runtime_hash,
             "model_hash": self.model_hash,

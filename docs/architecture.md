@@ -26,6 +26,57 @@
 - `prompt_calls` 和 `prompt_call_events` 形成独立审计链，记录脱敏后的 messages、模板/运行/模型/Skill 哈希、模型参数、工具调用、开始/完成/失败/冲突和 output ref；只有已提交产物可进入 completed，CAS 冲突终态不携带 output ref。最新样品修复链从该审计记录投影为有界的尝试摘要，JSONL 只作为完整导出格式。
 - `.jobs/jobs.db` 持久化 Job 和状态事件。SQLite `BEGIN IMMEDIATE` 同时承担跨线程、跨 worker 的写入协调；后续多机部署可将表边界迁移到 PostgreSQL，并将 artifact 目录替换为对象存储。
 
+## 分批全稿生成
+
+首次全稿生成使用独立于正式修订的 `FullDeckGenerationSession`。确定性规划器 `balanced-3-4-v1` 按连续待生成区间固化 3–4 页批次；例如前两页为样品的 16 页全稿固定拆成 `4/4/3/3`。成功批次在同一事务中提交不可变 segment 包、部分 preview 包、页面就绪投影、指令应用记录和 `session_version`。只有全部批次成功后才从耐久包重新组装并创建一个正式 `pending_approval` 修订。
+
+会话状态为 `queued → running → pause_requested → paused`，失败时进入 `failed`，全部批次成功后经 `finalizing` 进入 `completed`；`cancelled` 与 `stale` 为终态。暂停和取消均在当前批安全提交后生效，不强杀模型调用。失败重试只领取首个未成功批；部分预览失败保留已验证 segment，最终发布失败也不重新生成页面。下一批指令不可变，运行第 N 批时新增的指令从 N+1 批开始生效，并由批次记录实际应用的 directive ID。
+
+模型只能通过只读参考工具访问服务端登记的已确认样品和最近两个成功 segment。参考路径、扩展名、来源 ID、文件大小和 UTF-8 内容均重新校验；用户指令和参考文本都按不可信数据处理，不能改变目标页、工具 allowlist 或发布校验。部分预览只从当前会话登记的 preview 包提供，继续复用正式预览的路径规范、媒体类型和 CSP。
+
+### 上线开关与预算
+
+`runtime.yaml` 中的 `full_deck_batched_generation_enabled` 控制新会话入口。仓库默认配置为 `true`；没有该字段的外部旧配置按安全默认值 `false` 加载。
+
+- 开关开启：会话 API 和兼容 Job 入口均启动分批链路。
+- 开关关闭：会话 API 拒绝新建会话，兼容 Job 入口使用既有单次全稿生成；已保存会话仍可读取和审计，正式全稿修订仍可预览、导出、修改、恢复和确认。
+- 切换开关不会删除 session、batch、directive、segment、preview 或 artifact。正在运行的 worker 使用启动时取得的运行配置；应先等待或取消活动 Job，再修改部署配置并重启服务。
+
+全稿生成的独立限制为：
+
+- `full_deck_reference_max_read_chars_per_call`：单次参考文件读取字符数，默认 20,000；
+- `full_deck_reference_max_read_chars_per_batch`：单批所有参考读取总字符数，默认 80,000，且不得小于单次预算；
+- `full_deck_max_files`：草稿/包最大文件数，默认 384；
+- `full_deck_max_file_bytes`：单文件最大字节数，默认 4,000,000；
+- `full_deck_max_total_bytes`：整包最大字节数，默认 50,000,000。
+
+这些字段属于部署边界，不在浏览器设置表单中编辑；公开 runtime context 只返回开关状态和数值，不返回凭据。运行配置哈希进入每个 PromptCall 和最终修订 provenance。
+
+### v5 迁移与运行手册
+
+v5 迁移是增量迁移：只新增生成会话、批次、页面投影、指令和不可变包表，并给 Job 数据库补充 `session_id`、`progress_json`。重复打开幂等，既有 checkpoint、正式修订哈希、artifact 元数据和文件内容不改写。没有破坏性降级迁移；回退应用版本前应先关闭分批开关并保留 v5 表，避免丢失可恢复证据。
+
+上线步骤：
+
+1. 备份受管项目目录和 `.jobs/jobs.db`，确认没有活动生成 Job。
+2. 以开关关闭状态启动新版本，打开旧工程并验证正式全稿预览、ZIP 导出和修改入口。
+3. 运行 Schema 初始化/启动检查，确认旧修订哈希与 artifact 文件不变。
+4. 开启开关，使用固定 16 页夹具验证 `4/4/3/3`、部分预览、暂停/继续、指令、失败重试和最终单修订发布。
+5. 导出审计并核对 revision → session → batch → PromptCall/directive → package → artifact SHA-256 关联。
+
+回滚步骤：
+
+1. 停止接收新生成请求；等待活动批到安全点，或通过取消接口登记协作式取消。
+2. 将 `full_deck_batched_generation_enabled` 设为 `false` 并重启服务加载配置。
+3. 验证已有正式修订的预览、导出和修改；保留所有 v5 表及内容寻址对象。
+4. 如需回退二进制，使用上线前备份并优先只回退应用代码；不要删除 v5 数据来模拟降级。
+
+故障排查优先读取 session 的稳定错误码和最近成功 preview 指针。`full_deck_preview_failed` 从已保存 segment 重组，`full_deck_finalization_failed` 从全部耐久 segment 重试发布，`full_deck_session_stale` 需要从新基线创建会话。不得把 `generated_html/` 当作恢复或预览来源。
+
+### 审计导出
+
+`GET /api/projects/{project_id}/audit/export` 在既有正式修订、时间线和 PromptCall 之外，增加有界的 `full_deck_generation`：会话锚点与发布修订哈希、批次目标和 PromptCall ID、指令正文及生效批次、页面内容引用、segment/preview 包哈希，以及每个包文件的 artifact ID 与 SHA-256。导出不包含包文件内容或内部磁盘路径；各集合有明确上限，并通过 `truncated` 标记是否截断。
+
 ## 安全
 
 - HTTP 请求体上限 512 KiB，Pydantic 请求模型拒绝未知字段。

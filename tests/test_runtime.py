@@ -27,10 +27,24 @@ def test_default_runtime_is_valid() -> None:
     assert runtime.policy.full_deck_max_files == 384
     assert runtime.policy.full_deck_max_file_bytes == 4_000_000
     assert runtime.policy.full_deck_max_total_bytes == 50_000_000
+    assert runtime.policy.full_deck_batched_generation_enabled is True
+    assert runtime.policy.full_deck_reference_max_read_chars_per_call == 20_000
+    assert runtime.policy.full_deck_reference_max_read_chars_per_batch == 80_000
+    assert runtime.public_context()["features"] == {
+        "full_deck_batched_generation_enabled": True,
+    }
+    assert runtime.public_context()["full_deck_limits"] == {
+        "full_deck_reference_max_read_chars_per_call": 20_000,
+        "full_deck_reference_max_read_chars_per_batch": 80_000,
+        "full_deck_max_files": 384,
+        "full_deck_max_file_bytes": 4_000_000,
+        "full_deck_max_total_bytes": 50_000_000,
+    }
     assert "api_key_env" not in runtime.public_context()["model_bindings"][0]
 
 
 def test_runtime_rejects_unknown_fields() -> None:
+    assert RuntimePolicy().full_deck_batched_generation_enabled is False
     with pytest.raises(ValueError):
         RuntimePolicy.model_validate({"unexpected": True})
 
@@ -38,6 +52,12 @@ def test_runtime_rejects_unknown_fields() -> None:
 def test_runtime_rejects_inverted_read_budget() -> None:
     with pytest.raises(ValueError):
         RuntimePolicy(max_read_chars_per_call=200, max_read_chars_per_job=100)
+
+    with pytest.raises(ValueError, match="per-batch budget"):
+        RuntimePolicy(
+            full_deck_reference_max_read_chars_per_call=200,
+            full_deck_reference_max_read_chars_per_batch=100,
+        )
 
 
 def test_runtime_allows_tool_round_limit_up_to_one_hundred() -> None:
@@ -84,6 +104,8 @@ def test_runtime_update_persists_and_reloads_safe_fields(tmp_path: Path) -> None
     assert updated.models.binding_for("narrative_structure").parameters == {"temperature": 0.2}
     assert updated.models.binding_for("narrative_structure").api_key_env == "ARK_API_KEY"
     assert updated.policy.max_auto_questions == 4
+    assert updated.policy.full_deck_batched_generation_enabled is True
+    assert updated.policy.full_deck_reference_max_read_chars_per_batch == 80_000
     assert updated.model_hash != runtime.model_hash
     assert yaml.safe_load((tmp_path / "runtime.yaml").read_text(encoding="utf-8"))["max_auto_questions"] == 4
 

@@ -14,6 +14,7 @@ from agent_core.models import (
     utc_now,
 )
 from storage.errors import ConflictError
+from storage.full_deck_generation_audit import FullDeckGenerationAuditMixin
 from storage.full_deck_generation_packages import FullDeckGenerationPackageStoreMixin
 from storage.persistence import json_text
 
@@ -21,7 +22,10 @@ from storage.persistence import json_text
 _UNSET = object()
 
 
-class FullDeckGenerationStoreMixin(FullDeckGenerationPackageStoreMixin):
+class FullDeckGenerationStoreMixin(
+    FullDeckGenerationAuditMixin,
+    FullDeckGenerationPackageStoreMixin,
+):
     @staticmethod
     def _generation_session_value(row: sqlite3.Row) -> dict[str, Any]:
         return {
