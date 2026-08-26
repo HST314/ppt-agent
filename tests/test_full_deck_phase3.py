@@ -5,7 +5,6 @@ import re
 import shutil
 import sqlite3
 import threading
-import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -31,6 +30,7 @@ from agent_core.workflow import (
 )
 from configs.runtime import ManagedRuntime
 from storage.project_store import ProjectStore
+from tests.job_support import wait_for_terminal_job
 
 
 OUTLINE = "# 逐页大纲\n\n" + "\n".join(
@@ -124,12 +124,11 @@ def _targets(prompt: str) -> list[int]:
 
 
 def _wait_for_job(registry: JobRegistry, job_id: str) -> dict:
-    for _ in range(500):
-        job = registry.get(job_id)
-        if job["status"] not in {"queued", "running"}:
-            return job
-        time.sleep(0.01)
-    raise AssertionError("job did not reach a terminal state")
+    return wait_for_terminal_job(
+        registry.get,
+        job_id,
+        fetch_events=registry.events,
+    )
 
 
 def test_pending_pages_split_around_the_confirmed_middle_sample() -> None:

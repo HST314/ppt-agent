@@ -2,7 +2,6 @@ import json
 import os
 import sqlite3
 import threading
-import time
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from agent_core.processes import process_is_alive
 from agent_core.workflow import Workflow
 from configs.runtime import ManagedRuntime
 from storage.project_store import ProjectStore
+from tests.job_support import wait_for_terminal_job
 
 
 def _write_legacy_project(root: Path, project_id: str, runtime: dict) -> str:
@@ -507,11 +507,11 @@ def test_job_registry_uses_sqlite_and_deduplicates_across_instances(tmp_path: Pa
     registry = JobRegistry(root)
     job = registry.submit("demo", "generate_sample", "checkpoint_value", lambda: None)
     assert "_owner_pid" not in job
-    for _ in range(100):
-        job = registry.get(job["job_id"])
-        if job["status"] == "succeeded":
-            break
-        time.sleep(0.01)
+    job = wait_for_terminal_job(
+        registry.get,
+        job["job_id"],
+        fetch_events=registry.events,
+    )
 
     assert job["status"] == "succeeded"
     assert (root / "jobs.db").is_file()
@@ -545,8 +545,9 @@ def test_live_job_is_not_failed_when_another_worker_starts(tmp_path: Path) -> No
     assert second.get(job["job_id"])["status"] == "running"
 
     release.set()
-    for _ in range(100):
-        if first.get(job["job_id"])["status"] == "succeeded":
-            break
-        time.sleep(0.01)
-    assert first.get(job["job_id"])["status"] == "succeeded"
+    terminal = wait_for_terminal_job(
+        first.get,
+        job["job_id"],
+        fetch_events=first.events,
+    )
+    assert terminal["status"] == "succeeded"

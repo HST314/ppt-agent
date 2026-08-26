@@ -4,7 +4,25 @@ from shutil import copy2
 import pytest
 import yaml
 
+from agent_core.jobs import JobRegistry
 from configs.runtime import ManagedRuntime
+
+
+@pytest.fixture(autouse=True)
+def shutdown_test_job_registries(monkeypatch: pytest.MonkeyPatch):
+    """Track and close every registry created by a test."""
+
+    registries: list[JobRegistry] = []
+    original_init = JobRegistry.__init__
+
+    def tracked_init(registry: JobRegistry, *args, **kwargs) -> None:
+        original_init(registry, *args, **kwargs)
+        registries.append(registry)
+
+    monkeypatch.setattr(JobRegistry, "__init__", tracked_init)
+    yield
+    for registry in reversed(registries):
+        registry.shutdown()
 
 
 @pytest.fixture

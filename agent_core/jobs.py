@@ -445,6 +445,12 @@ class JobRegistry:
             for row in rows
         ]
 
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Release worker threads after queued jobs have finished."""
+
+        self.pool.shutdown(wait=wait)
+        self.futures.clear()
+
 
 class JobCancelled(RuntimeError):
     """A cooperative job stopped before publishing any project mutation."""

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -22,6 +21,7 @@ from agent_core.models import (
 from agent_core.workflow import Workflow
 from configs.runtime import ManagedRuntime
 from storage.project_store import ConflictError, ProjectStore
+from tests.job_support import wait_for_terminal_job
 
 
 OUTLINE = "# 逐页大纲\n\n" + "\n".join(
@@ -115,12 +115,11 @@ def _revision(manifest: dict, revision_hash: str) -> dict:
 
 
 def _wait_for_job(registry: JobRegistry, job_id: str) -> dict:
-    for _ in range(500):
-        job = registry.get(job_id)
-        if job["status"] not in {"queued", "running"}:
-            return job
-        time.sleep(0.01)
-    raise AssertionError("job did not reach a terminal state")
+    return wait_for_terminal_job(
+        registry.get,
+        job_id,
+        fetch_events=registry.events,
+    )
 
 
 def test_feedback_can_replace_a_sample_page_without_changing_other_refs(

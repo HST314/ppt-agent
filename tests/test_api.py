@@ -1,4 +1,3 @@
-import time
 from pathlib import Path
 from shutil import copy2
 
@@ -10,6 +9,7 @@ from agent_core.jobs import JobRegistry
 from agent_core.models import utc_now
 from configs.runtime import ManagedRuntime
 from storage.project_store import ProjectStore
+from tests.job_support import wait_for_terminal_job
 
 
 def finish_job(client: TestClient, response) -> dict:
@@ -18,11 +18,15 @@ def finish_job(client: TestClient, response) -> dict:
 
 
 def wait_for_job(client: TestClient, job_id: str) -> dict:
-    for _ in range(100):
-        job = client.get(f"/api/jobs/{job_id}").json()
-        if job["status"] not in {"queued", "running"}:
-            break
-        time.sleep(0.01)
+    job = wait_for_terminal_job(
+        lambda current_job_id: client.get(
+            f"/api/jobs/{current_job_id}"
+        ).json(),
+        job_id,
+        fetch_events=lambda current_job_id: client.get(
+            f"/api/jobs/{current_job_id}/events"
+        ).json(),
+    )
     assert job["status"] == "succeeded", job
     return job
 
@@ -63,12 +67,7 @@ def test_api_drives_project_to_narrative(
     })
     assert response.status_code == 202
     job_id = response.json()["job_id"]
-    for _ in range(100):
-        job = client.get(f"/api/jobs/{job_id}").json()
-        if job["status"] not in {"queued", "running"}:
-            break
-        time.sleep(0.01)
-    assert job["status"] == "succeeded"
+    wait_for_job(client, job_id)
     events = client.get(f"/api/jobs/{job_id}/events").json()
     assert events[0]["status"] == "queued"
     assert events[-1]["status"] == "succeeded"
