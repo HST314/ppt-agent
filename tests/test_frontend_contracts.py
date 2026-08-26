@@ -30,6 +30,8 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert "已发布为 PPT 样品" in samples
     assert "source_slide_number" in samples
     assert 'id="max-tool-rounds" name="max_tool_rounds" type="number" min="0" max="100"' in app
+    assert 'id="max-clarification-rounds" name="max_clarification_rounds" type="number" min="1" max="10"' in app
+    assert "每轮答完后由模型判断是否继续" in app
     assert "不会创建新修订" in samples
     assert 'data-action="branch_sample_revision"' in samples
     assert 'data-sample-revision="${escapeHtml(revision.revision_hash)}" aria-pressed="${selected}"' in samples

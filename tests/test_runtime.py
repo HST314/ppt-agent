@@ -14,6 +14,7 @@ def test_default_runtime_is_valid() -> None:
     assert runtime.policy.stream_model_output is False
     assert len(runtime.models.state_bindings) == 5
     assert runtime.policy.sample_page_count == 2
+    assert runtime.policy.max_clarification_rounds == 3
     assert runtime.policy.max_tool_rounds == 20
     assert {binding.provider for binding in runtime.models.state_bindings} == {"ark"}
     assert {binding.model for binding in runtime.models.state_bindings} == {"deepseek-v4-flash-ga-260731"}

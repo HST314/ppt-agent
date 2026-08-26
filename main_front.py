@@ -505,7 +505,20 @@ def answer_clarification(project_id: str, request: ClarificationRequest) -> dict
     store = store_for(project_id)
     with runtime_config_lock:
         current_runtime = runtime
-    Workflow(store, current_runtime).answer_clarification(request.checkpoint_id, request.question_card_id, request.answers)
+    workflow = Workflow(store, current_runtime)
+    updated = workflow.answer_clarification(
+        request.checkpoint_id,
+        request.question_card_id,
+        request.answers,
+    )
+    if "start_clarification" in capabilities(updated):
+        next_checkpoint_id = updated["checkpoint_id"]
+        jobs.submit(
+            project_id,
+            "start_clarification",
+            next_checkpoint_id,
+            lambda: workflow.start_clarification(next_checkpoint_id),
+        )
     return project_view(store)
 
 

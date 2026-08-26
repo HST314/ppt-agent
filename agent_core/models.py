@@ -57,6 +57,7 @@ class Question(StrictModel):
 class QuestionCard(StrictModel):
     question_card_id: str = Field(default_factory=lambda: "questions_" + uuid4().hex[:16])
     checkpoint_id: str
+    round: int = Field(default=1, ge=1, le=20)
     questions: list[Question]
     provenance: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)

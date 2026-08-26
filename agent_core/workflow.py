@@ -9,6 +9,13 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from agent_core.clarification import (
+    clarification_directive,
+    clarification_history_with_answers,
+    clarification_prompt_history,
+    select_new_questions,
+    should_continue_clarification,
+)
 from agent_core.full_deck_generation import (
     FullDeckGenerationError,
     generate_full_deck as run_full_deck_generation,
@@ -28,7 +35,6 @@ from agent_core.models import (
     FullDeckPlan,
     FullDeckRevision,
     HtmlPptPackage,
-    Question,
     QuestionCard,
     SampleRevision,
     TaskCard,
@@ -350,7 +356,10 @@ def capabilities(
     active_job = active_job or bool(manifest.get("active_job_id"))
     state, phase = manifest["state"], manifest["phase"]
     caps = ["inspect", "branch"]
-    if state == "intake" and phase == "ready_for_clarification":
+    if (
+        state in {"intake", "intake_clarify"}
+        and phase == "ready_for_clarification"
+    ):
         caps.append("start_clarification")
     elif state == "intake_clarify" and phase == "waiting_clarification":
         caps.append("answer_clarification")
@@ -530,21 +539,91 @@ class Workflow:
         if capability not in capabilities(manifest):
             raise ConflictError(f"capability_not_available:{capability}")
 
+    def _complete_clarification_without_model(
+        self,
+        checkpoint_id: str,
+        *,
+        round_number: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            value.update(
+                state="narrative_structure",
+                phase="ready_to_generate",
+                question_card=None,
+                clarification_completed=True,
+            )
+            return value
+
+        return self.store.update(
+            apply,
+            "clarification_completed",
+            {"round": round_number, "reason": reason},
+            expected_checkpoint_id=checkpoint_id,
+        )
+
     def start_clarification(self, checkpoint_id: str) -> dict[str, Any]:
         manifest = self.store.read()
         self._require(manifest, "start_clarification", checkpoint_id)
+        history = manifest.get("clarification_history", [])
+        round_number = len(history) + 1
+        asked_count = sum(len(entry.get("questions", [])) for entry in history)
+        remaining_budget = max(
+            0,
+            self.runtime.policy.clarification_total_budget - asked_count,
+        )
+        per_round_limit = min(
+            self.runtime.policy.max_auto_questions,
+            remaining_budget,
+        )
+        if self.runtime.policy.question_preference == "none":
+            return self._complete_clarification_without_model(
+                checkpoint_id,
+                round_number=round_number,
+                reason="question_preference_none",
+            )
+        if round_number > self.runtime.policy.max_clarification_rounds:
+            return self._complete_clarification_without_model(
+                checkpoint_id,
+                round_number=round_number,
+                reason="round_limit_reached",
+            )
+        if per_round_limit <= 0:
+            return self._complete_clarification_without_model(
+                checkpoint_id,
+                round_number=round_number,
+                reason="question_budget_exhausted",
+            )
         reader = SkillReader(self.runtime.skills_root, per_call=1000, per_job=1000)
         skill_index = reader.index()
         template, template_hash = self._template("clarify_questions.md")
+        prompt_history = clarification_prompt_history(manifest)
         prompt = (
-            template + "\n\nGenerate concise clarification questions for this presentation task. Return JSON with a questions array. "
+            template + "\n\nGenerate concise clarification questions for this presentation task. "
+            "Return JSON with needs_clarification and a questions array. "
             "Each item must contain field, prompt, impact, options[{value,label,recommended}], allow_free_text. "
-            f"Ask no more than {self.runtime.policy.max_auto_questions}. Task:\n"
+            f"This is clarification round {round_number} of at most "
+            f"{self.runtime.policy.max_clarification_rounds}. Ask no more than "
+            f"{per_round_limit} questions in this round. "
+            f"{clarification_directive(self.runtime.policy.question_preference)}\n"
+            "Task:\n"
             + json.dumps(manifest["task_card"], ensure_ascii=False)
+            + "\nAccumulated clarification answers:\n"
+            + json.dumps(manifest.get("clarification_answers", {}), ensure_ascii=False)
+            + "\nPrior rounds (questions and answers):\n"
+            + json.dumps(prompt_history, ensure_ascii=False)
             + "\nAvailable skill index:\n"
             + json.dumps(skill_index, ensure_ascii=False)
         )
         skills_hash = stable_hash(skill_index)
+        parent_prompt_call_id = next(
+            (
+                entry.get("prompt_call_id")
+                for entry in reversed(history)
+                if entry.get("prompt_call_id")
+            ),
+            None,
+        )
         prompt_call_id = self._start_prompt_audit(
             "intake_clarify",
             prompt,
@@ -552,23 +631,37 @@ class Workflow:
             template_hash=template_hash,
             skills_hash=skills_hash,
             json_mode=True,
+            parent_prompt_call_id=parent_prompt_call_id,
         )
         traces: list[dict[str, Any]] = []
         try:
             text, traces = self.gateway.generate("intake_clarify", prompt, json_mode=True)
             payload = self.gateway.parse_json(text)
-            raw_questions = payload.get("questions", [])[: self.runtime.policy.max_auto_questions]
-            questions = [Question.model_validate(item) for item in raw_questions]
-            if not questions:
-                raise WorkflowError("model returned no clarification questions")
+            questions = select_new_questions(payload, manifest, per_round_limit)
         except Exception as exc:
             self._fail_prompt_audit(prompt_call_id, exc, traces)
             raise
-        card_id = "questions_" + uuid4().hex[:16]
+        card_id = "questions_" + uuid4().hex[:16] if questions else None
+
         def apply(value: dict[str, Any]) -> dict[str, Any]:
+            if not questions:
+                value.update(
+                    state="narrative_structure",
+                    phase="ready_to_generate",
+                    question_card=None,
+                    clarification_completed=True,
+                )
+                value["last_tool_traces"] = traces
+                value["last_template"] = {
+                    "template_id": "clarify_questions",
+                    "template_version": 1,
+                    "template_hash": template_hash,
+                }
+                return value
             card = QuestionCard(
-                question_card_id=card_id,
+                question_card_id=card_id or "",
                 checkpoint_id=value["checkpoint_id"],
+                round=round_number,
                 questions=questions,
                 provenance={
                     **generation_provenance(skill_index, traces, text),
@@ -578,10 +671,16 @@ class Workflow:
                     "template_version": 1,
                     "template_hash": template_hash,
                     "prompt_call_id": prompt_call_id,
+                    "parent_prompt_call_id": parent_prompt_call_id,
                     "traces": traces,
                 },
             )
-            value.update(state="intake_clarify", phase="waiting_clarification", question_card=card.model_dump())
+            value.update(
+                state="intake_clarify",
+                phase="waiting_clarification",
+                question_card=card.model_dump(),
+                clarification_completed=False,
+            )
             value["last_tool_traces"] = traces
             value["last_template"] = {"template_id": "clarify_questions", "template_version": 1, "template_hash": template_hash}
             return value
@@ -590,13 +689,17 @@ class Workflow:
             prompt_call_id,
             lambda: self.store.update(
                 apply,
-                "clarification_generated",
-                {"question_card_id": card_id},
+                "clarification_generated" if questions else "clarification_completed",
+                {
+                    "question_card_id": card_id,
+                    "round": round_number,
+                    "reason": None if questions else "model_complete",
+                },
                 expected_checkpoint_id=checkpoint_id,
             ),
             traces=traces,
             messages=self.gateway.last_messages,
-            output_ref=card_id,
+            output_ref=card_id or f"clarification_complete_round_{round_number}",
             output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
         )
 
@@ -613,18 +716,51 @@ class Workflow:
             question["field"]: {"question": question["prompt"], "answer": answers[question["question_id"]]}
             for question in card["questions"]
         }
+        history = clarification_history_with_answers(manifest, card, answers)
+        should_continue = should_continue_clarification(
+            card,
+            history,
+            self.runtime.policy,
+        )
 
         def apply(value: dict[str, Any]) -> dict[str, Any]:
-            value["clarification_answers"] = clarified
-            value.update(state="narrative_structure", phase="ready_to_generate")
+            value.setdefault("clarification_answers", {}).update(clarified)
+            value["clarification_history"] = history
+            value["question_card"] = None
+            value["clarification_completed"] = not should_continue
+            if should_continue:
+                value.update(
+                    state="intake_clarify",
+                    phase="ready_for_clarification",
+                )
+            else:
+                value.update(
+                    state="narrative_structure",
+                    phase="ready_to_generate",
+                )
             return value
 
-        return self.store.update(
+        updated = self.store.update_events(
             apply,
-            "clarification_answered",
-            {"question_card_id": question_card_id},
+            [
+                (
+                    "clarification_answered",
+                    {
+                        "question_card_id": question_card_id,
+                        "round": card.get("round", 1),
+                    },
+                ),
+                *([] if should_continue else [(
+                    "clarification_completed",
+                    {
+                        "round": card.get("round", 1),
+                        "reason": "round_or_question_budget_reached",
+                    },
+                )]),
+            ],
             expected_checkpoint_id=checkpoint_id,
         )
+        return updated
 
     def generate_document(self, document_type: DocumentType, checkpoint_id: str, *, regenerate: bool = False) -> dict[str, Any]:
         manifest = self.store.read()

@@ -21,14 +21,26 @@ def workflow(tmp_path: Path, mock_runtime: ManagedRuntime) -> Workflow:
     return Workflow(store, runtime)
 
 
+def finish_automatic_clarification(workflow: Workflow, manifest: dict) -> dict:
+    while (
+        manifest["state"] == "intake_clarify"
+        and manifest["phase"] == "ready_for_clarification"
+    ):
+        manifest = workflow.start_clarification(manifest["checkpoint_id"])
+    return manifest
+
+
 def ready_for_sample(workflow: Workflow) -> dict:
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
-    manifest = workflow.answer_clarification(
-        manifest["checkpoint_id"],
-        card["question_card_id"],
-        {question["question_id"]: "management" for question in card["questions"]},
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {question["question_id"]: "management" for question in card["questions"]},
+        ),
     )
     for document_type in ("narrative_structure", "slide_outline"):
         manifest = workflow.generate_document(document_type, manifest["checkpoint_id"])
@@ -98,13 +110,15 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
     assert card["checkpoint_id"] == manifest["checkpoint_id"]
     assert card["provenance"]["skills_hash"] == stable_hash(card["provenance"]["skill_index"])
 
-    manifest = workflow.answer_clarification(
-        manifest["checkpoint_id"],
-        card["question_card_id"],
-        {question["question_id"]: "management" for question in card["questions"]},
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {question["question_id"]: "management" for question in card["questions"]},
+        ),
     )
     assert manifest["phase"] == "ready_to_generate"
-
     manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
     narrative = manifest["documents"]["narrative_structure"][-1]
     assert narrative["provenance"]["template_id"] == "narrative_structure"
@@ -165,6 +179,193 @@ def test_sample_stage_happy_path_and_feedback_revision(workflow: Workflow) -> No
     assert branched["state"] == "ppt_sample"
     assert branched["phase"] == "ready_to_generate"
     assert branched["samples"] == []
+
+
+def test_clarification_automatically_runs_multiple_rounds_with_prior_answers(
+    workflow: Workflow,
+) -> None:
+    outputs = iter([
+        {
+            "needs_clarification": True,
+            "questions": [{
+                "question_id": "q_audience",
+                "field": "audience",
+                "prompt": "主要听众是谁？",
+                "impact": "决定论证深度",
+                "options": [{
+                    "value": "management",
+                    "label": "管理层",
+                    "recommended": True,
+                }],
+                "allow_free_text": True,
+            }],
+        },
+        {
+            "needs_clarification": True,
+            "questions": [{
+                "question_id": "q_occasion",
+                "field": "occasion",
+                "prompt": "演示发生在什么场合？",
+                "impact": "决定开场方式",
+                "options": [{
+                    "value": "review",
+                    "label": "评审会",
+                    "recommended": True,
+                }],
+                "allow_free_text": True,
+            }],
+        },
+        {"needs_clarification": False, "questions": []},
+    ])
+    prompts: list[str] = []
+
+    def generate(state: str, prompt: str, **_kwargs):
+        assert state == "intake_clarify"
+        prompts.append(prompt)
+        return json.dumps(next(outputs), ensure_ascii=False), [{
+            "type": "model_call",
+            "provider": "test",
+            "model": "multi-round",
+            "usage": {},
+        }]
+
+    workflow.gateway.generate = generate
+    manifest = workflow.store.read()
+    first = workflow.start_clarification(manifest["checkpoint_id"])
+    assert first["question_card"]["round"] == 1
+
+    answered_first = workflow.answer_clarification(
+        first["checkpoint_id"],
+        first["question_card"]["question_card_id"],
+        {"q_audience": "管理层"},
+    )
+    assert answered_first["phase"] == "ready_for_clarification"
+    assert answered_first["clarification_answers"]["audience"]["answer"] == "管理层"
+    second = workflow.start_clarification(answered_first["checkpoint_id"])
+    assert second["state"] == "intake_clarify"
+    assert second["phase"] == "waiting_clarification"
+    assert second["question_card"]["round"] == 2
+    assert "主要听众是谁？" in prompts[1]
+    assert "管理层" in prompts[1]
+
+    answered_second = workflow.answer_clarification(
+        second["checkpoint_id"],
+        second["question_card"]["question_card_id"],
+        {"q_occasion": "评审会"},
+    )
+    assert answered_second["phase"] == "ready_for_clarification"
+    completed = workflow.start_clarification(answered_second["checkpoint_id"])
+    assert completed["state"] == "narrative_structure"
+    assert completed["phase"] == "ready_to_generate"
+    assert completed["clarification_completed"] is True
+    assert completed["question_card"] is None
+    assert [entry["round"] for entry in completed["clarification_history"]] == [1, 2]
+    assert completed["clarification_answers"]["audience"]["answer"] == "管理层"
+    assert completed["clarification_answers"]["occasion"]["answer"] == "评审会"
+    assert all(value in prompts[2] for value in (
+        "主要听众是谁？", "管理层", "演示发生在什么场合？", "评审会",
+    ))
+    calls = [
+        item for item in workflow.store.prompt_calls()
+        if item["state"] == "intake_clarify"
+    ]
+    assert len(calls) == 3
+    assert calls[1]["parent_prompt_call_id"] == calls[0]["prompt_call_id"]
+    assert calls[2]["parent_prompt_call_id"] == calls[1]["prompt_call_id"]
+
+
+def test_clarification_keeps_prior_answers_when_the_next_round_fails(
+    workflow: Workflow,
+) -> None:
+    first_output = {
+        "needs_clarification": True,
+        "questions": [{
+            "question_id": "q_audience",
+            "field": "audience",
+            "prompt": "主要听众是谁？",
+            "impact": "决定论证深度",
+            "options": [{
+                "value": "management",
+                "label": "管理层",
+                "recommended": True,
+            }],
+            "allow_free_text": True,
+        }],
+    }
+    workflow.gateway.generate = lambda *_args, **_kwargs: (
+        json.dumps(first_output, ensure_ascii=False),
+        [{"type": "model_call", "provider": "test", "model": "first", "usage": {}}],
+    )
+    first = workflow.start_clarification(workflow.store.read()["checkpoint_id"])
+    answered = workflow.answer_clarification(
+        first["checkpoint_id"],
+        first["question_card"]["question_card_id"],
+        {"q_audience": "管理层"},
+    )
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("temporary provider failure")
+
+    workflow.gateway.generate = fail
+    with pytest.raises(RuntimeError, match="temporary provider failure"):
+        workflow.start_clarification(answered["checkpoint_id"])
+
+    retained = workflow.store.read()
+    assert retained["phase"] == "ready_for_clarification"
+    assert retained["clarification_history"][0]["answers"] == {
+        "q_audience": "管理层",
+    }
+    assert retained["clarification_answers"]["audience"]["answer"] == "管理层"
+
+
+def test_clarification_stops_at_the_configured_round_limit(
+    workflow: Workflow,
+) -> None:
+    workflow.runtime.policy = workflow.runtime.policy.model_copy(
+        update={"max_clarification_rounds": 2}
+    )
+    call_count = 0
+
+    def generate(_state: str, _prompt: str, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        return json.dumps({
+            "needs_clarification": True,
+            "questions": [{
+                "question_id": f"q_{call_count}",
+                "field": f"field_{call_count}",
+                "prompt": f"第 {call_count} 轮问题？",
+                "impact": "补足输入",
+                "options": [{
+                    "value": "answer",
+                    "label": "回答",
+                    "recommended": True,
+                }],
+                "allow_free_text": True,
+            }],
+        }, ensure_ascii=False), [{
+            "type": "model_call",
+            "provider": "test",
+            "model": "round-limit",
+            "usage": {},
+        }]
+
+    workflow.gateway.generate = generate
+    manifest = workflow.start_clarification(workflow.store.read()["checkpoint_id"])
+    for round_number in (1, 2):
+        card = manifest["question_card"]
+        manifest = workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {card["questions"][0]["question_id"]: "回答"},
+        )
+        if round_number == 1:
+            manifest = workflow.start_clarification(manifest["checkpoint_id"])
+
+    assert call_count == 2
+    assert manifest["state"] == "narrative_structure"
+    assert manifest["phase"] == "ready_to_generate"
+    assert len(manifest["clarification_history"]) == 2
 
 
 def test_selecting_approved_sample_preserves_completed_phase(workflow: Workflow) -> None:
@@ -583,7 +784,14 @@ def test_editing_approved_narrative_invalidates_outline(workflow: Workflow) -> N
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
-    manifest = workflow.answer_clarification(manifest["checkpoint_id"], card["question_card_id"], {q["question_id"]: "answer" for q in card["questions"]})
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {q["question_id"]: "answer" for q in card["questions"]},
+        ),
+    )
     manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
     narrative = manifest["documents"]["narrative_structure"][-1]
     manifest = workflow.approve_document("narrative_structure", manifest["checkpoint_id"], narrative["revision_hash"])
@@ -641,10 +849,13 @@ def test_progress_snapshots_drive_stage_rerun_branch(workflow: Workflow) -> None
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
-    manifest = workflow.answer_clarification(
-        manifest["checkpoint_id"],
-        card["question_card_id"],
-        {question["question_id"]: "answer" for question in card["questions"]},
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {question["question_id"]: "answer" for question in card["questions"]},
+        ),
     )
     manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
     narrative = manifest["documents"]["narrative_structure"][-1]
@@ -692,10 +903,13 @@ def test_completed_outline_from_previous_release_can_enter_sample_stage(workflow
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
-    manifest = workflow.answer_clarification(
-        manifest["checkpoint_id"],
-        card["question_card_id"],
-        {question["question_id"]: "answer" for question in card["questions"]},
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {question["question_id"]: "answer" for question in card["questions"]},
+        ),
     )
     manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
     narrative = manifest["documents"]["narrative_structure"][-1]
@@ -725,10 +939,13 @@ def test_concurrent_edits_from_same_checkpoint_use_atomic_cas(workflow: Workflow
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
-    manifest = workflow.answer_clarification(
-        manifest["checkpoint_id"],
-        card["question_card_id"],
-        {question["question_id"]: "answer" for question in card["questions"]},
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {question["question_id"]: "answer" for question in card["questions"]},
+        ),
     )
     manifest = workflow.generate_document("narrative_structure", manifest["checkpoint_id"])
     shared_checkpoint = manifest["checkpoint_id"]
@@ -765,10 +982,13 @@ def test_concurrent_generation_only_completes_audit_for_committed_output(
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
-    manifest = workflow.answer_clarification(
-        manifest["checkpoint_id"],
-        card["question_card_id"],
-        {question["question_id"]: "answer" for question in card["questions"]},
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {question["question_id"]: "answer" for question in card["questions"]},
+        ),
     )
     checkpoint_id = manifest["checkpoint_id"]
     competing = Workflow(
@@ -823,10 +1043,13 @@ def test_generation_provenance_hashes_skill_index_reads_and_output(workflow: Wor
     manifest = workflow.store.read()
     manifest = workflow.start_clarification(manifest["checkpoint_id"])
     card = manifest["question_card"]
-    manifest = workflow.answer_clarification(
-        manifest["checkpoint_id"],
-        card["question_card_id"],
-        {question["question_id"]: "answer" for question in card["questions"]},
+    manifest = finish_automatic_clarification(
+        workflow,
+        workflow.answer_clarification(
+            manifest["checkpoint_id"],
+            card["question_card_id"],
+            {question["question_id"]: "answer" for question in card["questions"]},
+        ),
     )
     traces = [
         {"type": "model_call", "provider": "test", "model": "test-model", "usage": {}},

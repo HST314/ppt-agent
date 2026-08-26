@@ -1,4 +1,5 @@
 max_auto_questions: 3
+max_clarification_rounds: 3
 stream_model_output: false
 clarification_total_budget: 10
 question_preference: proactive

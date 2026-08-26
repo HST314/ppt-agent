@@ -12,7 +12,10 @@ from configs.runtime import ManagedRuntime
 
 def finish_job(client: TestClient, response) -> dict:
     assert response.status_code == 202
-    job_id = response.json()["job_id"]
+    return wait_for_job(client, response.json()["job_id"])
+
+
+def wait_for_job(client: TestClient, job_id: str) -> dict:
     for _ in range(100):
         job = client.get(f"/api/jobs/{job_id}").json()
         if job["status"] not in {"queued", "running"}:
@@ -20,6 +23,18 @@ def finish_job(client: TestClient, response) -> dict:
         time.sleep(0.01)
     assert job["status"] == "succeeded", job
     return job
+
+
+def finish_active_project_job(
+    client: TestClient,
+    project_id: str,
+    project: dict,
+) -> dict:
+    active_job = project.get("active_job")
+    if active_job:
+        wait_for_job(client, active_job["job_id"])
+        project = client.get(f"/api/projects/{project_id}").json()
+    return project
 
 
 def test_api_drives_project_to_narrative(
@@ -64,7 +79,12 @@ def test_api_drives_project_to_narrative(
         "answers": {question["question_id"]: "answer" for question in card["questions"]},
     })
     assert response.status_code == 200
-    assert response.json()["phase"] == "ready_to_generate"
+    project = finish_active_project_job(
+        client,
+        "api-demo",
+        response.json(),
+    )
+    assert project["phase"] == "ready_to_generate"
 
 
 def test_api_rejects_unknown_request_fields(tmp_path: Path, monkeypatch) -> None:
@@ -129,6 +149,7 @@ def test_api_drives_sample_generation_feedback_and_approval(
         "question_card_id": card["question_card_id"],
         "answers": {question["question_id"]: "answer" for question in card["questions"]},
     }).json()
+    project = finish_active_project_job(client, project_id, project)
 
     for operation, document_type in (
         ("generate_narrative", "narrative_structure"),

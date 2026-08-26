@@ -62,6 +62,7 @@ class RuntimePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_auto_questions: int = Field(default=3, ge=0, le=8)
+    max_clarification_rounds: int = Field(default=3, ge=1, le=10)
     stream_model_output: Literal[False] = False
     clarification_total_budget: int = Field(default=10, ge=0, le=30)
     question_preference: Literal["proactive", "minimal", "none"] = "proactive"
@@ -159,6 +160,7 @@ class EditableRuntimePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_auto_questions: int = Field(ge=0, le=8)
+    max_clarification_rounds: int = Field(ge=1, le=10)
     clarification_total_budget: int = Field(ge=0, le=30)
     question_preference: Literal["proactive", "minimal", "none"]
     model_timeout_seconds: float = Field(ge=1, le=600)
