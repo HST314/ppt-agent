@@ -2,15 +2,30 @@ import json
 import os
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 
+import pytest
+
 from agent_core.jobs import JobRegistry
-from agent_core.models import HtmlPptPackage, SamplePage, SampleRevision, TaskCard, utc_now
+from agent_core.models import (
+    FullDeckGenerationBatch,
+    FullDeckGenerationContentRef,
+    FullDeckGenerationDirective,
+    FullDeckGenerationPackage,
+    FullDeckGenerationPage,
+    FullDeckGenerationSession,
+    HtmlPptPackage,
+    SamplePage,
+    SampleRevision,
+    TaskCard,
+    utc_now,
+)
 from agent_core.processes import process_is_alive
 from agent_core.workflow import Workflow
 from configs.runtime import ManagedRuntime
-from storage.project_store import ProjectStore
+from storage.project_store import ConflictError, ProjectStore
 from tests.job_support import wait_for_terminal_job
 
 
@@ -220,7 +235,7 @@ def test_legacy_file_project_is_imported_without_removing_source_files(
     store = ProjectStore(root, "legacy-demo")
     imported = store.read()
 
-    assert imported["format_version"] == 4
+    assert imported["format_version"] == 5
     assert imported["storage"]["engine"] == "sqlite-wal"
     assert imported["samples"][0]["pages"][0]["html"] == "<main>旧样品</main>"
     assert store.database_path.is_file()
@@ -551,3 +566,412 @@ def test_live_job_is_not_failed_when_another_worker_starts(tmp_path: Path) -> No
         fetch_events=first.events,
     )
     assert terminal["status"] == "succeeded"
+
+
+def _generation_records(
+    *,
+    session_id: str,
+    batch_count: int,
+) -> tuple[
+    FullDeckGenerationSession,
+    list[FullDeckGenerationBatch],
+    list[FullDeckGenerationPage],
+]:
+    session = FullDeckGenerationSession(
+        session_id=session_id,
+        full_deck_id="deck_" + "d" * 24,
+        branch="main",
+        base_checkpoint_id="checkpoint_" + "c" * 24,
+        base_revision_hash="sha256:" + "1" * 64,
+        outline_revision_hash="sha256:" + "2" * 64,
+        sample_revision_hash="sha256:" + "3" * 64,
+        planner_version="balanced-3-4-v1",
+        total_batches=batch_count,
+    )
+    batches: list[FullDeckGenerationBatch] = []
+    pages: list[FullDeckGenerationPage] = []
+    for batch_index in range(1, batch_count + 1):
+        slot_id = f"slot_{batch_index:024x}"
+        slide_number = batch_index + 2
+        batches.append(FullDeckGenerationBatch(
+            session_id=session_id,
+            batch_index=batch_index,
+            slot_ids=[slot_id],
+            source_slide_numbers=[slide_number],
+        ))
+        pages.append(FullDeckGenerationPage(
+            session_id=session_id,
+            position=batch_index - 1,
+            slot_id=slot_id,
+            source_slide_number=slide_number,
+            title=f"生成页 {slide_number}",
+            generation_status="queued",
+            batch_index=batch_index,
+            source_type="pending",
+        ))
+    return session, batches, pages
+
+
+def _generation_package(
+    *,
+    session_id: str,
+    batch_index: int,
+    kind: str,
+    suffix: str,
+) -> FullDeckGenerationPackage:
+    slide_id = f"generated_{batch_index}"
+    return FullDeckGenerationPackage.model_validate({
+        "package_id": f"fullgenpkg_{suffix * 32}",
+        "session_id": session_id,
+        "batch_index": batch_index,
+        "kind": kind,
+        "entrypoint": "index.html",
+        "title": f"{kind} {batch_index}",
+        "slide_count": 1,
+        "slides": [{
+            "slide_id": slide_id,
+            "title": f"生成页 {batch_index + 2}",
+            "source_slide_number": batch_index + 2,
+        }],
+        "files": [{
+            "path": "index.html",
+            "content": f"<main data-slide-id='{slide_id}'>{kind}</main>",
+            "encoding": "utf-8",
+        }],
+        "composition_manifest": {"kind": kind, "batch_index": batch_index},
+    })
+
+
+def test_generation_session_cas_directives_and_active_session_uniqueness(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path / "projects"
+    store = ProjectStore(root, "generation-cas")
+    store.create(
+        TaskCard(title="分批生成", objective="验证会话 CAS").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    session, batches, pages = _generation_records(
+        session_id="fullsession_" + "a" * 32,
+        batch_count=2,
+    )
+    created = store.create_full_deck_generation_session(session, batches, pages)
+
+    assert created["session_version"] == 1
+    directive = FullDeckGenerationDirective(
+        directive_id="directive_" + "b" * 32,
+        session_id=session.session_id,
+        content="  后续页面减少装饰元素。  ",
+        apply_from_batch_index=2,
+    )
+    added = store.add_full_deck_generation_directive(
+        directive, expected_session_version=1
+    )
+    assert added["content"] == "后续页面减少装饰元素。"
+    assert added["session_version"] == 2
+    with pytest.raises(ConflictError, match="session_version_conflict"):
+        store.update_full_deck_generation_session(
+            session.session_id,
+            1,
+            status="paused",
+        )
+    with pytest.raises(ConflictError, match="transition_invalid"):
+        store.update_full_deck_generation_session(
+            session.session_id,
+            2,
+            status="completed",
+            completed_batches=2,
+            published_revision_hash="sha256:" + "8" * 64,
+        )
+
+    duplicate, duplicate_batches, duplicate_pages = _generation_records(
+        session_id="fullsession_" + "c" * 32,
+        batch_count=1,
+    )
+    with pytest.raises(ConflictError, match="session_conflict"):
+        store.create_full_deck_generation_session(
+            duplicate, duplicate_batches, duplicate_pages
+        )
+    assert store.active_full_deck_generation_session(
+        session.full_deck_id, "main"
+    )["session_id"] == session.session_id
+
+
+def test_generation_batch_commit_preview_read_and_restart_recovery(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path / "projects"
+    store = ProjectStore(root, "generation-restart")
+    store.create(
+        TaskCard(title="分批生成", objective="验证重启恢复").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    session, batches, pages = _generation_records(
+        session_id="fullsession_" + "d" * 32,
+        batch_count=2,
+    )
+    store.create_full_deck_generation_session(session, batches, pages)
+    claim = store.claim_full_deck_generation_batch(
+        session.session_id, expected_session_version=1
+    )
+    assert claim is not None
+    assert claim["batch"]["batch_index"] == 1
+    assert claim["session_version"] == 2
+
+    segment = _generation_package(
+        session_id=session.session_id,
+        batch_index=1,
+        kind="segment",
+        suffix="e",
+    )
+    preview = _generation_package(
+        session_id=session.session_id,
+        batch_index=1,
+        kind="preview",
+        suffix="f",
+    )
+    slot_id = batches[0].slot_ids[0]
+    committed = store.commit_full_deck_generation_batch(
+        session.session_id,
+        1,
+        expected_session_version=2,
+        segment_package=segment,
+        preview_package=preview,
+        page_content_refs={
+            slot_id: FullDeckGenerationContentRef(
+                package_id=segment.package_id,
+                package_hash=segment.package_hash,
+                slide_id=segment.slides[0].slide_id,
+                slide_content_hash="sha256:" + "4" * 64,
+            )
+        },
+    )
+    assert committed["completed_batches"] == 1
+    assert committed["batches"][0]["status"] == "succeeded"
+    assert committed["pages"][0]["generation_status"] == "ready"
+    assert committed["latest_preview_package_id"] == preview.package_id
+
+    restarted = ProjectStore(root, "generation-restart")
+    restored = restarted.full_deck_generation_session(session.session_id)
+    preview_path, media_type = restarted.full_deck_generation_preview_file(
+        session.session_id, "index.html"
+    )
+    assert restored["batches"][0]["segment_package_id"] == segment.package_id
+    assert preview_path.read_text(encoding="utf-8").endswith("preview</main>")
+    assert media_type == "text/html; charset=utf-8"
+
+    second_claim = restarted.claim_full_deck_generation_batch(
+        session.session_id, expected_session_version=3
+    )
+    assert second_claim is not None
+    assert second_claim["batch"]["batch_index"] == 2
+    recovered = ProjectStore(root, "generation-restart").recover_full_deck_generation_sessions()
+    assert len(recovered) == 1
+    assert recovered[0]["status"] == "failed"
+    assert recovered[0]["completed_batches"] == 1
+    assert [item["status"] for item in recovered[0]["batches"]] == [
+        "succeeded",
+        "failed",
+    ]
+    assert [item["generation_status"] for item in recovered[0]["pages"]] == [
+        "ready",
+        "failed",
+    ]
+    assert ProjectStore(root, "generation-restart").full_deck_generation_package_contents(
+        preview.package_id
+    )[0]["content"].endswith(b"preview</main>")
+    retry = ProjectStore(root, "generation-restart").claim_full_deck_generation_batch(
+        session.session_id,
+        expected_session_version=5,
+        retry_failed=True,
+    )
+    assert retry is not None
+    assert retry["batch"]["batch_index"] == 2
+    assert retry["batch"]["attempt_count"] == 2
+    after_retry = store.full_deck_generation_session(session.session_id)
+    assert after_retry["batches"][0]["status"] == "succeeded"
+    assert after_retry["latest_preview_package_id"] == preview.package_id
+
+
+def test_generation_batch_claim_is_atomic_across_store_instances(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path / "projects"
+    store = ProjectStore(root, "generation-claim")
+    store.create(
+        TaskCard(title="分批生成", objective="验证并发领取").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    session, batches, pages = _generation_records(
+        session_id="fullsession_" + "9" * 32,
+        batch_count=1,
+    )
+    store.create_full_deck_generation_session(session, batches, pages)
+    barrier = threading.Barrier(2)
+
+    def claim() -> dict | None:
+        worker_store = ProjectStore(root, "generation-claim")
+        barrier.wait(timeout=5)
+        return worker_store.claim_full_deck_generation_batch(session.session_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: claim(), range(2)))
+
+    assert sum(result is not None for result in results) == 1
+    snapshot = store.full_deck_generation_session(session.session_id)
+    assert snapshot["batches"][0]["status"] == "running"
+    assert snapshot["batches"][0]["attempt_count"] == 1
+    assert snapshot["session_version"] == 2
+
+
+def test_generation_batch_commit_rolls_back_before_session_version_publish(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path / "projects"
+    store = ProjectStore(root, "generation-rollback")
+    store.create(
+        TaskCard(title="分批生成", objective="验证提交回滚").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    session, batches, pages = _generation_records(
+        session_id="fullsession_" + "8" * 32,
+        batch_count=1,
+    )
+    store.create_full_deck_generation_session(session, batches, pages)
+    store.claim_full_deck_generation_batch(
+        session.session_id, expected_session_version=1
+    )
+    segment = _generation_package(
+        session_id=session.session_id,
+        batch_index=1,
+        kind="segment",
+        suffix="6",
+    )
+    preview = _generation_package(
+        session_id=session.session_id,
+        batch_index=1,
+        kind="preview",
+        suffix="7",
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_generation_session_publish
+            BEFORE UPDATE ON full_deck_generation_sessions
+            BEGIN
+                SELECT RAISE(ABORT, 'injected session publish failure');
+            END
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(ConflictError, match="package_conflict"):
+        store.commit_full_deck_generation_batch(
+            session.session_id,
+            1,
+            expected_session_version=2,
+            segment_package=segment,
+            preview_package=preview,
+            page_content_refs={
+                batches[0].slot_ids[0]: FullDeckGenerationContentRef(
+                    package_id=segment.package_id,
+                    package_hash=segment.package_hash,
+                    slide_id=segment.slides[0].slide_id,
+                    slide_content_hash="sha256:" + "5" * 64,
+                )
+            },
+        )
+
+    snapshot = store.full_deck_generation_session(session.session_id)
+    assert snapshot["session_version"] == 2
+    assert snapshot["latest_preview_package_id"] is None
+    assert snapshot["batches"][0]["status"] == "running"
+    assert snapshot["pages"][0]["generation_status"] == "generating"
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM full_deck_generation_packages"
+        ).fetchone()[0] == 0
+
+
+def test_v4_project_migrates_to_v5_without_changing_revisions_or_artifacts(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path / "projects"
+    store = ProjectStore(root, "generation-migration")
+    manifest = store.create(
+        TaskCard(title="迁移", objective="验证 v5 无损迁移").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    sample = SampleRevision.create(
+        [SamplePage(page_id="sample_1", title="样品", html="<main>样品</main>")],
+        revision=1,
+        parent=None,
+        feedback=None,
+    )
+    manifest = store.update(
+        lambda value: value | {
+            "samples": [sample.model_dump()],
+            "current_sample_revision_hash": sample.revision_hash,
+            "state": "ppt_sample",
+            "phase": "waiting_human_approval",
+        },
+        "sample_generated",
+        {"revision_hash": sample.revision_hash},
+        expected_checkpoint_id=manifest["checkpoint_id"],
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        artifact_rows = connection.execute(
+            "SELECT artifact_id, sha256, size_bytes, relative_path FROM artifacts"
+        ).fetchall()
+        for table in (
+            "full_deck_generation_package_files",
+            "full_deck_generation_packages",
+            "full_deck_generation_directives",
+            "full_deck_generation_pages",
+            "full_deck_generation_batches",
+            "full_deck_generation_sessions",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute(
+            "UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'"
+        )
+        for table in ("project_state", "checkpoints"):
+            rows = connection.execute(
+                f"SELECT rowid, payload_json FROM {table}"
+            ).fetchall()
+            for rowid, raw in rows:
+                payload = json.loads(raw)
+                payload["format_version"] = 4
+                connection.execute(
+                    f"UPDATE {table} SET payload_json = ? WHERE rowid = ?",
+                    (json.dumps(payload), rowid),
+                )
+        connection.commit()
+    artifact_bytes = {
+        row[0]: (store.root / row[3]).read_bytes() for row in artifact_rows
+    }
+    ProjectStore._initialized_databases.pop(str(store.database_path), None)
+
+    migrated = ProjectStore(root, "generation-migration").read()
+
+    assert migrated["format_version"] == 5
+    assert migrated["samples"][0]["revision_hash"] == sample.revision_hash
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "5"
+        assert connection.execute(
+            "SELECT count(*) FROM full_deck_generation_sessions"
+        ).fetchone()[0] == 0
+        migrated_artifacts = connection.execute(
+            "SELECT artifact_id, sha256, size_bytes, relative_path FROM artifacts"
+        ).fetchall()
+    assert migrated_artifacts == artifact_rows
+    assert {
+        row[0]: (store.root / row[3]).read_bytes() for row in migrated_artifacts
+    } == artifact_bytes

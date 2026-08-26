@@ -16,6 +16,8 @@ from uuid import uuid4
 from agent_core.models import utc_now
 from agent_core.sample_html import SANITIZER_VERSION
 from runtime.package_tool import TEXT_SUFFIXES, normalize_package_path, package_media_type
+from storage.errors import ConflictError
+from storage.full_deck_generation_store import FullDeckGenerationStoreMixin
 from storage.persistence import atomic_bytes, exclusive_file_lock, json_text
 from storage.prompt_audit import PromptAuditMixin
 from storage.retained_project import (
@@ -41,14 +43,10 @@ STAGE_IDS = (
     "ppt_full",
     "acceptance",
 )
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 INITIALIZATION_LOCK_TIMEOUT_SECONDS = 30
 MAX_GENERATED_HTML_FILES_PER_ATTEMPT = 12
 MAX_GENERATED_HTML_BYTES_PER_FILE = 1_000_000
-
-
-class ConflictError(RuntimeError):
-    pass
 
 
 def mark_full_deck_stale(manifest: dict[str, Any]) -> None:
@@ -73,7 +71,7 @@ def full_deck_phase(revision: dict[str, Any]) -> str:
     return "waiting_human_approval"
 
 
-class ProjectStore(PromptAuditMixin):
+class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
     _locks: dict[str, threading.RLock] = {}
     _initialized_databases: dict[str, int] = {}
 
@@ -176,6 +174,18 @@ class ProjectStore(PromptAuditMixin):
                                 payload["format_version"] = 4
                                 payload.setdefault("full_deck", None)
                                 payload.pop("full_deck_revisions", None)
+                                connection.execute(
+                                    f"UPDATE {table} SET payload_json = ? WHERE rowid = ?",
+                                    (json_text(payload), row["storage_rowid"]),
+                                )
+                    if previous_version < 5:
+                        for table in ("project_state", "checkpoints"):
+                            rows = connection.execute(
+                                f"SELECT rowid AS storage_rowid, payload_json FROM {table}"
+                            ).fetchall()
+                            for row in rows:
+                                payload = json.loads(row["payload_json"])
+                                payload["format_version"] = 5
                                 connection.execute(
                                     f"UPDATE {table} SET payload_json = ? WHERE rowid = ?",
                                     (json_text(payload), row["storage_rowid"]),

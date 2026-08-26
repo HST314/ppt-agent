@@ -416,7 +416,7 @@ def test_full_deck_stales_on_outline_edit_and_reruns_from_initial_revision(
         ).fetchone()[0] == "stale"
 
 
-def test_v3_sqlite_project_migrates_to_v4_idempotently(
+def test_v3_sqlite_project_migrates_to_v5_idempotently(
     tmp_path: Path,
     mock_runtime: ManagedRuntime,
 ) -> None:
@@ -428,6 +428,12 @@ def test_v3_sqlite_project_migrates_to_v4_idempotently(
     )
     with sqlite3.connect(store.database_path) as connection:
         for table in (
+            "full_deck_generation_package_files",
+            "full_deck_generation_packages",
+            "full_deck_generation_directives",
+            "full_deck_generation_pages",
+            "full_deck_generation_batches",
+            "full_deck_generation_sessions",
             "full_deck_package_files",
             "full_deck_packages",
             "full_deck_pages",
@@ -454,7 +460,7 @@ def test_v3_sqlite_project_migrates_to_v4_idempotently(
     ProjectStore._initialized_databases.pop(str(store.database_path), None)
 
     migrated = ProjectStore(root, "migration-demo").read()
-    assert migrated["format_version"] == 4
+    assert migrated["format_version"] == 5
     assert migrated["full_deck"] is None
     assert migrated["full_deck_revisions"] == []
     ProjectStore._initialized_databases.pop(str(store.database_path), None)
@@ -462,11 +468,11 @@ def test_v3_sqlite_project_migrates_to_v4_idempotently(
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "4"
+        ).fetchone()[0] == "5"
         persisted_payload = json.loads(connection.execute(
             "SELECT payload_json FROM project_state WHERE singleton = 1"
         ).fetchone()[0])
-        assert persisted_payload["format_version"] == 4
+        assert persisted_payload["format_version"] == 5
         assert persisted_payload["full_deck"] is None
         assert {
             row[0] for row in connection.execute(
@@ -477,4 +483,10 @@ def test_v3_sqlite_project_migrates_to_v4_idempotently(
             "full_deck_pages",
             "full_deck_packages",
             "full_deck_package_files",
+            "full_deck_generation_sessions",
+            "full_deck_generation_batches",
+            "full_deck_generation_pages",
+            "full_deck_generation_directives",
+            "full_deck_generation_packages",
+            "full_deck_generation_package_files",
         }

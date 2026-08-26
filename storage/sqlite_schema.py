@@ -154,6 +154,103 @@ CREATE TABLE IF NOT EXISTS full_deck_package_files (
     PRIMARY KEY (revision_hash, logical_path),
     UNIQUE (revision_hash, file_index)
 );
+CREATE TABLE IF NOT EXISTS full_deck_generation_sessions (
+    session_id TEXT PRIMARY KEY,
+    full_deck_id TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    base_checkpoint_id TEXT NOT NULL,
+    base_revision_hash TEXT NOT NULL,
+    outline_revision_hash TEXT NOT NULL,
+    sample_revision_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    planner_version TEXT NOT NULL,
+    total_batches INTEGER NOT NULL,
+    completed_batches INTEGER NOT NULL DEFAULT 0,
+    active_batch_index INTEGER,
+    session_version INTEGER NOT NULL DEFAULT 1,
+    latest_preview_package_id TEXT,
+    published_revision_hash TEXT,
+    error_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS full_deck_generation_session_deck_idx
+ON full_deck_generation_sessions(full_deck_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS full_deck_generation_active_session_idx
+ON full_deck_generation_sessions(full_deck_id, branch)
+WHERE status IN ('queued', 'running', 'pause_requested', 'paused', 'failed', 'finalizing');
+CREATE TABLE IF NOT EXISTS full_deck_generation_batches (
+    session_id TEXT NOT NULL
+        REFERENCES full_deck_generation_sessions(session_id) ON DELETE CASCADE,
+    batch_index INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    slot_ids_json TEXT NOT NULL,
+    source_slide_numbers_json TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    segment_package_id TEXT,
+    prompt_call_ids_json TEXT NOT NULL DEFAULT '[]',
+    applied_directive_ids_json TEXT NOT NULL DEFAULT '[]',
+    error_json TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    PRIMARY KEY (session_id, batch_index)
+);
+CREATE TABLE IF NOT EXISTS full_deck_generation_pages (
+    session_id TEXT NOT NULL
+        REFERENCES full_deck_generation_sessions(session_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    slot_id TEXT NOT NULL,
+    source_slide_number INTEGER,
+    title TEXT NOT NULL,
+    generation_status TEXT NOT NULL,
+    batch_index INTEGER,
+    source_type TEXT NOT NULL,
+    content_ref_json TEXT,
+    error_json TEXT,
+    PRIMARY KEY (session_id, slot_id),
+    UNIQUE (session_id, position)
+);
+CREATE INDEX IF NOT EXISTS full_deck_generation_pages_batch_idx
+ON full_deck_generation_pages(session_id, batch_index, position);
+CREATE TABLE IF NOT EXISTS full_deck_generation_directives (
+    directive_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL
+        REFERENCES full_deck_generation_sessions(session_id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    apply_from_batch_index INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    first_applied_at TEXT
+);
+CREATE INDEX IF NOT EXISTS full_deck_generation_directives_session_idx
+ON full_deck_generation_directives(session_id, created_at, directive_id);
+CREATE TABLE IF NOT EXISTS full_deck_generation_packages (
+    package_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL
+        REFERENCES full_deck_generation_sessions(session_id) ON DELETE CASCADE,
+    batch_index INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    package_hash TEXT NOT NULL,
+    entrypoint TEXT NOT NULL,
+    title TEXT NOT NULL,
+    slide_count INTEGER NOT NULL,
+    slides_json TEXT NOT NULL,
+    composition_manifest_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS full_deck_generation_packages_session_idx
+ON full_deck_generation_packages(session_id, batch_index, kind, created_at);
+CREATE TABLE IF NOT EXISTS full_deck_generation_package_files (
+    package_id TEXT NOT NULL
+        REFERENCES full_deck_generation_packages(package_id) ON DELETE CASCADE,
+    file_index INTEGER NOT NULL,
+    logical_path TEXT NOT NULL,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    origin TEXT NOT NULL,
+    PRIMARY KEY (package_id, logical_path),
+    UNIQUE (package_id, file_index)
+);
 CREATE TABLE IF NOT EXISTS prompt_calls (
     prompt_call_id TEXT PRIMARY KEY,
     parent_prompt_call_id TEXT,

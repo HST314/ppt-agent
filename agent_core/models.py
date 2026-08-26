@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Literal
@@ -268,6 +269,277 @@ class FullDeckPlan(StrictModel):
 
 class FullDeckPackage(HtmlPptPackage):
     composition_manifest: dict[str, Any]
+
+
+FullDeckGenerationSessionStatus = Literal[
+    "queued",
+    "running",
+    "pause_requested",
+    "paused",
+    "failed",
+    "finalizing",
+    "completed",
+    "cancelled",
+    "stale",
+]
+FullDeckGenerationBatchStatus = Literal["pending", "running", "succeeded", "failed"]
+FullDeckGenerationPageStatus = Literal[
+    "sample_ready", "queued", "generating", "ready", "failed"
+]
+FULL_DECK_GENERATION_SESSION_TRANSITIONS: dict[str, frozenset[str]] = {
+    "queued": frozenset({"running", "cancelled", "stale"}),
+    "running": frozenset(
+        {"pause_requested", "failed", "finalizing", "cancelled", "stale"}
+    ),
+    "pause_requested": frozenset({"paused", "failed", "cancelled", "stale"}),
+    "paused": frozenset({"running", "cancelled", "stale"}),
+    "failed": frozenset({"running", "finalizing", "cancelled", "stale"}),
+    "finalizing": frozenset({"completed", "failed", "stale"}),
+    "completed": frozenset(),
+    "cancelled": frozenset(),
+    "stale": frozenset(),
+}
+FULL_DECK_GENERATION_BATCH_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending": frozenset({"running"}),
+    "running": frozenset({"succeeded", "failed"}),
+    "failed": frozenset({"running"}),
+    "succeeded": frozenset(),
+}
+
+
+class FullDeckGenerationContentRef(StrictModel):
+    """Immutable slide source used by a generation-session page projection."""
+
+    artifact_type: Literal["html_ppt_slide"] = "html_ppt_slide"
+    revision_hash: str | None = Field(
+        default=None, pattern=r"^sha256:[a-f0-9]{64}$"
+    )
+    package_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    package_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    slide_id: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    slide_content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def validate_source_identity(self) -> "FullDeckGenerationContentRef":
+        if (self.revision_hash is None) == (self.package_id is None):
+            raise ValueError(
+                "generation content references require exactly one revision or package id"
+            )
+        return self
+
+
+class FullDeckGenerationSession(StrictModel):
+    session_id: str = Field(
+        default_factory=lambda: "fullsession_" + uuid4().hex,
+        pattern=r"^fullsession_[a-f0-9]{32}$",
+    )
+    full_deck_id: str = Field(pattern=r"^deck_[a-f0-9]{24}$")
+    branch: str = Field(min_length=1, max_length=120)
+    base_checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
+    base_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    outline_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    sample_revision_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    status: FullDeckGenerationSessionStatus = "queued"
+    planner_version: str = Field(min_length=1, max_length=80)
+    total_batches: int = Field(ge=1, le=1000)
+    completed_batches: int = Field(default=0, ge=0, le=1000)
+    active_batch_index: int | None = Field(default=None, ge=1, le=1000)
+    session_version: int = Field(default=1, ge=1)
+    latest_preview_package_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    published_revision_hash: str | None = Field(
+        default=None, pattern=r"^sha256:[a-f0-9]{64}$"
+    )
+    error: dict[str, Any] | None = None
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> "FullDeckGenerationSession":
+        if self.completed_batches > self.total_batches:
+            raise ValueError("completed batches cannot exceed total batches")
+        if (
+            self.active_batch_index is not None
+            and self.active_batch_index > self.total_batches
+        ):
+            raise ValueError("active batch index exceeds total batches")
+        if self.published_revision_hash is not None and self.status != "completed":
+            raise ValueError("only completed sessions can reference a published revision")
+        if self.status == "completed" and self.published_revision_hash is None:
+            raise ValueError("completed sessions require a published revision")
+        if self.status == "completed" and self.completed_batches != self.total_batches:
+            raise ValueError("completed sessions require every batch to be complete")
+        if self.status in {
+            "queued",
+            "paused",
+            "failed",
+            "finalizing",
+            "completed",
+            "cancelled",
+            "stale",
+        } and self.active_batch_index is not None:
+            raise ValueError(f"{self.status} sessions cannot carry an active batch")
+        return self
+
+    def can_transition_to(self, status: FullDeckGenerationSessionStatus) -> bool:
+        return status == self.status or status in FULL_DECK_GENERATION_SESSION_TRANSITIONS[
+            self.status
+        ]
+
+
+class FullDeckGenerationBatch(StrictModel):
+    session_id: str = Field(pattern=r"^fullsession_[a-f0-9]{32}$")
+    batch_index: int = Field(ge=1, le=1000)
+    status: FullDeckGenerationBatchStatus = "pending"
+    slot_ids: list[str] = Field(min_length=1, max_length=5)
+    source_slide_numbers: list[int] = Field(min_length=1, max_length=5)
+    attempt_count: int = Field(default=0, ge=0)
+    segment_package_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    prompt_call_ids: list[str] = Field(default_factory=list, max_length=100)
+    applied_directive_ids: list[str] = Field(default_factory=list, max_length=1000)
+    error: dict[str, Any] | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+
+    @field_validator("slot_ids")
+    @classmethod
+    def validate_slot_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("batch slot ids must be unique")
+        if any(not re.fullmatch(r"slot_[a-f0-9]{24}", item) for item in value):
+            raise ValueError("invalid full-deck slot id")
+        return value
+
+    @field_validator("prompt_call_ids")
+    @classmethod
+    def validate_prompt_call_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("batch prompt call ids must be unique")
+        if any(not re.fullmatch(r"prompt_[a-f0-9]{32}", item) for item in value):
+            raise ValueError("invalid prompt call id")
+        return value
+
+    @field_validator("applied_directive_ids")
+    @classmethod
+    def validate_directive_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("batch directive ids must be unique")
+        if any(not re.fullmatch(r"directive_[a-f0-9]{32}", item) for item in value):
+            raise ValueError("invalid generation directive id")
+        return value
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> "FullDeckGenerationBatch":
+        if len(self.slot_ids) != len(self.source_slide_numbers):
+            raise ValueError("batch slots and source slide numbers must align")
+        if len(self.source_slide_numbers) != len(set(self.source_slide_numbers)):
+            raise ValueError("batch source slide numbers must be unique")
+        if any(not 1 <= item <= 1000 for item in self.source_slide_numbers):
+            raise ValueError("batch source slide numbers must be between 1 and 1000")
+        if self.source_slide_numbers != sorted(self.source_slide_numbers):
+            raise ValueError("batch source slide numbers must be ordered")
+        if any(
+            right != left + 1
+            for left, right in zip(
+                self.source_slide_numbers,
+                self.source_slide_numbers[1:],
+            )
+        ):
+            raise ValueError("batch source slide numbers must be contiguous")
+        if self.status == "succeeded" and self.segment_package_id is None:
+            raise ValueError("succeeded batches require a segment package")
+        return self
+
+    def can_transition_to(self, status: FullDeckGenerationBatchStatus) -> bool:
+        return status == self.status or status in FULL_DECK_GENERATION_BATCH_TRANSITIONS[
+            self.status
+        ]
+
+
+class FullDeckGenerationPage(StrictModel):
+    session_id: str = Field(pattern=r"^fullsession_[a-f0-9]{32}$")
+    position: int = Field(ge=0, le=999)
+    slot_id: str = Field(pattern=r"^slot_[a-f0-9]{24}$")
+    source_slide_number: int | None = Field(default=None, ge=1, le=1000)
+    title: str = Field(min_length=1, max_length=160)
+    generation_status: FullDeckGenerationPageStatus
+    batch_index: int | None = Field(default=None, ge=1, le=1000)
+    source_type: Literal[
+        "approved_sample", "generated_segment", "full_deck_edit", "pending"
+    ]
+    content_ref: FullDeckGenerationContentRef | None = None
+    error: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_generation_state(self) -> "FullDeckGenerationPage":
+        if self.generation_status == "sample_ready":
+            if self.batch_index is not None or self.source_type != "approved_sample":
+                raise ValueError("sample-ready pages must come from an approved sample")
+            if self.content_ref is None or self.content_ref.revision_hash is None:
+                raise ValueError("sample-ready pages require a revision content reference")
+        elif self.batch_index is None:
+            raise ValueError("generated pages require a batch index")
+        if self.generation_status == "ready":
+            if self.source_type != "generated_segment":
+                raise ValueError("ready generated pages must come from a generated segment")
+            if self.content_ref is None or self.content_ref.package_id is None:
+                raise ValueError("ready generated pages require a package content reference")
+        elif self.generation_status != "sample_ready" and self.content_ref is not None:
+            raise ValueError("unfinished generated pages cannot carry content")
+        return self
+
+
+class FullDeckGenerationDirective(StrictModel):
+    directive_id: str = Field(
+        default_factory=lambda: "directive_" + uuid4().hex,
+        pattern=r"^directive_[a-f0-9]{32}$",
+    )
+    session_id: str = Field(pattern=r"^fullsession_[a-f0-9]{32}$")
+    content: str = Field(min_length=1, max_length=4000)
+    apply_from_batch_index: int = Field(ge=1, le=1000)
+    created_at: str = Field(default_factory=utc_now)
+    first_applied_at: str | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def normalize_content(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("generation directive cannot be blank")
+        return normalized
+
+
+class FullDeckGenerationPackage(FullDeckPackage):
+    package_id: str = Field(
+        default_factory=lambda: "fullgenpkg_" + uuid4().hex,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z][A-Za-z0-9_-]*$",
+    )
+    session_id: str = Field(pattern=r"^fullsession_[a-f0-9]{32}$")
+    batch_index: int = Field(ge=1, le=1000)
+    kind: Literal["segment", "preview"]
+    created_at: str = Field(default_factory=utc_now)
 
 
 class FullDeckRevision(StrictModel):
