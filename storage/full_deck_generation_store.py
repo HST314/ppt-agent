@@ -17,6 +17,7 @@ from storage.errors import ConflictError
 from storage.full_deck_generation_audit import FullDeckGenerationAuditMixin
 from storage.full_deck_generation_packages import FullDeckGenerationPackageStoreMixin
 from storage.persistence import json_text
+from storage.prompt_audit import finish_prompt_calls_in_transaction
 
 
 _UNSET = object()
@@ -833,7 +834,7 @@ class FullDeckGenerationStoreMixin(
         return self.full_deck_generation_session(session_id)
 
     def recover_full_deck_generation_sessions(self) -> list[dict[str, Any]]:
-        """Fail only batches left running by an interrupted worker."""
+        """Recover interrupted batches and terminalize their durable PromptCalls."""
 
         self._ensure_database()
         error = {
@@ -843,6 +844,60 @@ class FullDeckGenerationStoreMixin(
         recovered_ids: list[str] = []
         now = utc_now()
         with self._transaction() as connection:
+            batch_rows = connection.execute(
+                """
+                SELECT b.session_id, b.batch_index, b.status,
+                       b.segment_package_id, b.prompt_call_ids_json
+                FROM full_deck_generation_batches b
+                """
+            ).fetchall()
+            batches_by_identity = {
+                (row["session_id"], row["batch_index"]): row
+                for row in batch_rows
+            }
+            started_prompt_rows = connection.execute(
+                """
+                SELECT prompt_call_id, messages_json, parameters_json,
+                       tool_calls_json
+                FROM prompt_calls
+                WHERE state = 'ppt_full' AND status = 'started'
+                ORDER BY started_at, prompt_call_id
+                """
+            ).fetchall()
+            prompt_call_updates: list[dict[str, Any]] = []
+            for prompt_row in started_prompt_rows:
+                parameters = json.loads(prompt_row["parameters_json"])
+                if parameters.get("operation") != "generate_full_deck_batch":
+                    continue
+                session_id = parameters.get("generation_session_id")
+                batch_index = parameters.get("batch_index")
+                if not isinstance(session_id, str) or not isinstance(batch_index, int):
+                    continue
+                batch_row = batches_by_identity.get((session_id, batch_index))
+                if batch_row is None:
+                    continue
+                prompt_call_id = prompt_row["prompt_call_id"]
+                recorded_prompt_call_ids = json.loads(
+                    batch_row["prompt_call_ids_json"]
+                )
+                committed = (
+                    batch_row["status"] == "succeeded"
+                    and prompt_call_id in recorded_prompt_call_ids
+                    and batch_row["segment_package_id"] is not None
+                )
+                prompt_call_updates.append({
+                    "prompt_call_id": prompt_call_id,
+                    "status": "completed" if committed else "failed",
+                    "traces": json.loads(prompt_row["tool_calls_json"]),
+                    "messages": json.loads(prompt_row["messages_json"]),
+                    "output_ref": (
+                        batch_row["segment_package_id"] if committed else None
+                    ),
+                    # The durable segment proves publication, but its package hash
+                    # is not the hash of the raw model response recorded here.
+                    "output_hash": None,
+                    "error": None if committed else error,
+                })
             rows = connection.execute(
                 """
                 SELECT DISTINCT s.session_id
@@ -892,4 +947,9 @@ class FullDeckGenerationStoreMixin(
                     (json_text(error), now, session_id),
                 )
                 recovered_ids.append(session_id)
+            finish_prompt_calls_in_transaction(
+                connection,
+                prompt_call_updates,
+                completed_at=now,
+            )
         return [self.full_deck_generation_session(item) for item in recovered_ids]

@@ -642,6 +642,29 @@ def _generation_package(
     })
 
 
+def _start_generation_prompt_call(
+    store: ProjectStore,
+    *,
+    session_id: str,
+    batch_index: int,
+) -> str:
+    return store.start_prompt_call(
+        state="ppt_full",
+        messages=[{"role": "user", "content": "generate this batch"}],
+        template_id="ppt_full",
+        template_version=1,
+        template_hash="sha256:" + "1" * 64,
+        model_config_hash="sha256:" + "2" * 64,
+        runtime_config_hash="sha256:" + "3" * 64,
+        skills_hash="sha256:" + "4" * 64,
+        parameters={
+            "operation": "generate_full_deck_batch",
+            "generation_session_id": session_id,
+            "batch_index": batch_index,
+        },
+    )
+
+
 def test_generation_session_cas_directives_and_active_session_uniqueness(
     tmp_path: Path,
     mock_runtime: ManagedRuntime,
@@ -816,6 +839,107 @@ def test_generation_batch_commit_preview_read_and_restart_recovery(
     after_retry = store.full_deck_generation_session(session.session_id)
     assert after_retry["batches"][0]["status"] == "succeeded"
     assert after_retry["latest_preview_package_id"] == preview.package_id
+
+
+def test_generation_recovery_fails_prompt_call_interrupted_before_model_return(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path / "projects"
+    store = ProjectStore(root, "generation-prompt-before-model")
+    store.create(
+        TaskCard(title="分批生成", objective="验证模型返回前恢复").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    session, batches, pages = _generation_records(
+        session_id="fullsession_" + "1" * 32,
+        batch_count=1,
+    )
+    store.create_full_deck_generation_session(session, batches, pages)
+    store.claim_full_deck_generation_batch(
+        session.session_id,
+        expected_session_version=1,
+    )
+    prompt_call_id = _start_generation_prompt_call(
+        store,
+        session_id=session.session_id,
+        batch_index=1,
+    )
+
+    restarted = ProjectStore(root, "generation-prompt-before-model")
+    recovered = restarted.recover_full_deck_generation_sessions()
+
+    assert recovered[0]["batches"][0]["status"] == "failed"
+    prompt_call = restarted.prompt_calls()[-1]
+    assert prompt_call["prompt_call_id"] == prompt_call_id
+    assert prompt_call["status"] == "failed"
+    assert prompt_call["error"]["code"] == (
+        "full_deck_generation_worker_interrupted"
+    )
+
+
+def test_generation_recovery_completes_prompt_call_after_batch_commit(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path / "projects"
+    store = ProjectStore(root, "generation-prompt-after-commit")
+    store.create(
+        TaskCard(title="分批生成", objective="验证批事务后恢复").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    session, batches, pages = _generation_records(
+        session_id="fullsession_" + "2" * 32,
+        batch_count=1,
+    )
+    store.create_full_deck_generation_session(session, batches, pages)
+    store.claim_full_deck_generation_batch(
+        session.session_id,
+        expected_session_version=1,
+    )
+    prompt_call_id = _start_generation_prompt_call(
+        store,
+        session_id=session.session_id,
+        batch_index=1,
+    )
+    segment = _generation_package(
+        session_id=session.session_id,
+        batch_index=1,
+        kind="segment",
+        suffix="3",
+    )
+    preview = _generation_package(
+        session_id=session.session_id,
+        batch_index=1,
+        kind="preview",
+        suffix="4",
+    )
+    slot_id = batches[0].slot_ids[0]
+    store.commit_full_deck_generation_batch(
+        session.session_id,
+        1,
+        expected_session_version=2,
+        segment_package=segment,
+        preview_package=preview,
+        page_content_refs={
+            slot_id: FullDeckGenerationContentRef(
+                package_id=segment.package_id,
+                package_hash=segment.package_hash,
+                slide_id=segment.slides[0].slide_id,
+                slide_content_hash="sha256:" + "5" * 64,
+            )
+        },
+        prompt_call_ids=[prompt_call_id],
+    )
+
+    restarted = ProjectStore(root, "generation-prompt-after-commit")
+    assert restarted.recover_full_deck_generation_sessions() == []
+
+    prompt_call = restarted.prompt_calls()[-1]
+    assert prompt_call["prompt_call_id"] == prompt_call_id
+    assert prompt_call["status"] == "completed"
+    assert prompt_call["output_ref"] == segment.package_id
+    assert prompt_call["output_hash"] is None
 
 
 def test_generation_batch_claim_is_atomic_across_store_instances(

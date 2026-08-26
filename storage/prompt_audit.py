@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from copy import deepcopy
 from typing import Any
 from uuid import uuid4
@@ -92,6 +93,110 @@ def redact_for_audit(value: Any) -> Any:
     return value
 
 
+def finish_prompt_calls_in_transaction(
+    connection: sqlite3.Connection,
+    calls: list[dict[str, Any]],
+    *,
+    completed_at: str,
+) -> None:
+    """Terminalize started PromptCalls inside an existing transaction."""
+
+    prepared: list[dict[str, Any]] = []
+    prompt_call_ids: set[str] = set()
+    for call in calls:
+        prompt_call_id = call["prompt_call_id"]
+        status = call["status"]
+        if status not in {"completed", "failed", "conflicted"}:
+            raise ValueError("invalid prompt call status")
+        if prompt_call_id in prompt_call_ids:
+            raise ValueError("duplicate prompt call id")
+        prompt_call_ids.add(prompt_call_id)
+        output_ref = call.get("output_ref")
+        output_hash = call.get("output_hash")
+        audited_messages = (
+            deepcopy(call.get("messages")) if call.get("messages") is not None else None
+        )
+        if audited_messages:
+            for message in reversed(audited_messages):
+                content = message.get("content")
+                if (
+                    message.get("role") != "assistant"
+                    or not isinstance(content, str)
+                    or not content
+                ):
+                    continue
+                referenced_hash = output_hash or (
+                    "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+                )
+                message["content"] = (
+                    f"[OUTPUT_REF {output_ref or 'uncommitted'} {referenced_hash}]"
+                )
+                break
+        prepared.append({
+            "prompt_call_id": prompt_call_id,
+            "status": status,
+            "tool_calls": [
+                item
+                for item in call.get("traces") or []
+                if item.get("type") == "tool_call"
+            ],
+            "messages": audited_messages,
+            "output_ref": output_ref,
+            "output_hash": output_hash,
+            "error": call.get("error"),
+        })
+    for call in prepared:
+        current = connection.execute(
+            "SELECT status FROM prompt_calls WHERE prompt_call_id = ?",
+            (call["prompt_call_id"],),
+        ).fetchone()
+        if current is None:
+            raise FileNotFoundError(call["prompt_call_id"])
+        if current["status"] != "started":
+            raise RuntimeError("prompt_call_terminal")
+    for call in prepared:
+        connection.execute(
+            """
+            UPDATE prompt_calls SET
+                status = ?, messages_json = COALESCE(?, messages_json),
+                tool_calls_json = ?, completed_at = ?, error_json = ?,
+                output_ref = ?, output_hash = ?
+            WHERE prompt_call_id = ?
+            """,
+            (
+                call["status"],
+                json_text(redact_for_audit(call["messages"]))
+                if call["messages"] is not None
+                else None,
+                json_text(redact_for_audit(call["tool_calls"])),
+                completed_at,
+                json_text(redact_for_audit(call["error"]))
+                if call["error"]
+                else None,
+                call["output_ref"],
+                call["output_hash"],
+                call["prompt_call_id"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO prompt_call_events(
+                prompt_call_id, at, status, details_json
+            ) VALUES(?, ?, ?, ?)
+            """,
+            (
+                call["prompt_call_id"],
+                completed_at,
+                call["status"],
+                json_text({
+                    "output_ref": call["output_ref"],
+                    "output_hash": call["output_hash"],
+                    "error": redact_for_audit(call["error"]),
+                }),
+            ),
+        )
+
+
 class PromptAuditMixin:
     project_id: str
 
@@ -162,101 +267,12 @@ class PromptAuditMixin:
         if not calls:
             return
         completed_at = utc_now()
-        prepared: list[dict[str, Any]] = []
-        prompt_call_ids: set[str] = set()
-        for call in calls:
-            prompt_call_id = call["prompt_call_id"]
-            status = call["status"]
-            if status not in {"completed", "failed", "conflicted"}:
-                raise ValueError("invalid prompt call status")
-            if prompt_call_id in prompt_call_ids:
-                raise ValueError("duplicate prompt call id")
-            prompt_call_ids.add(prompt_call_id)
-            output_ref = call.get("output_ref")
-            output_hash = call.get("output_hash")
-            audited_messages = (
-                deepcopy(call.get("messages")) if call.get("messages") is not None else None
-            )
-            if audited_messages:
-                for message in reversed(audited_messages):
-                    content = message.get("content")
-                    if (
-                        message.get("role") != "assistant"
-                        or not isinstance(content, str)
-                        or not content
-                    ):
-                        continue
-                    referenced_hash = output_hash or (
-                        "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
-                    )
-                    message["content"] = (
-                        f"[OUTPUT_REF {output_ref or 'uncommitted'} {referenced_hash}]"
-                    )
-                    break
-            prepared.append({
-                "prompt_call_id": prompt_call_id,
-                "status": status,
-                "tool_calls": [
-                    item
-                    for item in call.get("traces") or []
-                    if item.get("type") == "tool_call"
-                ],
-                "messages": audited_messages,
-                "output_ref": output_ref,
-                "output_hash": output_hash,
-                "error": call.get("error"),
-            })
         with self._transaction() as connection:
-            for call in prepared:
-                current = connection.execute(
-                    "SELECT status FROM prompt_calls WHERE prompt_call_id = ?",
-                    (call["prompt_call_id"],),
-                ).fetchone()
-                if current is None:
-                    raise FileNotFoundError(call["prompt_call_id"])
-                if current["status"] != "started":
-                    raise RuntimeError("prompt_call_terminal")
-            for call in prepared:
-                connection.execute(
-                    """
-                    UPDATE prompt_calls SET
-                        status = ?, messages_json = COALESCE(?, messages_json),
-                        tool_calls_json = ?, completed_at = ?, error_json = ?,
-                        output_ref = ?, output_hash = ?
-                    WHERE prompt_call_id = ?
-                    """,
-                    (
-                        call["status"],
-                        json_text(redact_for_audit(call["messages"]))
-                        if call["messages"] is not None
-                        else None,
-                        json_text(redact_for_audit(call["tool_calls"])),
-                        completed_at,
-                        json_text(redact_for_audit(call["error"]))
-                        if call["error"]
-                        else None,
-                        call["output_ref"],
-                        call["output_hash"],
-                        call["prompt_call_id"],
-                    ),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO prompt_call_events(
-                        prompt_call_id, at, status, details_json
-                    ) VALUES(?, ?, ?, ?)
-                    """,
-                    (
-                        call["prompt_call_id"],
-                        completed_at,
-                        call["status"],
-                        json_text({
-                            "output_ref": call["output_ref"],
-                            "output_hash": call["output_hash"],
-                            "error": redact_for_audit(call["error"]),
-                        }),
-                    ),
-                )
+            finish_prompt_calls_in_transaction(
+                connection,
+                calls,
+                completed_at=completed_at,
+            )
 
     def append_prompt_call_progress(
         self,
