@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import agent_core.full_deck_session as session_module
-from agent_core.jobs import JobRegistry
+from agent_core.jobs import JobCancelled, JobRegistry
 from agent_core.models import (
     DocumentRevision,
     HtmlPptPackage,
@@ -450,3 +450,43 @@ def test_session_runner_publishes_live_progress_to_its_bound_job(
         "total_pages": 16,
         "active_slide_numbers": [],
     }
+
+
+def test_session_cancellation_waits_for_the_current_batch_safe_point(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    workflow, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-safe-cancel",
+    )
+    session = workflow.start_full_deck_generation_session(entered["checkpoint_id"])
+    original_generate = workflow.gateway.generate
+    cancellation_requested = False
+
+    def request_cancel_during_model(state: str, prompt: str, **kwargs):
+        nonlocal cancellation_requested
+        cancellation_requested = True
+        return original_generate(state, prompt, **kwargs)
+
+    workflow.gateway.generate = request_cancel_during_model
+    with pytest.raises(JobCancelled):
+        workflow.run_full_deck_generation_session(
+            session["session_id"],
+            cancel_requested=lambda: cancellation_requested,
+        )
+
+    cancelled = workflow.store.full_deck_generation_session(session["session_id"])
+    assert cancelled["status"] == "cancelled"
+    assert [batch["status"] for batch in cancelled["batches"]] == [
+        "succeeded",
+        "pending",
+        "pending",
+        "pending",
+    ]
+    assert cancelled["latest_preview_package_id"] is not None
+    assert sum(
+        page["generation_status"] in {"sample_ready", "ready"}
+        for page in cancelled["pages"]
+    ) == 6

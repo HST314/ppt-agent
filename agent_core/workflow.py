@@ -1301,11 +1301,13 @@ class Workflow:
         session_id: str,
         *,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         return run_generation_session(
             self,
             session_id,
             progress_callback=progress_callback,
+            cancel_requested=cancel_requested,
         )
 
     def request_full_deck_generation_pause(

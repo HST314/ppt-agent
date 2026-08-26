@@ -30,6 +30,7 @@ from agent_core.full_deck_generation import (
     _validate_full_deck_package_limits,
     _validate_offline_package,
 )
+from agent_core.jobs import JobCancelled
 from agent_core.models import (
     FullDeckContentRef,
     FullDeckGenerationBatch,
@@ -54,6 +55,7 @@ from storage.project_store import ConflictError
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+CancelCallback = Callable[[], bool]
 
 
 class FullDeckSessionError(FullDeckGenerationError):
@@ -344,6 +346,23 @@ def _report(
 ) -> None:
     if callback is not None:
         callback(_progress(snapshot, stage))
+
+
+def _cancel_at_safe_point(
+    workflow: FullDeckWorkflowHost,
+    snapshot: dict[str, Any],
+    progress_callback: ProgressCallback | None,
+) -> None:
+    if snapshot.get("active_batch_index") is not None:
+        raise ConflictError("full_deck_generation_batch_still_running")
+    cancelled = workflow.store.update_full_deck_generation_session(
+        snapshot["session_id"],
+        snapshot["session_version"],
+        status="cancelled",
+        completed_batches=snapshot["completed_batches"],
+    )
+    _report(progress_callback, cancelled, "cancelled")
+    raise JobCancelled("full-deck generation session cancelled at a batch boundary")
 
 
 def _current_commit_version(
@@ -856,11 +875,20 @@ def run_full_deck_generation_session(
     session_id: str,
     *,
     progress_callback: ProgressCallback | None = None,
+    cancel_requested: CancelCallback | None = None,
 ) -> dict[str, Any]:
     """Run automatically until pause, failure, staleness, or one final publish."""
 
+    should_cancel = cancel_requested or (lambda: False)
     while True:
         snapshot = workflow.store.full_deck_generation_session(session_id)
+        if (
+            should_cancel()
+            and snapshot["status"]
+            not in {"completed", "cancelled", "stale", "finalizing"}
+            and snapshot["active_batch_index"] is None
+        ):
+            _cancel_at_safe_point(workflow, snapshot, progress_callback)
         if snapshot["status"] in {"completed", "cancelled", "stale", "paused"}:
             return snapshot
         if snapshot["status"] == "pause_requested" and snapshot[
@@ -950,6 +978,17 @@ def run_full_deck_generation_session(
                     ),
                     applied_directive_ids=effective_directive_ids,
                 )
+            if should_cancel():
+                failed = workflow.store.full_deck_generation_session(session_id)
+                if (
+                    failed["status"] == "failed"
+                    and failed["active_batch_index"] is None
+                ):
+                    _cancel_at_safe_point(
+                        workflow,
+                        failed,
+                        progress_callback,
+                    )
             if getattr(exc, "public_code", None) == "full_deck_preview_failed":
                 raise
             raise FullDeckSessionError(
@@ -958,6 +997,8 @@ def run_full_deck_generation_session(
                 f"批次 {batch['batch_index']} 生成或校验失败：{exc}",
             ) from exc
         _report(progress_callback, committed, "validating")
+        if should_cancel():
+            _cancel_at_safe_point(workflow, committed, progress_callback)
         if committed["status"] == "pause_requested":
             paused = workflow.store.update_full_deck_generation_session(
                 session_id,

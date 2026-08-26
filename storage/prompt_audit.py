@@ -605,7 +605,10 @@ class PromptAuditMixin:
             if latest is None:
                 return []
             latest_parameters = json.loads(latest["parameters_json"])
-            generation_id = latest_parameters.get("generation_id")
+            generation_id = (
+                latest_parameters.get("generation_id")
+                or latest_parameters.get("generation_session_id")
+            )
             if not generation_id:
                 return []
             rows = connection.execute(
@@ -615,7 +618,10 @@ class PromptAuditMixin:
                        output_ref
                 FROM prompt_calls
                 WHERE state = 'ppt_full'
-                  AND json_extract(parameters_json, '$.generation_id') = ?
+                  AND COALESCE(
+                    json_extract(parameters_json, '$.generation_id'),
+                    json_extract(parameters_json, '$.generation_session_id')
+                  ) = ?
                 ORDER BY started_at, prompt_call_id LIMIT 240
                 """,
                 (generation_id,),

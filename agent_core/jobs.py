@@ -418,6 +418,62 @@ class JobRegistry:
             ).fetchone()
         return self._record(row) if row else None
 
+    def find_for_request(
+        self,
+        project_id: str,
+        request_key: str,
+    ) -> dict[str, Any] | None:
+        """Return a durable idempotent result before re-validating mutable state."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE project_id = ? AND request_key = ?
+                  AND status IN ('queued', 'running', 'succeeded')
+                ORDER BY created_at DESC, job_id DESC LIMIT 1
+                """,
+                (project_id, request_key),
+            ).fetchone()
+        return self._record(row) if row else None
+
+    def find_for_request_prefix(
+        self,
+        project_id: str,
+        request_key_prefix: str,
+    ) -> dict[str, Any] | None:
+        """Find a versioned request whose immutable target suffix is now historical."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE project_id = ?
+                  AND substr(request_key, 1, length(?)) = ?
+                  AND status IN ('queued', 'running', 'succeeded')
+                ORDER BY created_at DESC, job_id DESC LIMIT 1
+                """,
+                (project_id, request_key_prefix, request_key_prefix),
+            ).fetchone()
+        return self._record(row) if row else None
+
+    def active_for_session(
+        self,
+        project_id: str,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE project_id = ? AND session_id = ?
+                  AND status IN ('queued', 'running')
+                ORDER BY created_at DESC, job_id DESC LIMIT 1
+                """,
+                (project_id, session_id),
+            ).fetchone()
+        return self._record(row) if row else None
+
     def list_for_project(self, project_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         if limit < 1 or limit > 500:
             raise ValueError("job limit out of range")
