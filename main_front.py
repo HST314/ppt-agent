@@ -31,12 +31,14 @@ from agent_core.workflow import Workflow, capabilities
 from agent_core.workflow_support import stable_hash
 from configs.runtime import ManagedRuntime, RuntimeConfigUpdate
 from runtime.read_tool import SkillReader
+from storage.project_images import SyncReport, sync_project_images
 from storage.project_store import ConflictError, ProjectStore, list_projects
 
 
 APP_ROOT = Path(__file__).resolve().parent
 FRONTEND_ROOT = APP_ROOT / "frontend"
 PROJECTS_ROOT = Path(os.getenv("PPT_AGENT_PROJECTS_ROOT", FRONTEND_ROOT / "data" / "projects")).resolve()
+IMAGES_ROOT = Path(os.getenv("PPT_AGENT_IMAGES_ROOT", FRONTEND_ROOT / "data" / "images")).resolve()
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 MAX_REQUEST_BYTES = 512 * 1024
 
@@ -249,11 +251,18 @@ def _current_runtime() -> ManagedRuntime:
         return runtime
 
 
+def _sync_project_images(store: ProjectStore) -> SyncReport:
+    """Refresh the project image snapshot before a generation job starts."""
+
+    return sync_project_images(IMAGES_ROOT, store.root)
+
+
 def _full_deck_session_route_context() -> FullDeckSessionRouteContext:
     return FullDeckSessionRouteContext(
         store_for=store_for,
         current_runtime=_current_runtime,
         current_jobs=lambda: jobs,
+        sync_images=_sync_project_images,
         package_file_response=package_file_response,
     )
 
@@ -504,6 +513,7 @@ def _full_deck_job_idempotency_key(
 @app.post("/api/projects/{project_id}/jobs", status_code=202)
 def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
     store = store_for(project_id)
+    sync_project_images(IMAGES_ROOT, store.root)
     with runtime_config_lock:
         current_runtime = runtime
     workflow = Workflow(store, current_runtime)

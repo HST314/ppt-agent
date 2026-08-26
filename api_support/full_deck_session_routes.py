@@ -18,6 +18,7 @@ from api_support.full_deck_sessions import (
 from agent_core.jobs import ActiveJobError, JobRegistry
 from agent_core.workflow import Workflow
 from configs.runtime import ManagedRuntime
+from storage.project_images import SyncReport
 from storage.project_store import ConflictError, ProjectStore
 
 
@@ -43,6 +44,7 @@ class FullDeckSessionRouteContext:
     store_for: Callable[[str], ProjectStore]
     current_runtime: Callable[[], ManagedRuntime]
     current_jobs: Callable[[], JobRegistry]
+    sync_images: Callable[[ProjectStore], SyncReport]
     package_file_response: Callable[[Path, str], FileResponse]
 
 
@@ -191,6 +193,7 @@ def build_full_deck_session_router(
                 "工程基线已变化，需要重新开始全稿生成。",
             )
         workflow = Workflow(store, context.current_runtime())
+        context.sync_images(store)
         snapshot, job = start_full_deck_session_job(
             context,
             project_id,
