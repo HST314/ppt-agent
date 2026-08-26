@@ -8,6 +8,7 @@ from typing import Any
 from agent_core.models import (
     FullDeckGenerationBatch,
     FullDeckGenerationDirective,
+    FullDeckGenerationPackage,
     FullDeckGenerationPage,
     FullDeckGenerationSession,
     utc_now,
@@ -671,85 +672,160 @@ class FullDeckGenerationStoreMixin(FullDeckGenerationPackageStoreMixin):
         expected_session_version: int,
         error: dict[str, Any],
         prompt_call_ids: list[str] | None = None,
+        applied_directive_ids: list[str] | None = None,
+        segment_package: FullDeckGenerationPackage | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not error:
             raise ValueError("generation batch failure requires an error")
         self._ensure_database()
         now = utc_now()
-        with self._transaction() as connection:
-            session_row = connection.execute(
-                "SELECT * FROM full_deck_generation_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if session_row is None:
-                raise FileNotFoundError(session_id)
-            self._require_generation_session_version(
-                session_row, expected_session_version
+        segment = (
+            FullDeckGenerationPackage.model_validate(segment_package)
+            if segment_package is not None
+            else None
+        )
+        if segment is not None and (
+            segment.session_id != session_id
+            or segment.batch_index != batch_index
+            or segment.kind != "segment"
+        ):
+            raise ValueError("generation segment identity does not match the batch")
+        segment_artifacts: list[dict[str, Any]] = []
+        segment_files: list[dict[str, Any]] = []
+        if segment is not None:
+            segment_artifacts, segment_files = (
+                self._prepare_full_deck_generation_package(segment)
             )
-            if session_row["status"] not in {"running", "pause_requested"}:
-                raise ConflictError("full_deck_generation_batch_failure_not_allowed")
-            batch_row = connection.execute(
-                """
-                SELECT * FROM full_deck_generation_batches
-                WHERE session_id = ? AND batch_index = ?
-                """,
-                (session_id, batch_index),
-            ).fetchone()
-            if batch_row is None or batch_row["status"] != "running":
-                raise ConflictError("full_deck_generation_batch_not_running")
-            batch_value = self._generation_batch_value(batch_row)
-            batch_value.update(
-                status="failed",
-                prompt_call_ids=list(prompt_call_ids or []),
-                error=error,
-                completed_at=now,
-            )
-            validated_batch = FullDeckGenerationBatch.model_validate(batch_value)
-            cursor = connection.execute(
-                """
-                UPDATE full_deck_generation_batches SET
-                    status = 'failed', prompt_call_ids_json = ?,
-                    error_json = ?, completed_at = ?
-                WHERE session_id = ? AND batch_index = ? AND status = 'running'
-                """,
-                (
-                    json_text(validated_batch.prompt_call_ids),
-                    json_text(error),
-                    now,
-                    session_id,
-                    batch_index,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise ConflictError("full_deck_generation_batch_not_running")
-            page_cursor = connection.execute(
-                """
-                UPDATE full_deck_generation_pages SET
-                    generation_status = 'failed', error_json = ?
-                WHERE session_id = ? AND batch_index = ?
-                  AND generation_status = 'generating'
-                """,
-                (json_text(error), session_id, batch_index),
-            )
-            if page_cursor.rowcount != len(validated_batch.slot_ids):
-                raise ConflictError("full_deck_generation_page_projection_conflict")
-            session_cursor = connection.execute(
-                """
-                UPDATE full_deck_generation_sessions SET
-                    status = 'failed', active_batch_index = NULL,
-                    session_version = session_version + 1,
-                    error_json = ?, updated_at = ?
-                WHERE session_id = ? AND session_version = ?
-                """,
-                (
-                    json_text(error),
-                    now,
-                    session_id,
-                    expected_session_version,
-                ),
-            )
-            if session_cursor.rowcount != 1:
-                raise ConflictError("full_deck_generation_session_version_conflict")
+        try:
+            with self._transaction() as connection:
+                session_row = connection.execute(
+                    "SELECT * FROM full_deck_generation_sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if session_row is None:
+                    raise FileNotFoundError(session_id)
+                self._require_generation_session_version(
+                    session_row, expected_session_version
+                )
+                if session_row["status"] not in {"running", "pause_requested"}:
+                    raise ConflictError("full_deck_generation_batch_failure_not_allowed")
+                batch_row = connection.execute(
+                    """
+                    SELECT * FROM full_deck_generation_batches
+                    WHERE session_id = ? AND batch_index = ?
+                    """,
+                    (session_id, batch_index),
+                ).fetchone()
+                if batch_row is None or batch_row["status"] != "running":
+                    raise ConflictError("full_deck_generation_batch_not_running")
+                batch_value = self._generation_batch_value(batch_row)
+                stored_prompt_call_ids = (
+                    list(prompt_call_ids)
+                    if prompt_call_ids is not None
+                    else batch_value["prompt_call_ids"]
+                )
+                stored_directive_ids = (
+                    list(applied_directive_ids)
+                    if applied_directive_ids is not None
+                    else batch_value["applied_directive_ids"]
+                )
+                if segment is not None:
+                    if [
+                        item.source_slide_number for item in segment.slides
+                    ] != batch_value["source_slide_numbers"]:
+                        raise ValueError("segment slides do not match the claimed batch")
+                    batch_value["segment_package_id"] = segment.package_id
+                batch_value.update(
+                    status="failed",
+                    prompt_call_ids=stored_prompt_call_ids,
+                    applied_directive_ids=stored_directive_ids,
+                    error=error,
+                    completed_at=now,
+                )
+                validated_batch = FullDeckGenerationBatch.model_validate(batch_value)
+                if stored_directive_ids:
+                    directive_rows = connection.execute(
+                        """
+                        SELECT directive_id, apply_from_batch_index
+                        FROM full_deck_generation_directives
+                        WHERE session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchall()
+                    effective = {
+                        row["directive_id"]: row
+                        for row in directive_rows
+                        if row["directive_id"] in set(stored_directive_ids)
+                    }
+                    if set(effective) != set(stored_directive_ids) or any(
+                        row["apply_from_batch_index"] > batch_index
+                        for row in effective.values()
+                    ):
+                        raise ValueError("batch references an ineffective directive")
+                if segment is not None:
+                    self._insert_artifacts(connection, segment_artifacts)
+                    self._insert_full_deck_generation_package(
+                        connection, segment, segment_files
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE full_deck_generation_batches SET
+                        status = 'failed', segment_package_id = ?,
+                        prompt_call_ids_json = ?, applied_directive_ids_json = ?,
+                        error_json = ?, completed_at = ?
+                    WHERE session_id = ? AND batch_index = ? AND status = 'running'
+                    """,
+                    (
+                        validated_batch.segment_package_id,
+                        json_text(validated_batch.prompt_call_ids),
+                        json_text(validated_batch.applied_directive_ids),
+                        json_text(error),
+                        now,
+                        session_id,
+                        batch_index,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError("full_deck_generation_batch_not_running")
+                if stored_directive_ids:
+                    connection.executemany(
+                        """
+                        UPDATE full_deck_generation_directives
+                        SET first_applied_at = COALESCE(first_applied_at, ?)
+                        WHERE session_id = ? AND directive_id = ?
+                        """,
+                        [(now, session_id, item) for item in stored_directive_ids],
+                    )
+                page_cursor = connection.execute(
+                    """
+                    UPDATE full_deck_generation_pages SET
+                        generation_status = 'failed', error_json = ?
+                    WHERE session_id = ? AND batch_index = ?
+                      AND generation_status = 'generating'
+                    """,
+                    (json_text(error), session_id, batch_index),
+                )
+                if page_cursor.rowcount != len(validated_batch.slot_ids):
+                    raise ConflictError("full_deck_generation_page_projection_conflict")
+                session_cursor = connection.execute(
+                    """
+                    UPDATE full_deck_generation_sessions SET
+                        status = 'failed', active_batch_index = NULL,
+                        session_version = session_version + 1,
+                        error_json = ?, updated_at = ?
+                    WHERE session_id = ? AND session_version = ?
+                    """,
+                    (
+                        json_text(error),
+                        now,
+                        session_id,
+                        expected_session_version,
+                    ),
+                )
+                if session_cursor.rowcount != 1:
+                    raise ConflictError("full_deck_generation_session_version_conflict")
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("full_deck_generation_package_conflict") from exc
         return self.full_deck_generation_session(session_id)
 
     def recover_full_deck_generation_sessions(self) -> list[dict[str, Any]]:

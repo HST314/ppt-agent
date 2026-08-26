@@ -25,6 +25,13 @@ from agent_core.full_deck_revision import (
     create_full_deck_revision,
     full_deck_package_model,
 )
+from agent_core.full_deck_session import (
+    add_full_deck_generation_directive as add_generation_directive,
+    request_full_deck_generation_pause as request_generation_pause,
+    resume_full_deck_generation_session as resume_generation_session,
+    run_full_deck_generation_session as run_generation_session,
+    start_full_deck_generation_session as start_generation_session,
+)
 from agent_core.models import (
     DocumentRevision,
     FullDeck,
@@ -1282,6 +1289,62 @@ class Workflow:
             checkpoint_id,
             cancel_requested=cancel_requested,
         )
+
+    def start_full_deck_generation_session(
+        self,
+        checkpoint_id: str,
+    ) -> dict[str, Any]:
+        return start_generation_session(self, checkpoint_id)
+
+    def run_full_deck_generation_session(
+        self,
+        session_id: str,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        return run_generation_session(
+            self,
+            session_id,
+            progress_callback=progress_callback,
+        )
+
+    def request_full_deck_generation_pause(
+        self,
+        session_id: str,
+        expected_session_version: int,
+    ) -> dict[str, Any]:
+        return request_generation_pause(
+            self,
+            session_id,
+            expected_session_version,
+        )
+
+    def resume_full_deck_generation_session(
+        self,
+        session_id: str,
+        expected_session_version: int,
+    ) -> dict[str, Any]:
+        return resume_generation_session(
+            self,
+            session_id,
+            expected_session_version,
+        )
+
+    def add_full_deck_generation_directive(
+        self,
+        session_id: str,
+        expected_session_version: int,
+        content: str,
+    ) -> dict[str, Any]:
+        return add_generation_directive(
+            self,
+            session_id,
+            expected_session_version,
+            content,
+        )
+
+    def recover_full_deck_generation_sessions(self) -> list[dict[str, Any]]:
+        return self.store.recover_full_deck_generation_sessions()
 
     def revise_full_deck(
         self,

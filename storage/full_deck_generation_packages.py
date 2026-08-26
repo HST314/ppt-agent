@@ -221,12 +221,27 @@ class FullDeckGenerationPackageStoreMixin:
                         for row in directive_rows.values()
                     ):
                         raise ValueError("batch references a directive that is not effective yet")
+                existing_segment = connection.execute(
+                    """
+                    SELECT session_id, batch_index, kind, package_hash
+                    FROM full_deck_generation_packages WHERE package_id = ?
+                    """,
+                    (segment.package_id,),
+                ).fetchone()
+                if existing_segment is not None and (
+                    existing_segment["session_id"] != session_id
+                    or existing_segment["batch_index"] != batch_index
+                    or existing_segment["kind"] != "segment"
+                    or existing_segment["package_hash"] != segment.package_hash
+                ):
+                    raise ConflictError("full_deck_generation_package_conflict")
                 self._insert_artifacts(
                     connection, segment_artifacts + preview_artifacts
                 )
-                self._insert_full_deck_generation_package(
-                    connection, segment, segment_files
-                )
+                if existing_segment is None:
+                    self._insert_full_deck_generation_package(
+                        connection, segment, segment_files
+                    )
                 self._insert_full_deck_generation_package(
                     connection, preview, preview_files
                 )

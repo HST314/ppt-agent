@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     owner_pid INTEGER,
     cancellable INTEGER NOT NULL DEFAULT 0,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
-    request_key TEXT
+    request_key TEXT,
+    session_id TEXT,
+    progress_json TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_project_time_idx ON jobs(project_id, created_at, job_id);
 CREATE INDEX IF NOT EXISTS jobs_dedup_idx ON jobs(project_id, operation, checkpoint_id, status);
@@ -114,6 +116,10 @@ class JobRegistry:
                 )
             if "request_key" not in columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN request_key TEXT")
+            if "session_id" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN session_id TEXT")
+            if "progress_json" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN progress_json TEXT")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_request_key_idx "
                 "ON jobs(project_id, request_key, status)"
@@ -130,6 +136,8 @@ class JobRegistry:
         item["cancellable"] = bool(item.get("cancellable"))
         item["cancel_requested"] = bool(item.get("cancel_requested"))
         item["error"] = json.loads(item.pop("error_json")) if item.get("error_json") else None
+        progress_json = item.pop("progress_json", None)
+        item["progress"] = json.loads(progress_json) if progress_json else None
         return item
 
     @staticmethod
@@ -152,8 +160,8 @@ class JobRegistry:
             INSERT INTO jobs(
                 job_id, project_id, operation, checkpoint_id, status,
                 created_at, started_at, finished_at, error_json, owner_pid,
-                cancellable, cancel_requested, request_key
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cancellable, cancel_requested, request_key, session_id, progress_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
                 status = excluded.status,
                 started_at = excluded.started_at,
@@ -162,7 +170,9 @@ class JobRegistry:
                 owner_pid = excluded.owner_pid,
                 cancellable = excluded.cancellable,
                 cancel_requested = MAX(jobs.cancel_requested, excluded.cancel_requested),
-                request_key = COALESCE(excluded.request_key, jobs.request_key)
+                request_key = COALESCE(excluded.request_key, jobs.request_key),
+                session_id = COALESCE(excluded.session_id, jobs.session_id),
+                progress_json = COALESCE(excluded.progress_json, jobs.progress_json)
             """,
             (
                 record["job_id"], record["project_id"], record["operation"],
@@ -173,6 +183,10 @@ class JobRegistry:
                 int(bool(record.get("cancellable"))),
                 int(bool(record.get("cancel_requested"))),
                 record.get("request_key"),
+                record.get("session_id"),
+                json.dumps(record.get("progress"), ensure_ascii=False)
+                if record.get("progress") is not None
+                else None,
             ),
         )
 
@@ -257,6 +271,9 @@ class JobRegistry:
         *,
         cancellable: bool = False,
         idempotency_key: str | None = None,
+        session_id: str | None = None,
+        initial_progress: dict[str, Any] | None = None,
+        progress_reporting: bool = False,
     ) -> dict[str, Any]:
         request_key = idempotency_key or f"{operation}\n{checkpoint_id}"
         with self.lock, self._transaction() as connection:
@@ -301,11 +318,42 @@ class JobRegistry:
                 "cancellable": cancellable,
                 "cancel_requested": False,
                 "request_key": request_key,
+                "session_id": session_id,
+                "progress": self._validated_progress(initial_progress),
             }
             self._upsert(connection, record)
             self._insert_event(connection, record)
-        self.futures[record["job_id"]] = self.pool.submit(self._run, record, action)
+        self.futures[record["job_id"]] = self.pool.submit(
+            self._run,
+            record,
+            action,
+            progress_reporting,
+        )
         return {key: value for key, value in record.items() if not key.startswith("_")}
+
+    @staticmethod
+    def _validated_progress(progress: dict[str, Any] | None) -> dict[str, Any] | None:
+        if progress is None:
+            return None
+        if not isinstance(progress, dict):
+            raise ValueError("job progress must be an object")
+        encoded = json.dumps(progress, ensure_ascii=False, sort_keys=True)
+        if len(encoded.encode("utf-8")) > 32_768:
+            raise ValueError("job progress exceeds the storage limit")
+        return json.loads(encoded)
+
+    def update_progress(self, job_id: str, progress: dict[str, Any]) -> dict[str, Any]:
+        """Persist a bounded resumable-operation summary without adding event noise."""
+
+        value = self._validated_progress(progress)
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE jobs SET progress_json = ? WHERE job_id = ?",
+                (json.dumps(value, ensure_ascii=False), job_id),
+            )
+            if cursor.rowcount != 1:
+                raise FileNotFoundError(job_id)
+        return self.get(job_id)
 
     def _write(self, record: dict[str, Any]) -> None:
         with self._transaction() as connection:
@@ -320,14 +368,25 @@ class JobRegistry:
             ).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def _run(self, record: dict[str, Any], action: Callable[..., Any]) -> None:
+    def _run(
+        self,
+        record: dict[str, Any],
+        action: Callable[..., Any],
+        progress_reporting: bool,
+    ) -> None:
         record.update(status="running", started_at=utc_now())
         self._write(record)
         try:
+            arguments: list[Callable[..., Any]] = []
             if record.get("cancellable"):
-                action(lambda: self._cancel_requested(record["job_id"]))
-            else:
-                action()
+                arguments.append(lambda: self._cancel_requested(record["job_id"]))
+            if progress_reporting:
+                def report_progress(progress: dict[str, Any]) -> None:
+                    record["progress"] = self._validated_progress(progress)
+                    self.update_progress(record["job_id"], progress)
+
+                arguments.append(report_progress)
+            action(*arguments)
             record["status"] = "succeeded"
         except JobCancelled:
             record.update(
