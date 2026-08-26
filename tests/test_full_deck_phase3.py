@@ -288,6 +288,48 @@ def test_full_deck_generation_targets_only_pending_segments_and_publishes_r2(
         ).fetchone()[0] == 1
 
 
+def test_full_deck_generation_registers_sample_and_recent_segment_references(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    workflow, entered = _ready_full_deck(tmp_path, mock_runtime)
+    original_generate = workflow.gateway.generate
+    observed_sources: list[list[str]] = []
+
+    def capture(state: str, prompt: str, **kwargs):
+        if state == "ppt_full":
+            references = kwargs["package_references"]
+            summaries = references.summaries()
+            observed_sources.append([item["source_id"] for item in summaries])
+            assert "PACKAGE_REFERENCE_SOURCES_JSON:" in prompt
+            sample_index = references.read_reference_file(
+                "approved_sample", "index.html", limit=80
+            )
+            assert sample_index["content_hash"].startswith("sha256:")
+            if len(summaries) > 1:
+                recent_index = references.read_reference_file(
+                    summaries[-1]["source_id"], "index.html", limit=80
+                )
+                assert recent_index["content_hash"].startswith("sha256:")
+        return original_generate(state, prompt, **kwargs)
+
+    workflow.gateway.generate = capture
+    workflow.generate_full_deck(entered["checkpoint_id"])
+
+    assert observed_sources == [
+        ["approved_sample"],
+        ["approved_sample", "segment_1_3"],
+    ]
+    full_deck_calls = [
+        item for item in workflow.store.prompt_calls()
+        if item["state"] == "ppt_full"
+    ]
+    assert [
+        [source["source_id"] for source in item["parameters"]["package_references"]]
+        for item in full_deck_calls
+    ] == observed_sources
+
+
 def test_failed_segment_never_publishes_and_successful_retry_commits_once(
     tmp_path: Path,
     mock_runtime: ManagedRuntime,

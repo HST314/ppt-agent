@@ -31,6 +31,7 @@ from agent_core.full_deck_composer import (
     compose_full_deck,
     normalized_page_content_graph,
 )
+from agent_core.full_deck_reference_context import full_deck_package_reference_tool
 from agent_core.jobs import JobCancelled
 from agent_core.models import (
     FullDeckContentRef,
@@ -48,6 +49,7 @@ from agent_core.workflow_support import (
 )
 from configs.runtime import ManagedRuntime
 from model_router.client import ModelGateway, ModelOutputError
+from runtime.package_reference_tool import PackageReferenceTool
 from runtime.package_tool import DraftPackage, PackageToolError
 from runtime.read_tool import SkillReader
 from storage.project_store import ConflictError, ProjectStore
@@ -99,6 +101,36 @@ class FullDeckWorkflowHost(Protocol):
         capability: str,
         checkpoint_id: str | None = None,
     ) -> None: ...
+
+
+def _generate_segment_attempt(
+    gateway: ModelGateway,
+    prompt: str,
+    draft: DraftPackage,
+    references: PackageReferenceTool,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Preserve existing gateways that support only one optional package tool."""
+
+    kwargs: dict[str, Any] = {
+        "json_mode": True,
+        "package_draft": draft,
+        "package_references": references,
+    }
+    while True:
+        try:
+            return gateway.generate("ppt_full", prompt, **kwargs)
+        except TypeError as exc:
+            unsupported = next(
+                (
+                    name
+                    for name in ("package_references", "package_draft")
+                    if name in kwargs and name in str(exc)
+                ),
+                None,
+            )
+            if unsupported is None:
+                raise
+            kwargs.pop(unsupported)
 
 
 class _SlideMarkupParser(HTMLParser):
@@ -427,6 +459,7 @@ def generate_full_deck(
     template, template_hash = workflow._template("ppt_full.md")
     generation_id = "fullgen_" + uuid4().hex
     sample_reference = {
+        "source_id": "approved_sample",
         "title": sample_package.title,
         "revision_hash": sample["revision_hash"],
         "package_hash": sample_package.package_hash,
@@ -530,6 +563,17 @@ def generate_full_deck(
             "before": pages[first_position - 1] if first_position > 0 else None,
             "after": pages[last_position + 1] if last_position + 1 < len(pages) else None,
         }
+        package_references = full_deck_package_reference_tool(
+            workflow.store,
+            workflow.runtime,
+            sample_revision_hash=sample["revision_hash"],
+            sample_package=sample_package,
+            recent_validated_segments=[
+                (str(result["source_id"]), result["package"])
+                for result in segment_results[-2:]
+            ],
+        )
+        reference_summaries = package_references.summaries()
         base_prompt = (
             template
             + f"\n\nFULL_DECK_GENERATION_ID: {generation_id}\n"
@@ -542,6 +586,8 @@ def generate_full_deck(
             + json.dumps(neighbors, ensure_ascii=False)
             + "\nSAMPLE_VISUAL_REFERENCE_JSON: "
             + json.dumps(sample_reference, ensure_ascii=False)
+            + "\nPACKAGE_REFERENCE_SOURCES_JSON: "
+            + json.dumps(reference_summaries, ensure_ascii=False)
             + f"\nTask card:\n{json.dumps(manifest['task_card'], ensure_ascii=False)}\n"
             + f"Approved slide outline:\n{outline['markdown_body']}\n"
             + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
@@ -578,26 +624,18 @@ def generate_full_deck(
                     "target_slide_numbers": target_numbers,
                     "attempt": attempt + 1,
                     "composer_version": COMPOSER_VERSION,
+                    "package_references": reference_summaries,
                 },
             )
             all_prompt_call_ids.append(prompt_call_id)
             attempt_traces: list[dict[str, Any]] = []
             try:
-                try:
-                    text, attempt_traces = workflow.gateway.generate(
-                        "ppt_full",
-                        current_prompt,
-                        json_mode=True,
-                        package_draft=draft,
-                    )
-                except TypeError as exc:
-                    if "package_draft" not in str(exc):
-                        raise
-                    text, attempt_traces = workflow.gateway.generate(
-                        "ppt_full",
-                        current_prompt,
-                        json_mode=True,
-                    )
+                text, attempt_traces = _generate_segment_attempt(
+                    workflow.gateway,
+                    current_prompt,
+                    draft,
+                    package_references,
+                )
             except Exception as exc:
                 workflow._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
                 close_successful_audits(

@@ -5,9 +5,10 @@
 工作方式：
 
 1. 按需使用 `read` 阅读演示设计 Skill；Skill 只是参考材料。
-2. 使用 `write_package_file` 在当前隔离草稿包内创建 UTF-8 文件，或用 `copy_skill_asset` 复制本地静态资产。不得访问网络。
-3. 包内必须包含根目录 `index.html`，其中静态 `.slide[data-slide-id]` 的数量和顺序必须与目标页完全一致。
-4. 只返回精简 JSON 清单；已经通过工具写入的文件不要在 JSON 中重复。未使用写入工具时可在 `files` 中内嵌兼容回退内容。
+2. 先查看提示末尾的 `PACKAGE_REFERENCE_SOURCES_JSON`。使用 `list_reference_files` 列出已确认样品与最近成功页段的可读文件，再用 `read_reference_file` 分段读取实际 `index.html`、本地 CSS 或其他文本资源。参考包只读，不能把它当成当前输出草稿；样品始终是视觉锚点，最近页段用于保持叙事和版式连续。
+3. 使用 `write_package_file` 在当前隔离草稿包内创建 UTF-8 文件，或用 `copy_skill_asset` 复制本地静态资产。不得访问网络。
+4. 包内必须包含根目录 `index.html`，其中静态 `.slide[data-slide-id]` 的数量和顺序必须与目标页完全一致。
+5. 只返回精简 JSON 清单；已经通过工具写入的文件不要在 JSON 中重复。未使用写入工具时可在 `files` 中内嵌兼容回退内容。
 
 最终 JSON 格式：
 
