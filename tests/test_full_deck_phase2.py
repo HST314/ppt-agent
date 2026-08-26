@@ -23,6 +23,7 @@ from agent_core.models import (
     TaskCard,
 )
 from agent_core.workflow import Workflow
+from agent_core.workflow_support import generation_provenance, stable_hash
 from configs.runtime import ManagedRuntime
 from storage.project_store import ProjectStore
 
@@ -34,6 +35,37 @@ OUTLINE = """# 逐页大纲
 ## 第 3 页｜数据证据
 ## 第 4 页｜行动计划
 """
+
+
+def test_generation_provenance_only_records_successful_typed_skill_reads() -> None:
+    valid_read = {
+        "type": "tool_call",
+        "tool": "read",
+        "path": "ppt-layout/SKILL.md",
+        "content_hash": "sha256:valid-read",
+        "offset": 0,
+        "end": 128,
+    }
+    traces = [
+        {"type": "tool_call", "tool": "read", "error": "path_not_found"},
+        valid_read,
+        valid_read | {"path": ""},
+        valid_read | {"content_hash": None},
+        valid_read | {"offset": True},
+        valid_read | {"end": "128"},
+        valid_read | {"offset": 129},
+    ]
+
+    provenance = generation_provenance([], traces, "valid output")
+
+    expected = [{
+        "path": valid_read["path"],
+        "content_hash": valid_read["content_hash"],
+        "offset": valid_read["offset"],
+        "end": valid_read["end"],
+    }]
+    assert provenance["skill_reads"] == expected
+    assert provenance["skill_reads_hash"] == stable_hash(expected)
 
 
 def _sample_package() -> HtmlPptPackage:

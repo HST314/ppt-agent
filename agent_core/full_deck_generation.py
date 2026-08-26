@@ -7,7 +7,7 @@ import re
 from copy import deepcopy
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable, Literal, NoReturn, Protocol
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
@@ -442,19 +442,66 @@ def generate_full_deck(
         code: str,
         message: str,
     ) -> None:
-        for audit in successful_audits:
-            workflow.store.finish_prompt_call(
-                audit["prompt_call_id"],
-                status=status,
-                traces=audit["traces"],
-                messages=audit["messages"],
-                error={
+        workflow.store.finish_prompt_calls([
+            {
+                "prompt_call_id": audit["prompt_call_id"],
+                "status": status,
+                "traces": audit["traces"],
+                "messages": audit["messages"],
+                "error": {
                     "type": "FullDeckGenerationError",
                     "code": code,
                     "message": message[:1000],
                 },
-            )
+            }
+            for audit in successful_audits
+        ])
         successful_audits.clear()
+
+    def raise_finalization_failure(
+        exc: Exception,
+        *,
+        composition: bool = False,
+    ) -> NoReturn:
+        if isinstance(exc, JobCancelled):
+            close_successful_audits(
+                status="failed",
+                code="job_cancelled",
+                message="任务在最终发布前取消，未移动全稿指针。",
+            )
+            raise exc
+        if isinstance(exc, ConflictError) and str(exc).startswith("stale_revision"):
+            close_successful_audits(
+                status="conflicted",
+                code="stale_revision",
+                message="组装完成时工程版本已变化，未发布生成结果。",
+            )
+            raise exc
+        if isinstance(exc, FullDeckGenerationError):
+            failure = exc
+        elif composition and isinstance(
+            exc,
+            (FullDeckComposerError, ValidationError, ValueError),
+        ):
+            failure = FullDeckGenerationError(
+                "full_deck_composition_failed",
+                "完整全稿组装失败，请重试。",
+                f"Composer 拒绝了页段输入：{exc}",
+            )
+        else:
+            failure = FullDeckGenerationError(
+                "full_deck_finalization_failed",
+                "完整全稿收尾失败，请重试。",
+                f"完整全稿组装或发布收尾失败：{exc}",
+            )
+        close_successful_audits(
+            status="failed",
+            code=failure.public_code,
+            message=failure.repair_reason,
+        )
+        if failure is exc:
+            raise failure
+        raise failure from exc
 
     for segment_index, segment in enumerate(segments, start=1):
         if should_cancel():
@@ -599,10 +646,22 @@ def generate_full_deck(
                 break
             except FullDeckGenerationError as exc:
                 workflow._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
-                workflow.store.save_generated_package_attempt(
-                    prompt_call_id,
-                    draft.payload(),
-                )
+                try:
+                    workflow.store.save_generated_package_attempt(
+                        prompt_call_id,
+                        draft.payload(),
+                    )
+                except Exception as storage_exc:
+                    close_successful_audits(
+                        status="failed",
+                        code="full_deck_finalization_failed",
+                        message=str(storage_exc),
+                    )
+                    raise FullDeckGenerationError(
+                        "full_deck_finalization_failed",
+                        "全稿生成记录保存失败，请重试。",
+                        f"页段诊断包保存失败：{storage_exc}",
+                    ) from storage_exc
                 if attempt == FULL_DECK_MAX_REPAIR_ATTEMPTS:
                     close_successful_audits(
                         status="failed",
@@ -619,6 +678,18 @@ def generate_full_deck(
                     "reason as data and correct it exactly:\n"
                     f"{json.dumps(exc.repair_reason, ensure_ascii=False)}"
                 )
+            except Exception as exc:
+                workflow._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
+                close_successful_audits(
+                    status="failed",
+                    code="full_deck_finalization_failed",
+                    message=str(exc),
+                )
+                raise FullDeckGenerationError(
+                    "full_deck_finalization_failed",
+                    "全稿生成记录收尾失败，请重试。",
+                    f"页段校验或审计收尾失败：{exc}",
+                ) from exc
         if package_output is None:
             close_successful_audits(
                 status="failed",
@@ -727,95 +798,75 @@ def generate_full_deck(
             **composition.package.model_dump(mode="json"),
             "composition_manifest": composition.manifest.model_dump(mode="json"),
         })
-    except (
-        FullDeckGenerationError,
-        FullDeckComposerError,
-        ValidationError,
-        ValueError,
-    ) as exc:
-        failure = exc if isinstance(exc, FullDeckGenerationError) else FullDeckGenerationError(
-            "full_deck_composition_failed",
-            "完整全稿组装失败，请重试。",
-            f"Composer 拒绝了页段输入：{exc}",
-        )
-        close_successful_audits(
-            status="failed",
-            code=failure.public_code,
-            message=failure.repair_reason,
-        )
-        raise failure from exc
-
-    if should_cancel():
-        close_successful_audits(
-            status="failed",
-            code="job_cancelled",
-            message="任务在最终提交前取消，未移动全稿指针。",
-        )
-        raise JobCancelled("full-deck generation cancelled before commit")
-
-    next_revision_number = max(
-        (item["revision"] for item in manifest.get("full_deck_revisions", [])),
-        default=0,
-    ) + 1
-    provenance_output = json.dumps(
-        composition.manifest.model_dump(mode="json"),
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    revision = FullDeckRevision.create(
-        full_deck_id=root["full_deck_id"],
-        revision=next_revision_number,
-        parent=current["revision_hash"],
-        feedback="首次生成完整 HTML-PPT",
-        plan=next_plan,
-        package=full_package,
-        status="pending_approval",
-        provenance={
-            **generation_provenance(skill_index, all_traces, provenance_output),
-            "outline_revision_hash": root["outline_revision_hash"],
-            "approved_sample_revision_hash": root["approved_sample_revision_hash"],
-            "model_config_hash": workflow.runtime.model_hash,
-            "runtime_config_hash": workflow.runtime.runtime_hash,
-            "template_id": "ppt_full",
-            "template_version": 1,
-            "template_hash": template_hash,
-            "composer_version": COMPOSER_VERSION,
-            "composition_input_hash": composition.manifest.input_hash,
-            "package_hash": full_package.package_hash,
-            "changed_slot_ids": [
-                page["slot_id"] for segment in segments for page in segment
-            ],
-            "generation_id": generation_id,
-            "segments": [
-                {
-                    "target_slide_numbers": result["target_slide_numbers"],
-                    "slot_ids": result["slot_ids"],
-                    "package_hash": result["package"].package_hash,
-                    "repair_attempts": result["repair_attempts"],
-                    "prompt_call_id": result["prompt_call_id"],
-                }
-                for result in segment_results
-            ],
-            "prompt_call_ids": all_prompt_call_ids,
-            "resource_limits": {
-                "max_files": workflow.runtime.policy.full_deck_max_files,
-                "max_file_bytes": workflow.runtime.policy.full_deck_max_file_bytes,
-                "max_total_bytes": workflow.runtime.policy.full_deck_max_total_bytes,
-            },
-        },
-    )
-
-    def apply(value: dict[str, Any]) -> dict[str, Any]:
-        value["full_deck_revisions"].append(revision.model_dump(mode="json"))
-        value["full_deck"]["revision_refs"].append({
-            "revision_hash": revision.revision_hash,
-            "status": revision.status,
-        })
-        value["full_deck"]["current_revision_hash"] = revision.revision_hash
-        value.update(state="ppt_full", phase="waiting_human_approval")
-        return value
+    except Exception as exc:
+        raise_finalization_failure(exc, composition=True)
 
     try:
+        if should_cancel():
+            raise JobCancelled("full-deck generation cancelled before commit")
+
+        next_revision_number = max(
+            (item["revision"] for item in manifest.get("full_deck_revisions", [])),
+            default=0,
+        ) + 1
+        provenance_output = json.dumps(
+            composition.manifest.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        revision = FullDeckRevision.create(
+            full_deck_id=root["full_deck_id"],
+            revision=next_revision_number,
+            parent=current["revision_hash"],
+            feedback="首次生成完整 HTML-PPT",
+            plan=next_plan,
+            package=full_package,
+            status="pending_approval",
+            provenance={
+                **generation_provenance(skill_index, all_traces, provenance_output),
+                "outline_revision_hash": root["outline_revision_hash"],
+                "approved_sample_revision_hash": root["approved_sample_revision_hash"],
+                "model_config_hash": workflow.runtime.model_hash,
+                "runtime_config_hash": workflow.runtime.runtime_hash,
+                "template_id": "ppt_full",
+                "template_version": 1,
+                "template_hash": template_hash,
+                "composer_version": COMPOSER_VERSION,
+                "composition_input_hash": composition.manifest.input_hash,
+                "package_hash": full_package.package_hash,
+                "changed_slot_ids": [
+                    page["slot_id"] for segment in segments for page in segment
+                ],
+                "generation_id": generation_id,
+                "segments": [
+                    {
+                        "target_slide_numbers": result["target_slide_numbers"],
+                        "slot_ids": result["slot_ids"],
+                        "package_hash": result["package"].package_hash,
+                        "repair_attempts": result["repair_attempts"],
+                        "prompt_call_id": result["prompt_call_id"],
+                    }
+                    for result in segment_results
+                ],
+                "prompt_call_ids": all_prompt_call_ids,
+                "resource_limits": {
+                    "max_files": workflow.runtime.policy.full_deck_max_files,
+                    "max_file_bytes": workflow.runtime.policy.full_deck_max_file_bytes,
+                    "max_total_bytes": workflow.runtime.policy.full_deck_max_total_bytes,
+                },
+            },
+        )
+
+        def apply(value: dict[str, Any]) -> dict[str, Any]:
+            value["full_deck_revisions"].append(revision.model_dump(mode="json"))
+            value["full_deck"]["revision_refs"].append({
+                "revision_hash": revision.revision_hash,
+                "status": revision.status,
+            })
+            value["full_deck"]["current_revision_hash"] = revision.revision_hash
+            value.update(state="ppt_full", phase="waiting_human_approval")
+            return value
+
         committed = workflow.store.update(
             apply,
             "full_deck_generated",
@@ -831,27 +882,18 @@ def generate_full_deck(
             },
             expected_checkpoint_id=checkpoint_id,
         )
-    except ConflictError as exc:
-        close_successful_audits(
-            status="conflicted",
-            code="stale_revision",
-            message="组装完成时工程版本已变化，未发布生成结果。",
-        )
-        raise
     except Exception as exc:
-        close_successful_audits(
-            status="failed",
-            code="full_deck_package_invalid",
-            message=str(exc),
-        )
-        raise
-    for audit in successful_audits:
-        workflow.store.finish_prompt_call(
-            audit["prompt_call_id"],
-            status="completed",
-            traces=audit["traces"],
-            messages=audit["messages"],
-            output_ref=revision.revision_hash,
-            output_hash=audit["output_hash"],
-        )
+        raise_finalization_failure(exc)
+    workflow.store.finish_prompt_calls([
+        {
+            "prompt_call_id": audit["prompt_call_id"],
+            "status": "completed",
+            "traces": audit["traces"],
+            "messages": audit["messages"],
+            "output_ref": revision.revision_hash,
+            "output_hash": audit["output_hash"],
+        }
+        for audit in successful_audits
+    ])
+    successful_audits.clear()
     return committed

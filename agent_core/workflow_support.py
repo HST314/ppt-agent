@@ -73,6 +73,27 @@ def generation_provenance(
     traces: list[dict[str, Any]],
     output: str,
 ) -> dict[str, Any]:
+    def is_successful_skill_read(trace: dict[str, Any]) -> bool:
+        path = trace.get("path")
+        content_hash = trace.get("content_hash")
+        offset = trace.get("offset")
+        end = trace.get("end")
+        return (
+            trace.get("type") == "tool_call"
+            and trace.get("tool") == "read"
+            and "error" not in trace
+            and isinstance(path, str)
+            and bool(path)
+            and isinstance(content_hash, str)
+            and bool(content_hash)
+            and isinstance(offset, int)
+            and not isinstance(offset, bool)
+            and offset >= 0
+            and isinstance(end, int)
+            and not isinstance(end, bool)
+            and end >= offset
+        )
+
     skill_reads = sorted(
         (
             {
@@ -82,7 +103,7 @@ def generation_provenance(
                 "end": trace["end"],
             }
             for trace in traces
-            if trace.get("type") == "tool_call" and trace.get("tool") == "read"
+            if is_successful_skill_read(trace)
         ),
         key=lambda item: (item["path"], item["content_hash"], item["offset"], item["end"]),
     )

@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import agent_core.full_deck_generation as full_deck_generation
 import main_front
+from agent_core.full_deck_generation import FullDeckGenerationError
 from agent_core.jobs import JobRegistry
 from agent_core.models import (
     DocumentRevision,
@@ -30,6 +32,11 @@ OUTLINE = """# 逐页大纲
 ## 第 3 页｜数据证据
 ## 第 4 页｜行动计划
 """
+
+SIXTEEN_PAGE_OUTLINE = "# 逐页大纲\n\n" + "\n".join(
+    f"## 第 {number} 页｜页面 {number}\n- 本页目的：推进第 {number} 个叙事节点"
+    for number in range(1, 17)
+)
 
 
 def _sample_package() -> HtmlPptPackage:
@@ -58,10 +65,35 @@ def _sample_package() -> HtmlPptPackage:
     )
 
 
+def _leading_sample_package() -> HtmlPptPackage:
+    return HtmlPptPackage(
+        title="前两页样品",
+        slide_count=2,
+        slides=[
+            PackageSlide(slide_id="sample-1", title="页面 1", source_slide_number=1),
+            PackageSlide(slide_id="sample-2", title="页面 2", source_slide_number=2),
+        ],
+        files=[
+            PackageFile(
+                path="index.html",
+                content=(
+                    '<!doctype html><html><body><section class="slide" '
+                    'data-slide-id="sample-1"><h1>页面 1</h1></section>'
+                    '<section class="slide" data-slide-id="sample-2">'
+                    '<h1>页面 2</h1></section></body></html>'
+                ),
+            ),
+        ],
+    )
+
+
 def _sample_project(
     root: Path,
     runtime: ManagedRuntime,
     project_id: str,
+    *,
+    outline_markdown: str = OUTLINE,
+    sample_package: HtmlPptPackage | None = None,
 ) -> tuple[Workflow, dict]:
     store = ProjectStore(root, project_id)
     manifest = store.create(
@@ -70,14 +102,14 @@ def _sample_project(
     )
     outline = DocumentRevision.create(
         "slide_outline",
-        OUTLINE,
+        outline_markdown,
         revision=1,
         parent=None,
         created_by="agent",
         provenance={"output_hash": "sha256:" + "1" * 64},
     ).model_copy(update={"status": "approved"})
     sample = SampleRevision.create_package(
-        _sample_package(),
+        sample_package or _sample_package(),
         revision=1,
         parent=None,
         feedback=None,
@@ -116,6 +148,109 @@ def _complete_full_deck(
     )
     completed = workflow.generate_full_deck(entered["checkpoint_id"])
     return workflow, entered, completed
+
+
+def test_failed_read_trace_does_not_block_valid_fourteen_page_generation(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    workflow, sample_manifest = _sample_project(
+        tmp_path / "projects",
+        mock_runtime,
+        "phase5-failed-read",
+        outline_markdown=SIXTEEN_PAGE_OUTLINE,
+        sample_package=_leading_sample_package(),
+    )
+    entered = workflow.enter_full_deck(
+        sample_manifest["checkpoint_id"],
+        sample_manifest["current_sample_revision_hash"],
+    )
+    original_generate = workflow.gateway.generate
+    failed_read = {
+        "type": "tool_call",
+        "tool": "read",
+        "error": "path_not_found",
+        "round": 1,
+    }
+    successful_read = {
+        "type": "tool_call",
+        "tool": "read",
+        "path": "ppt-layout/SKILL.md",
+        "content_hash": "sha256:successful-read",
+        "offset": 0,
+        "end": 96,
+        "round": 1,
+    }
+
+    def generate_with_read_traces(state: str, prompt: str, **kwargs):
+        output, traces = original_generate(state, prompt, **kwargs)
+        if state == "ppt_full":
+            traces.extend([failed_read, successful_read])
+        return output, traces
+
+    workflow.gateway.generate = generate_with_read_traces
+    completed = workflow.generate_full_deck(entered["checkpoint_id"])
+
+    revision = completed["full_deck_revisions"][-1]
+    assert revision["package"]["slide_count"] == 16
+    assert revision["provenance"]["segments"][0]["target_slide_numbers"] == list(
+        range(3, 17)
+    )
+    assert revision["provenance"]["skill_reads"] == [{
+        "path": successful_read["path"],
+        "content_hash": successful_read["content_hash"],
+        "offset": successful_read["offset"],
+        "end": successful_read["end"],
+    }]
+    prompt_calls = workflow.store.prompt_calls()
+    assert prompt_calls
+    assert all(call["status"] == "completed" for call in prompt_calls)
+    assert all(call["status"] != "started" for call in prompt_calls)
+    assert failed_read in prompt_calls[-1]["tool_calls"]
+
+
+@pytest.mark.parametrize("failure_site", ["provenance", "store_update"])
+def test_finalization_failures_close_every_started_prompt_call(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    workflow, sample_manifest = _sample_project(
+        tmp_path / "projects",
+        mock_runtime,
+        "phase5-finalization-failure",
+    )
+    entered = workflow.enter_full_deck(
+        sample_manifest["checkpoint_id"],
+        sample_manifest["current_sample_revision_hash"],
+    )
+
+    def fail_finalization(*args, **kwargs):
+        raise RuntimeError(f"injected {failure_site} failure")
+
+    if failure_site == "provenance":
+        monkeypatch.setattr(
+            full_deck_generation,
+            "generation_provenance",
+            fail_finalization,
+        )
+    else:
+        monkeypatch.setattr(workflow.store, "update", fail_finalization)
+
+    with pytest.raises(FullDeckGenerationError) as error:
+        workflow.generate_full_deck(entered["checkpoint_id"])
+
+    assert error.value.public_code == "full_deck_finalization_failed"
+    unchanged = workflow.store.read(include_sample_html=False)
+    assert len(unchanged["full_deck_revisions"]) == 1
+    prompt_calls = workflow.store.prompt_calls()
+    assert prompt_calls
+    assert all(call["status"] == "failed" for call in prompt_calls)
+    assert all(call["status"] != "started" for call in prompt_calls)
+    assert {
+        call["error"]["code"] for call in prompt_calls
+    } == {"full_deck_finalization_failed"}
 
 
 def test_approve_full_deck_is_atomic_and_completes_progress_snapshot(
