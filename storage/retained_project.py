@@ -15,6 +15,16 @@ from storage.persistence import atomic_bytes
 
 REVISION_HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
 
+# Keep the staging directory name short: full-deck materialization paths can
+# approach the Windows MAX_PATH (260) limit, and the old name embedded the full
+# 64-hex revision hash plus a 32-hex UUID (102 characters) on its own.
+STAGING_NAME_MAX_LENGTH = 32
+
+
+def _staging_dir_name(revision_hash: str) -> str:
+    revision = revision_hash.removeprefix("sha256:")
+    return f".{revision[:12]}.{uuid4().hex[:8]}.tmp"
+
 
 class RetainedProjectError(RuntimeError):
     pass
@@ -129,9 +139,7 @@ def materialize_full_deck_revision(
     if package.get("entrypoint") not in contents:
         raise RetainedProjectError("package_artifact_missing")
     full_deck_root.mkdir(parents=True, exist_ok=True)
-    staging = full_deck_root / (
-        f".{revision_hash.removeprefix('sha256:')}.{uuid4().hex}.tmp"
-    )
+    staging = full_deck_root / _staging_dir_name(revision_hash)
     try:
         for logical_path, content in contents.items():
             target = (staging / logical_path).resolve()

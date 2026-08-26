@@ -60,17 +60,47 @@ def exclusive_file_lock(path: Path, *, timeout_seconds: float) -> Iterator[None]
             _release_exclusive_lock(lock_file)
 
 
+def _windows_extended_length_text(text: str) -> str:
+    """Prefix an absolute Windows path with ``\\\\?\\`` to bypass MAX_PATH.
+
+    The retained full-deck layout nests content-addressed directories deeply
+    enough that absolute paths can exceed the classic 260-character limit;
+    without the prefix, ``os.open`` fails with a misleading
+    ``FileNotFoundError`` on Windows.
+    """
+
+    if text.startswith("\\\\?\\"):
+        return text
+    if text.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + text[2:]
+    return "\\\\?\\" + text
+
+
+def _os_level_path(path: Path) -> str:
+    """Return an OS-level path string, extended-length safe on Windows."""
+
+    text = os.fspath(path)
+    if os.name == "nt":
+        text = _windows_extended_length_text(os.path.abspath(text))
+    return text
+
+
 def atomic_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    target = _os_level_path(path)
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.",
+        dir=parent,
+    )
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        os.replace(temporary, target)
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
+            directory_fd = os.open(parent, os.O_RDONLY)
             try:
                 os.fsync(directory_fd)
             finally:
