@@ -65,6 +65,12 @@ def test_full_deck_workspace_contracts_match_the_sample_interaction_model() -> N
         "fullDeckRevisions:", "fullDeckRevision:", "restoreFullDeck:",
         "branchFromFullDeck:", "fullDeckPreviewUrl:", "fullDeckExportUrl:",
     ))
+    assert all(name in api for name in (
+        "startFullDeckGeneration:", "fullDeckGenerationSession:",
+        "pauseFullDeckGeneration:", "resumeFullDeckGeneration:",
+        "retryFullDeckGeneration:", "cancelFullDeckGeneration:",
+        "addFullDeckGenerationDirective:", "fullDeckGenerationPreviewUrl:",
+    ))
 
     assert 'id="full-deck-title"' in app
     assert 'id="full-deck-preview-frame" sandbox="allow-scripts" referrerpolicy="no-referrer"' in full_deck

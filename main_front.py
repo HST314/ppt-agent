@@ -10,10 +10,21 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from api_support.full_deck_session_routes import (
+    FullDeckSessionRouteContext,
+    build_full_deck_session_router,
+    start_full_deck_session_job,
+)
+from api_support.full_deck_sessions import (
+    FullDeckSessionAPIError,
+    current_session_summary,
+)
 from agent_core.jobs import ActiveJobError, JobRegistry
 from agent_core.models import TaskCard, utc_now
 from agent_core.workflow import Workflow, capabilities
@@ -188,6 +199,42 @@ async def active_job_handler(_: Request, exc: ActiveJobError):
     })
 
 
+@app.exception_handler(FullDeckSessionAPIError)
+async def full_deck_session_api_error_handler(
+    _: Request,
+    exc: FullDeckSessionAPIError,
+):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "retryable": exc.retryable,
+            }
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    if "/full-deck/generation-sessions" not in request.url.path:
+        return await request_validation_exception_handler(request, exc)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "full_deck_session_invalid",
+                "message": "全稿生成会话请求无效。",
+                "retryable": False,
+            }
+        },
+    )
+
+
 def store_for(project_id: str) -> ProjectStore:
     if not PROJECT_ID.fullmatch(project_id):
         raise HTTPException(status_code=422, detail="工程 ID 格式无效")
@@ -195,6 +242,20 @@ def store_for(project_id: str) -> ProjectStore:
     if not store.exists():
         raise HTTPException(status_code=404, detail="工程不存在")
     return store
+
+
+def _current_runtime() -> ManagedRuntime:
+    with runtime_config_lock:
+        return runtime
+
+
+def _full_deck_session_route_context() -> FullDeckSessionRouteContext:
+    return FullDeckSessionRouteContext(
+        store_for=store_for,
+        current_runtime=_current_runtime,
+        current_jobs=lambda: jobs,
+        package_file_response=package_file_response,
+    )
 
 
 def _full_deck_revision_summary(
@@ -293,6 +354,11 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
             for item in reversed(full_deck_revisions)
         ],
         "full_deck_attempts": store.full_deck_attempts(),
+        "full_deck_generation_session": current_session_summary(
+            store,
+            store.project_id,
+            manifest,
+        ),
         "capabilities": capabilities(manifest, active_job=active_job is not None),
         "active_job": active_job,
         "progress_snapshots": store.progress_snapshots(),
@@ -441,6 +507,14 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
     with runtime_config_lock:
         current_runtime = runtime
     workflow = Workflow(store, current_runtime)
+    if request.operation == "generate_full_deck":
+        _, job = start_full_deck_session_job(
+            _full_deck_session_route_context(),
+            project_id,
+            workflow,
+            request.checkpoint_id,
+        )
+        return job
     actions = {
         "start_clarification": lambda: workflow.start_clarification(request.checkpoint_id),
         "generate_narrative": lambda: workflow.generate_document("narrative_structure", request.checkpoint_id),
@@ -450,10 +524,6 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
         "generate_sample": lambda: workflow.generate_sample(request.checkpoint_id),
         "regenerate_sample": lambda: workflow.generate_sample(request.checkpoint_id, regenerate=True),
         "revise_sample": lambda: workflow.generate_sample(request.checkpoint_id, feedback=request.feedback),
-        "generate_full_deck": lambda cancel_requested: workflow.generate_full_deck(
-            request.checkpoint_id,
-            cancel_requested=cancel_requested,
-        ),
         "regenerate_full_deck": lambda cancel_requested: workflow.regenerate_full_deck(
             request.checkpoint_id,
             request.revision_hash or "",
@@ -1146,6 +1216,9 @@ def switch_branch(project_id: str, request: BranchSwitchRequest) -> dict[str, An
     return project_view(store)
 
 
+app.include_router(
+    build_full_deck_session_router(_full_deck_session_route_context())
+)
 app.mount("/static", StaticFiles(directory=FRONTEND_ROOT / "static"), name="static")
 
 

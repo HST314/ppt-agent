@@ -1,15 +1,17 @@
 from pathlib import Path
 from shutil import copy2
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
 
 import main_front
-from agent_core.jobs import JobRegistry
+from agent_core.jobs import JobCancelled, JobRegistry
 from agent_core.models import utc_now
 from configs.runtime import ManagedRuntime
 from storage.project_store import ProjectStore
 from tests.job_support import wait_for_terminal_job
+from tests.test_full_deck_session import _ready_full_deck
 
 
 def finish_job(client: TestClient, response) -> dict:
@@ -506,3 +508,334 @@ def test_resume_sample_rejects_a_stale_project_checkpoint_before_queueing(
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "sample_resume_stale"
+
+
+def test_full_deck_generation_session_api_start_is_idempotent_and_scoped(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    registry = JobRegistry(project_root / ".jobs")
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", registry)
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    _, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-api-start",
+    )
+    release = Event()
+
+    def hold_session(self, session_id, **kwargs):
+        while not release.wait(timeout=0.01):
+            cancel_requested = kwargs.get("cancel_requested")
+            if cancel_requested is not None and cancel_requested():
+                snapshot = self.store.full_deck_generation_session(session_id)
+                self.store.update_full_deck_generation_session(
+                    session_id,
+                    snapshot["session_version"],
+                    status="cancelled",
+                    completed_batches=snapshot["completed_batches"],
+                )
+                raise JobCancelled("cancelled by API test worker")
+        return self.store.full_deck_generation_session(session_id)
+
+    monkeypatch.setattr(
+        main_front.Workflow,
+        "run_full_deck_generation_session",
+        hold_session,
+    )
+    client = TestClient(main_front.app)
+    payload = {
+        "checkpoint_id": entered["checkpoint_id"],
+        "revision_hash": entered["full_deck"]["current_revision_hash"],
+    }
+
+    first = client.post(
+        "/api/projects/session-api-start/full-deck/generation-sessions",
+        json=payload,
+    )
+    second = client.post(
+        "/api/projects/session-api-start/full-deck/generation-sessions",
+        json=payload,
+    )
+
+    assert first.status_code == second.status_code == 202
+    assert first.json()["session"]["session_id"] == second.json()["session"][
+        "session_id"
+    ]
+    assert first.json()["job"]["job_id"] == second.json()["job"]["job_id"]
+    session_id = first.json()["session"]["session_id"]
+    fetched = client.get(
+        f"/api/projects/session-api-start/full-deck/generation-sessions/{session_id}"
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["progress"]["ready_pages"] == 2
+    assert fetched.json()["progress"]["total_pages"] == 16
+    project = client.get("/api/projects/session-api-start").json()
+    assert project["full_deck_generation_session"]["session_id"] == session_id
+
+    unknown = client.post(
+        "/api/projects/session-api-start/full-deck/generation-sessions",
+        json=payload | {"provider": "not-accepted"},
+    )
+    stale = client.post(
+        "/api/projects/session-api-start/full-deck/generation-sessions",
+        json=payload | {"checkpoint_id": "checkpoint_" + "f" * 24},
+    )
+    wrong_revision = client.post(
+        "/api/projects/session-api-start/full-deck/generation-sessions",
+        json=payload | {"revision_hash": "sha256:" + "f" * 64},
+    )
+    client.post(
+        "/api/projects",
+        json={
+            "project_id": "other-project",
+            "task_card": {"title": "其他工程", "objective": "验证会话隔离"},
+        },
+    )
+    cross_project = client.get(
+        f"/api/projects/other-project/full-deck/generation-sessions/{session_id}"
+    )
+
+    assert unknown.status_code == 422
+    assert unknown.json()["error"]["code"] == "full_deck_session_invalid"
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "full_deck_session_stale"
+    assert wrong_revision.status_code == 409
+    assert wrong_revision.json()["error"]["code"] == "full_deck_session_stale"
+    assert cross_project.status_code == 404
+    assert cross_project.json()["error"]["code"] == "full_deck_session_not_found"
+
+    current = client.get(
+        f"/api/projects/session-api-start/full-deck/generation-sessions/{session_id}"
+    ).json()
+    cancelled = client.post(
+        f"/api/projects/session-api-start/full-deck/generation-sessions/"
+        f"{session_id}/cancel",
+        json={"session_version": current["session_version"]},
+    )
+    repeated_cancel = client.post(
+        f"/api/projects/session-api-start/full-deck/generation-sessions/"
+        f"{session_id}/cancel",
+        json={"session_version": current["session_version"]},
+    )
+    assert cancelled.status_code == repeated_cancel.status_code == 200
+    assert cancelled.json().get("cancel_requested") or cancelled.json()[
+        "status"
+    ] == "cancelled"
+    terminal = wait_for_terminal_job(
+        lambda job_id: client.get(f"/api/jobs/{job_id}").json(),
+        first.json()["job"]["job_id"],
+    )
+    assert terminal["status"] in {"succeeded", "cancelled"}
+    final_session = client.get(
+        f"/api/projects/session-api-start/full-deck/generation-sessions/{session_id}"
+    ).json()
+    assert final_session["status"] == "cancelled"
+
+
+def test_full_deck_generation_session_controls_preview_and_conflicts(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    registry = JobRegistry(project_root / ".jobs")
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", registry)
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    workflow, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-api-controls",
+    )
+    session = workflow.start_full_deck_generation_session(entered["checkpoint_id"])
+    session_id = session["session_id"]
+    original_generate = workflow.gateway.generate
+    requested_pause = False
+
+    def pause_during_first_batch(state, prompt, **kwargs):
+        nonlocal requested_pause
+        if not requested_pause:
+            requested_pause = True
+            running = workflow.store.full_deck_generation_session(session_id)
+            workflow.request_full_deck_generation_pause(
+                session_id,
+                running["session_version"],
+            )
+        return original_generate(state, prompt, **kwargs)
+
+    workflow.gateway.generate = pause_during_first_batch
+    paused = workflow.run_full_deck_generation_session(session_id)
+    assert paused["status"] == "paused"
+    client = TestClient(main_front.app)
+
+    details = client.get(
+        f"/api/projects/session-api-controls/full-deck/generation-sessions/{session_id}"
+    )
+    assert details.status_code == 200
+    body = details.json()
+    assert body["progress"]["ready_pages"] == 6
+    assert body["preview_url"].endswith(
+        f"/preview/index.html?v={body['session_version']}"
+    )
+    preview = client.get(body["preview_url"])
+    assert preview.status_code == 200
+    assert preview.headers["content-security-policy"].startswith(
+        "sandbox allow-scripts; default-src 'none'"
+    )
+    traversal = client.get(
+        f"/api/projects/session-api-controls/full-deck/generation-sessions/"
+        f"{session_id}/preview/%2E%2E%2Findex.html"
+    )
+    assert traversal.status_code in {404, 422}
+
+    directive = client.post(
+        f"/api/projects/session-api-controls/full-deck/generation-sessions/"
+        f"{session_id}/directives",
+        json={
+            "session_version": body["session_version"],
+            "content": "  后续页面减少装饰元素。  ",
+        },
+    )
+    assert directive.status_code == 200
+    assert directive.json()["content"] == "后续页面减少装饰元素。"
+    assert directive.json()["apply_from_batch_index"] == 2
+    assert directive.json()["apply_from_slide_numbers"] == [7, 8, 9, 10]
+    stale_directive = client.post(
+        f"/api/projects/session-api-controls/full-deck/generation-sessions/"
+        f"{session_id}/directives",
+        json={
+            "session_version": body["session_version"],
+            "content": "这一条使用了陈旧版本。",
+        },
+    )
+    assert stale_directive.status_code == 409
+    assert stale_directive.json()["error"]["code"] == "full_deck_session_conflict"
+
+    release = Event()
+
+    def hold_resumed_session(self, held_session_id, **_kwargs):
+        release.wait(timeout=5)
+        return self.store.full_deck_generation_session(held_session_id)
+
+    monkeypatch.setattr(
+        main_front.Workflow,
+        "run_full_deck_generation_session",
+        hold_resumed_session,
+    )
+    current = client.get(
+        f"/api/projects/session-api-controls/full-deck/generation-sessions/{session_id}"
+    ).json()
+    resume_url = (
+        f"/api/projects/session-api-controls/full-deck/generation-sessions/"
+        f"{session_id}/resume"
+    )
+    resumed = client.post(
+        resume_url,
+        json={"session_version": current["session_version"]},
+    )
+    repeated = client.post(
+        resume_url,
+        json={"session_version": current["session_version"]},
+    )
+    assert resumed.status_code == repeated.status_code == 202
+    assert resumed.json()["job"]["job_id"] == repeated.json()["job"]["job_id"]
+    release.set()
+    wait_for_job(client, resumed.json()["job"]["job_id"])
+
+
+def test_full_deck_generation_pause_and_retry_api_are_versioned_and_idempotent(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    registry = JobRegistry(project_root / ".jobs")
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", registry)
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    workflow, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-api-retry",
+    )
+    created = workflow.start_full_deck_generation_session(
+        entered["checkpoint_id"]
+    )
+    session_id = created["session_id"]
+    claimed = workflow.store.claim_full_deck_generation_batch(
+        session_id,
+        expected_session_version=created["session_version"],
+    )
+    assert claimed is not None
+    running = workflow.store.full_deck_generation_session(session_id)
+    client = TestClient(main_front.app)
+    pause_url = (
+        f"/api/projects/session-api-retry/full-deck/generation-sessions/"
+        f"{session_id}/pause"
+    )
+
+    paused_requested = client.post(
+        pause_url,
+        json={"session_version": running["session_version"]},
+    )
+    repeated_pause = client.post(
+        pause_url,
+        json={"session_version": running["session_version"]},
+    )
+    stale_pause = client.post(
+        pause_url,
+        json={"session_version": created["session_version"]},
+    )
+    unknown = client.post(
+        pause_url,
+        json={
+            "session_version": running["session_version"],
+            "force": True,
+        },
+    )
+
+    assert paused_requested.status_code == repeated_pause.status_code == 200
+    assert paused_requested.json()["status"] == "pause_requested"
+    assert stale_pause.status_code == 409
+    assert stale_pause.json()["error"]["code"] == "full_deck_session_conflict"
+    assert unknown.status_code == 422
+    assert unknown.json()["error"]["code"] == "full_deck_session_invalid"
+
+    pause_snapshot = workflow.store.full_deck_generation_session(session_id)
+    failed = workflow.store.fail_full_deck_generation_batch(
+        session_id,
+        1,
+        expected_session_version=pause_snapshot["session_version"],
+        error={
+            "code": "full_deck_batch_failed",
+            "message": "当前批未完成，可重试当前批。",
+        },
+    )
+    retry_url = (
+        f"/api/projects/session-api-retry/full-deck/generation-sessions/"
+        f"{session_id}/retry"
+    )
+    retried = client.post(
+        retry_url,
+        json={"session_version": failed["session_version"]},
+    )
+    assert retried.status_code == 202
+    wait_for_job(client, retried.json()["job"]["job_id"])
+    repeated_retry = client.post(
+        retry_url,
+        json={"session_version": failed["session_version"]},
+    )
+    assert repeated_retry.status_code == 202
+    assert repeated_retry.json()["job"]["job_id"] == retried.json()["job"][
+        "job_id"
+    ]
+    completed = client.get(
+        f"/api/projects/session-api-retry/full-deck/generation-sessions/{session_id}"
+    ).json()
+    assert completed["status"] == "completed"
+    project = client.get("/api/projects/session-api-retry").json()
+    assert project["full_deck_generation_session"]["status"] == "completed"
