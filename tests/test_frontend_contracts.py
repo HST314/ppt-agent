@@ -8,6 +8,7 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     html = (ROOT / "frontend/index.html").read_text(encoding="utf-8")
     app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
     samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
+    api = (ROOT / "frontend/static/js/api.js").read_text(encoding="utf-8")
 
     assert all(f'data-view="{view}"' in html for view in ("workspace", "status", "settings"))
     assert all(name in app for name in ("任务卡", "澄清问题", "叙事结构", "逐页大纲", "PPT 样品", "PPT 全稿", "确认验收"))
@@ -27,6 +28,9 @@ def test_frontend_has_three_top_level_views_and_seven_stages() -> None:
     assert 'data-action="generate_sample"' in samples
     assert '${completion}${preview}${feedback}${attemptsMarkup}${historyMarkup}' in samples
     assert "本次生成尝试" in samples
+    assert 'data-action="resume_sample"' in samples
+    assert "追加 ${preferredRounds} 轮并继续" in samples
+    assert "resumeSample" in api
     assert "已发布为 PPT 样品" in samples
     assert "source_slide_number" in samples
     assert 'id="max-tool-rounds" name="max_tool_rounds" type="number" min="0" max="100"' in app
@@ -173,6 +177,8 @@ def test_status_console_supports_stable_live_filter_search_and_expand() -> None:
     assert 'id="status-elapsed"' in app
     assert "signature === statusDataSignature" in app
     assert "statusPollInFlight" in app
+    assert "summary.progress" in app
+    assert "tool_round_completed" in app
     assert 'from "./status-view.js"' in app
     assert "window.scrollTo(snapshot.scrollX, snapshot.scrollY)" in status_view
     assert "需要关注" not in app

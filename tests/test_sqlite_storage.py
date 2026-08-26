@@ -415,6 +415,93 @@ def test_sample_attempt_summary_groups_latest_chain_and_counts_tool_rounds(
     assert attempts[1]["published"] is True
 
 
+def test_prompt_round_progress_is_immediately_queryable_and_drives_resume(
+    tmp_path: Path,
+) -> None:
+    store = ProjectStore(tmp_path / "projects", "live-progress")
+    checkpoint_id = "checkpoint_0123456789abcdef01234567"
+    prompt_call_id = store.start_prompt_call(
+        state="ppt_sample",
+        messages=[{"role": "user", "content": "生成样品"}],
+        template_id="ppt_sample",
+        template_version=1,
+        template_hash="sha256:template",
+        model_config_hash="sha256:model",
+        runtime_config_hash="sha256:runtime",
+        skills_hash="sha256:skills",
+        parameters={
+            "provider": "test",
+            "model": "test-model",
+            "generation_checkpoint_id": checkpoint_id,
+            "round_limit": 20,
+            "sample_request": {},
+        },
+    )
+    messages = [
+        {"role": "user", "content": "生成样品"},
+        {"role": "assistant", "tool_calls": [{
+            "id": "call_1",
+            "function": {"name": "read", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "{}"},
+    ]
+    traces = [{
+        "type": "tool_call",
+        "tool": "read",
+        "path": "template.md",
+        "content_hash": "sha256:content",
+        "offset": 0,
+        "end": 100,
+        "round": 1,
+        "round_limit": 20,
+        "at": utc_now(),
+    }]
+
+    store.append_prompt_call_progress(
+        prompt_call_id,
+        status="tool_round_completed",
+        details={
+            "round": 1,
+            "round_limit": 20,
+            "tools": ["read"],
+            "tool_call_count": 1,
+            "skill_read_count": 1,
+            "recent_action": "read · template.md",
+            "elapsed_seconds": 0.1,
+        },
+        traces=traces,
+        messages=messages,
+    )
+
+    attempt = store.sample_attempts(current_checkpoint_id=checkpoint_id)[0]
+    event = store.prompt_call_events()[0]
+    assert attempt["status"] == "started"
+    assert attempt["tool_rounds"] == 1
+    assert attempt["skill_read_count"] == 1
+    assert event["status"] == "tool_round_completed"
+    assert event["details"]["round"] == 1
+
+    store.finish_prompt_call(
+        prompt_call_id,
+        status="failed",
+        messages=messages,
+        traces=traces,
+        error={
+            "type": "MaxToolRoundsExceeded",
+            "code": "max_tool_rounds_exceeded",
+            "message": "maximum tool rounds exceeded",
+        },
+    )
+    attempt = store.sample_attempts(current_checkpoint_id=checkpoint_id)[0]
+    assert attempt["resume_available"] is True
+    assert attempt["resume_options"] == [5, 10, 20]
+    stale = store.sample_attempts(
+        current_checkpoint_id="checkpoint_ffffffffffffffffffffffff",
+    )[0]
+    assert stale["resume_available"] is False
+    assert stale["resume_blocked_reason"] == "工程检查点已变化，不能继续旧生成。"
+
+
 def test_job_registry_uses_sqlite_and_deduplicates_across_instances(tmp_path: Path) -> None:
     root = tmp_path / ".jobs"
     registry = JobRegistry(root)

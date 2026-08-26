@@ -9,6 +9,7 @@ from agent_core.models import SampleOutput, SamplePage, TaskCard, digest
 from agent_core.jobs import public_job_error
 from agent_core.workflow import SampleGenerationError, Workflow, capabilities, stable_hash
 from configs.runtime import ManagedRuntime
+from model_router.client import MaxToolRoundsExceeded
 from storage.project_store import ConflictError, ProjectStore
 
 
@@ -577,6 +578,95 @@ def test_generated_package_persistence_failure_closes_prompt_audit(
         item for item in workflow.store.prompt_calls() if item["state"] == "ppt_sample"
     ]
     assert [item["status"] for item in sample_calls] == ["failed"]
+
+
+def test_sample_tool_limit_can_resume_from_persisted_context_and_draft(
+    workflow: Workflow,
+    monkeypatch,
+) -> None:
+    manifest = ready_for_sample(workflow)
+    captured: dict[str, object] = {}
+
+    def exhaust(_state: str, prompt: str, **kwargs):
+        draft = kwargs["package_draft"]
+        draft.write(
+            "index.html",
+            '<section class="slide" data-slide-id="draft_1">草稿</section>',
+        )
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": prompt},
+        ]
+        traces = []
+        for index in range(1, 21):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": f"call_{index}",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": f"call_{index}", "content": "{}"},
+            ])
+            traces.append({
+                "type": "tool_call",
+                "tool": "read",
+                "path": "templates/deck.html",
+                "content_hash": "sha256:read",
+                "offset": index,
+                "end": index + 1,
+                "round": index,
+                "round_limit": 20,
+            })
+        workflow.gateway.last_messages = messages
+        workflow.gateway.last_traces = traces
+        raise MaxToolRoundsExceeded("maximum tool rounds exceeded")
+
+    monkeypatch.setattr(workflow.gateway, "generate", exhaust)
+    with pytest.raises(MaxToolRoundsExceeded):
+        workflow.generate_sample(manifest["checkpoint_id"])
+
+    attempts = workflow.store.sample_attempts(
+        current_checkpoint_id=manifest["checkpoint_id"],
+    )
+    failed = attempts[-1]
+    assert failed["failure_code"] == "max_tool_rounds_exceeded"
+    assert failed["tool_rounds"] == 20
+    assert failed["resume_available"] is True
+    assert failed["resume_options"] == [5, 10, 20]
+    assert workflow.store.load_generated_package_attempt(
+        failed["prompt_call_id"]
+    )[0]["path"] == "index.html"
+
+    def complete(_state: str, _prompt: str, **kwargs):
+        captured.update(kwargs)
+        return realistic_package_output(), [{
+            "type": "model_call",
+            "provider": "test",
+            "model": "resumed",
+            "usage": {},
+        }]
+
+    monkeypatch.setattr(workflow.gateway, "generate", complete)
+    generated = workflow.resume_sample(
+        manifest["checkpoint_id"],
+        failed["prompt_call_id"],
+        10,
+    )
+
+    sample = generated["samples"][-1]
+    assert sample["package"]["slide_count"] == 2
+    assert sample["provenance"]["sample_resumed"] is True
+    assert captured["max_tool_rounds"] == 10
+    assert captured["prior_tool_rounds"] == 20
+    assert len(captured["resume_messages"]) == 42
+    calls = [
+        item for item in workflow.store.prompt_calls()
+        if item["state"] == "ppt_sample"
+    ]
+    assert calls[-1]["parent_prompt_call_id"] == failed["prompt_call_id"]
+    assert calls[-1]["status"] == "completed"
 
 
 def test_job_error_contract_hides_internal_sample_validation_details() -> None:

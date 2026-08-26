@@ -7,7 +7,9 @@ from fastapi.testclient import TestClient
 
 import main_front
 from agent_core.jobs import JobRegistry
+from agent_core.models import utc_now
 from configs.runtime import ManagedRuntime
+from storage.project_store import ProjectStore
 
 
 def finish_job(client: TestClient, response) -> dict:
@@ -408,3 +410,100 @@ def test_api_rejects_non_whitelisted_model_parameters(
     persisted = client.get("/api/runtime-context").json()
     assert persisted["model_bindings"][0]["parameters"] == original_parameters
     assert "audit-secret" not in str(persisted)
+
+
+def test_activity_exposes_live_tool_round_progress(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    client = TestClient(main_front.app)
+    project = client.post("/api/projects", json={
+        "project_id": "live-activity",
+        "task_card": {"title": "实时状态", "objective": "观察工具轮次"},
+    }).json()
+    store = ProjectStore(project_root, "live-activity")
+    prompt_call_id = store.start_prompt_call(
+        state="ppt_sample",
+        messages=[{"role": "user", "content": "生成样品"}],
+        template_id="ppt_sample",
+        template_version=1,
+        template_hash="sha256:template",
+        model_config_hash="sha256:model",
+        runtime_config_hash="sha256:runtime",
+        skills_hash="sha256:skills",
+        parameters={"provider": "test", "model": "status-model"},
+    )
+    traces = [{
+        "type": "tool_call",
+        "tool": "read",
+        "path": "template.md",
+        "round": 4,
+        "round_limit": 20,
+        "at": utc_now(),
+    }]
+    store.append_prompt_call_progress(
+        prompt_call_id,
+        status="tool_round_completed",
+        details={
+            "round": 4,
+            "round_limit": 20,
+            "tools": ["read"],
+            "tool_call_count": 5,
+            "skill_read_count": 4,
+            "recent_action": "read · template.md",
+            "elapsed_seconds": 12.5,
+        },
+        traces=traces,
+        messages=[
+            {"role": "user", "content": "生成样品"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_4",
+                "function": {"name": "read", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_4", "content": "{}"},
+        ],
+    )
+
+    activity = client.get(
+        f"/api/projects/{project['project_id']}/activity"
+    ).json()
+
+    assert activity["summary"]["progress"]["round"] == 4
+    assert any(
+        item["title"] == "tool_round_completed"
+        and item["summary"].startswith("第 4/20 轮")
+        for item in activity["events"]
+    )
+
+
+def test_resume_sample_rejects_a_stale_project_checkpoint_before_queueing(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", JobRegistry(project_root / ".jobs"))
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    client = TestClient(main_front.app)
+    client.post("/api/projects", json={
+        "project_id": "stale-sample-resume",
+        "task_card": {"title": "续跑边界", "objective": "拒绝旧检查点"},
+    })
+
+    response = client.post(
+        "/api/projects/stale-sample-resume/samples/attempts/"
+        "prompt_0123456789abcdef0123456789abcdef/resume",
+        json={
+            "checkpoint_id": "checkpoint_ffffffffffffffffffffffff",
+            "additional_rounds": 10,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "sample_resume_stale"

@@ -403,6 +403,49 @@ class ProjectStore(PromptAuditMixin):
             relative_paths.append(relative_path)
         return relative_paths
 
+    def load_generated_package_attempt(
+        self,
+        prompt_call_id: str,
+    ) -> list[dict[str, Any]]:
+        """Restore a bounded draft package for a resumable sample tool loop."""
+
+        if not PROMPT_CALL_ID.fullmatch(prompt_call_id):
+            raise ValueError("invalid prompt call id")
+        package_root = (
+            self.generated_html_root / prompt_call_id / "package"
+        ).resolve()
+        if not package_root.is_dir() or not package_root.is_relative_to(
+            self.generated_html_root.resolve()
+        ):
+            return []
+        result: list[dict[str, Any]] = []
+        total = 0
+        for candidate in sorted(path for path in package_root.rglob("*") if path.is_file()):
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(package_root):
+                continue
+            content = resolved.read_bytes()
+            total += len(content)
+            if not content or len(content) > 2_000_000 or total > 15_000_000:
+                continue
+            logical_path = resolved.relative_to(package_root).as_posix()
+            if resolved.suffix.lower() in TEXT_SUFFIXES:
+                try:
+                    value = content.decode("utf-8")
+                    encoding = "utf-8"
+                except UnicodeDecodeError:
+                    value = base64.b64encode(content).decode("ascii")
+                    encoding = "base64"
+            else:
+                value = base64.b64encode(content).decode("ascii")
+                encoding = "base64"
+            result.append({
+                "path": logical_path,
+                "content": value,
+                "encoding": encoding,
+            })
+        return result
+
     def _externalize_manifest(
         self,
         manifest: dict[str, Any],

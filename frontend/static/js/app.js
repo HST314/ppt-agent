@@ -66,6 +66,7 @@ const EVENT_LABELS = {
   full_deck_approved: "确认 PPT 全稿",
   branch_created: "创建分支",
   branch_switched: "切换分支",
+  tool_round_completed: "完成模型工具轮次",
 };
 
 const state = {
@@ -116,6 +117,7 @@ const ERROR_MESSAGES = {
   stale_revision: "工程已更新，请刷新后再执行此操作。",
   active_job: "当前有后台任务正在运行，请等待任务结束后重试。",
   invalid_model_output: "模型返回的内容格式不正确，请重试。",
+  max_tool_rounds_exceeded: "达到当前工具轮次上限，可追加轮次从当前进度继续。",
   process_restarted: "服务已重启，请从上一成功点重试。",
   job_failed: "任务暂未完成，请重试。",
 };
@@ -172,6 +174,7 @@ function jobLabel(operation) {
     generate_sample: "生成 PPT 样品",
     regenerate_sample: "重新生成 PPT 样品",
     revise_sample: "根据修改意见调整 PPT 样品",
+    continue_sample: "追加轮次并继续生成 PPT 样品",
     generate_full_deck: "生成完整 HTML-PPT",
     regenerate_full_deck: "重新生成 PPT 全稿",
     revise_full_deck: "根据修改意见调整 PPT 全稿",
@@ -432,6 +435,9 @@ async function statusMarkup({ skipUnchanged = false } = {}) {
   const signature = createStatusSignature(activity, branches);
   if (skipUnchanged && signature === statusDataSignature) return { markup: null, branches, activity, summary, signature };
   const job = summary.active_job;
+  const liveProgress = job && summary.progress
+    ? `第 ${summary.progress.round}/${summary.progress.round_limit} 轮 · ${summary.progress.tool_call_count} 次工具调用 · ${summary.progress.skill_read_count} 次 Skill 读取 · ${summary.progress.recent_action || "继续处理中"}`
+    : "等待首个工具轮次返回…";
   const counts = activity.events.reduce((result, event) => {
     result[event.kind] = (result[event.kind] || 0) + 1;
     return result;
@@ -459,7 +465,7 @@ async function statusMarkup({ skipUnchanged = false } = {}) {
   const eventsMarkup = filtered.length
     ? filtered.map((event) => eventMarkup(event)).join("")
     : `<div class="status-empty"><strong>没有匹配的事件</strong><p>尝试清空搜索词，或切换到“全部”类型。</p><button class="btn btn--secondary" type="button" data-status-reset>清除筛选</button></div>`;
-  const markup = `<div class="page-head"><div><p class="eyebrow">Agent observability</p><h1>${escapeHtml(p.title)}</h1><p class="lede">实时汇总后台任务、模型调用、Skill 读取、校验、产物保存和错误。</p></div><span class="badge ${job ? "badge--info" : "badge--success"}">${job ? "实时运行中" : "已同步"}</span></div><section class="panel section ia-section status-overview"><div class="metric-grid metric-grid--status"><div class="metric"><span>当前任务</span><strong>${escapeHtml(job ? jobLabel(job.operation) : "暂无运行任务")}</strong></div><div class="metric"><span>阶段 / 耗时</span><strong id="status-elapsed">${escapeHtml(statusElapsedLabel(summary, STATE_LABELS))}</strong></div><div class="metric"><span>模型</span><strong>${escapeHtml(summary.model || "尚未调用")}</strong><small>${escapeHtml(summary.provider || "")}</small></div><div class="metric"><span>事件 / 失败</span><strong>${summary.event_count} / ${summary.error_count}</strong></div></div>${job ? `<div class="job-progress" role="status"><span class="spinner" aria-hidden="true"></span><strong>正在${escapeHtml(jobLabel(job.operation))}</strong><span>状态台每 2 秒自动更新。</span></div>` : ""}<div class="event-density" aria-label="最近 ${Math.min(activity.events.length, 64)} 条事件的类型密度"><span>事件密度</span><div>${density}</div></div></section><section class="panel section ia-section"><div class="section__head"><div><h2>统一事件流</h2><p>展开事件可查看经过脱敏的结构化详情并复制。</p></div><div class="status-sort"><label for="status-order">排序</label><select class="input" id="status-order"><option value="newest" ${state.statusOrder === "newest" ? "selected" : ""}>最新在前</option><option value="oldest" ${state.statusOrder === "oldest" ? "selected" : ""}>时间顺序</option></select></div></div><div class="status-controls"><div class="status-filters" aria-label="按事件类型筛选">${filters}</div><div class="status-search"><label class="sr-only" for="status-search">搜索事件</label><input class="input" id="status-search" type="search" value="${escapeHtml(state.statusQuery)}" placeholder="搜索操作、文件、模型或错误…"><span>${filtered.length} 条</span></div></div><div class="activity-list">${eventsMarkup}</div></section>`;
+  const markup = `<div class="page-head"><div><p class="eyebrow">Agent observability</p><h1>${escapeHtml(p.title)}</h1><p class="lede">实时汇总后台任务、模型调用、Skill 读取、校验、产物保存和错误。</p></div><span class="badge ${job ? "badge--info" : "badge--success"}">${job ? "实时运行中" : "已同步"}</span></div><section class="panel section ia-section status-overview"><div class="metric-grid metric-grid--status"><div class="metric"><span>当前任务</span><strong>${escapeHtml(job ? jobLabel(job.operation) : "暂无运行任务")}</strong></div><div class="metric"><span>阶段 / 耗时</span><strong id="status-elapsed">${escapeHtml(statusElapsedLabel(summary, STATE_LABELS))}</strong></div><div class="metric"><span>模型</span><strong>${escapeHtml(summary.model || "尚未调用")}</strong><small>${escapeHtml(summary.provider || "")}</small></div><div class="metric"><span>事件 / 失败</span><strong>${summary.event_count} / ${summary.error_count}</strong></div></div>${job ? `<div class="job-progress" role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><strong>正在${escapeHtml(jobLabel(job.operation))}</strong><span>${escapeHtml(liveProgress)}</span><small>状态台每 2 秒自动更新。</small></div>` : ""}<div class="event-density" aria-label="最近 ${Math.min(activity.events.length, 64)} 条事件的类型密度"><span>事件密度</span><div>${density}</div></div></section><section class="panel section ia-section"><div class="section__head"><div><h2>统一事件流</h2><p>展开事件可查看经过脱敏的结构化详情并复制。</p></div><div class="status-sort"><label for="status-order">排序</label><select class="input" id="status-order"><option value="newest" ${state.statusOrder === "newest" ? "selected" : ""}>最新在前</option><option value="oldest" ${state.statusOrder === "oldest" ? "selected" : ""}>时间顺序</option></select></div></div><div class="status-controls"><div class="status-filters" aria-label="按事件类型筛选">${filters}</div><div class="status-search"><label class="sr-only" for="status-search">搜索事件</label><input class="input" id="status-search" type="search" value="${escapeHtml(state.statusQuery)}" placeholder="搜索操作、文件、模型或错误…"><span>${filtered.length} 条</span></div></div><div class="activity-list">${eventsMarkup}</div></section>`;
   return { markup, branches, activity, summary, signature };
 }
 
@@ -635,11 +641,42 @@ async function runJob(operation, extra = {}) {
   finally { setBusy(false); }
 }
 
+async function resumeSample(button) {
+  if (!state.project) return false;
+  const promptCallId = button.dataset.promptCallId;
+  const select = content.querySelector(`[data-resume-rounds="${CSS.escape(promptCallId)}"]`);
+  const additionalRounds = Number(select?.value || 10);
+  setBusy(true);
+  try {
+    const job = await api.resumeSample(
+      state.project.project_id,
+      promptCallId,
+      {
+        checkpoint_id: state.project.checkpoint_id,
+        additional_rounds: additionalRounds,
+      },
+    );
+    state.project.active_job = job;
+    await render();
+    void pollJob(job.job_id);
+    return true;
+  } catch (error) {
+    toast(userErrorMessage(error), true);
+    return false;
+  } finally {
+    setBusy(false);
+  }
+}
+
 function wireWorkspace() {
   content.querySelectorAll("[data-sample-revision]").forEach((button) => button.addEventListener("click", () => selectSampleRevision(button.dataset.sampleRevision)));
   content.querySelectorAll("[data-full-deck-revision]").forEach((button) => button.addEventListener("click", () => selectFullDeckRevision(button.dataset.fullDeckRevision)));
   content.querySelectorAll("[data-snapshot-stage]").forEach((button) => button.addEventListener("click", () => {
     openSnapshotDialog(button.dataset.snapshotStage);
+  }));
+  content.querySelectorAll("[data-resume-rounds]").forEach((select) => select.addEventListener("change", () => {
+    const button = content.querySelector(`[data-action="resume_sample"][data-prompt-call-id="${CSS.escape(select.dataset.resumeRounds)}"]`);
+    if (button) button.textContent = `追加 ${select.value} 轮并继续`;
   }));
   content.querySelectorAll("button[data-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.action;
@@ -658,6 +695,7 @@ function wireWorkspace() {
     if (action === "regenerate_document") await runJob(button.dataset.type === "narrative_structure" ? "regenerate_narrative" : "regenerate_outline");
     if (action === "approve_document") await approveDocument(button.dataset.type);
     if (action === "regenerate_sample") await runJob("regenerate_sample");
+    if (action === "resume_sample") await resumeSample(button);
     if (action === "approve_sample") await approveSample();
     if (action === "branch_sample_revision") await branchFromSampleRevision(button.dataset.revisionHash);
     if (action === "generate_full_deck") await runJob("generate_full_deck");

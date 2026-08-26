@@ -22,6 +22,7 @@ export const api = {
   project: (id) => request(`/api/projects/${encodeURIComponent(id)}`),
   create: (payload) => request("/api/projects", { method: "POST", body: JSON.stringify(payload) }),
   startJob: (id, payload) => request(`/api/projects/${encodeURIComponent(id)}/jobs`, { method: "POST", body: JSON.stringify(payload) }),
+  resumeSample: (id, promptCallId, payload) => request(`/api/projects/${encodeURIComponent(id)}/samples/attempts/${encodeURIComponent(promptCallId)}/resume`, { method: "POST", body: JSON.stringify(payload) }),
   job: (id) => request(`/api/jobs/${encodeURIComponent(id)}`),
   cancelJob: (id) => request(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST", body: "{}" }),
   answer: (id, payload) => request(`/api/projects/${encodeURIComponent(id)}/clarification`, { method: "POST", body: JSON.stringify(payload) }),

@@ -136,6 +136,10 @@ class SampleRevisionBranchRequest(SampleRevisionRequest):
     name: str = Field(min_length=2, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 
 
+class ResumeSampleRequest(SampleRevisionRequest):
+    additional_rounds: Literal[5, 10, 20] = 10
+
+
 class FullDeckRevisionRequest(StrictRequest):
     checkpoint_id: str = Field(pattern=r"^checkpoint_[a-f0-9]{24}$")
 
@@ -279,7 +283,9 @@ def project_view(store: ProjectStore) -> dict[str, Any]:
         # every prior sample on each poll.
         "samples": latest_sample,
         "sample_revisions": history,
-        "sample_attempts": store.sample_attempts(),
+        "sample_attempts": store.sample_attempts(
+            current_checkpoint_id=manifest["checkpoint_id"],
+        ),
         "sample_page_count": sample_page_count,
         "full_deck_revision": current_full_deck,
         "full_deck_revisions": [
@@ -470,6 +476,56 @@ def start_job(project_id: str, request: StartJobRequest) -> dict[str, Any]:
         },
         idempotency_key=_full_deck_job_idempotency_key(
             store, current_runtime, request
+        ),
+    )
+
+
+@app.post(
+    "/api/projects/{project_id}/samples/attempts/{prompt_call_id}/resume",
+    status_code=202,
+)
+def resume_sample_job(
+    project_id: str,
+    prompt_call_id: str,
+    request: ResumeSampleRequest,
+) -> dict[str, Any]:
+    store = store_for(project_id)
+    current_checkpoint_id = store.read(
+        latest_sample_only=True,
+        include_sample_html=False,
+    )["checkpoint_id"]
+    if request.checkpoint_id != current_checkpoint_id:
+        raise ConflictError(
+            "sample_resume_stale:工程检查点已变化，不能继续旧生成。"
+        )
+    try:
+        context = store.sample_resume_context(
+            prompt_call_id,
+            checkpoint_id=current_checkpoint_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="样品生成尝试不存在") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise ConflictError(str(exc)) from exc
+    if request.additional_rounds > context["remaining_tool_rounds"]:
+        raise ConflictError(
+            "sample_resume_limit:追加后会超过整条生成链 100 轮上限。"
+        )
+    with runtime_config_lock:
+        current_runtime = runtime
+    workflow = Workflow(store, current_runtime)
+    return jobs.submit(
+        project_id,
+        "continue_sample",
+        request.checkpoint_id,
+        lambda: workflow.resume_sample(
+            request.checkpoint_id,
+            prompt_call_id,
+            request.additional_rounds,
+        ),
+        idempotency_key=(
+            f"continue_sample\n{request.checkpoint_id}\n{prompt_call_id}\n"
+            f"{request.additional_rounds}"
         ),
     )
 
@@ -842,7 +898,11 @@ def project_activity(
 ) -> dict[str, Any]:
     store = store_for(project_id)
     project_events = store.events(limit=min(limit, 1000))
-    prompt_items = store.prompt_calls(limit=min(limit, 500))
+    prompt_items = store.prompt_calls(
+        limit=min(limit, 500),
+        include_messages=False,
+    )
+    prompt_events = store.prompt_call_events(limit=min(limit, 1000))
     job_items = jobs.list_for_project(project_id, limit=min(limit, 500))
     job_events = jobs.events_for_project(project_id, limit=min(limit, 1000))
     events: list[dict[str, Any]] = []
@@ -913,13 +973,41 @@ def project_activity(
             kind = "skill" if tool == "read" else "artifact"
             events.append({
                 "id": f"tool-{call['prompt_call_id']}-{tool_index}",
-                "at": call.get("completed_at") or call["started_at"],
+                "at": tool_call.get("at") or call.get("completed_at") or call["started_at"],
                 "kind": kind,
                 "status": "succeeded",
                 "title": tool,
-                "summary": tool_call.get("path") or tool_call.get("source_path") or "工具调用",
+                "summary": (
+                    f"第 {tool_call.get('round')}/{tool_call.get('round_limit')} 轮 · "
+                    f"{tool_call.get('path') or tool_call.get('source_path') or '工具调用'}"
+                    if tool_call.get("round") is not None
+                    else tool_call.get("path") or tool_call.get("source_path") or "工具调用"
+                ),
                 "details": tool_call,
             })
+
+    progress_events = [
+        item for item in prompt_events
+        if item["status"] == "tool_round_completed"
+    ]
+    for item in progress_events:
+        details = item.get("details") or {}
+        events.append({
+            "id": f"prompt-progress-{item['event_id']}",
+            "at": item["at"],
+            "kind": "model",
+            "status": "running",
+            "title": "tool_round_completed",
+            "summary": (
+                f"第 {details.get('round', '—')}/{details.get('round_limit', '—')} 轮 · "
+                f"{details.get('recent_action') or '工具调用已完成'}"
+            ),
+            "details": {
+                "prompt_call_id": item["prompt_call_id"],
+                "state": item["state"],
+                **details,
+            },
+        })
 
     events.sort(key=lambda item: (item.get("at") or "", item["id"]), reverse=True)
     events = events[:limit]
@@ -929,6 +1017,15 @@ def project_activity(
     )
     latest_prompt = prompt_items[0] if prompt_items else None
     model_parameters = (latest_prompt or {}).get("parameters") or {}
+    latest_progress = next(
+        (
+            item.get("details")
+            for item in progress_events
+            if latest_prompt
+            and item["prompt_call_id"] == latest_prompt["prompt_call_id"]
+        ),
+        None,
+    )
     return {
         "summary": {
             "active_job": active,
@@ -937,6 +1034,7 @@ def project_activity(
             "provider": model_parameters.get("provider"),
             "event_count": len(events),
             "error_count": sum(item["kind"] == "error" for item in events),
+            "progress": latest_progress,
         },
         "events": events,
     }

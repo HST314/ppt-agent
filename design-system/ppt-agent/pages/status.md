@@ -6,5 +6,6 @@ This page inherits `../MASTER.md` and adds the following rules.
 - Use a small event-density strip to reveal bursts and gaps without introducing a charting dependency. Every mark has a text tooltip and the detailed list remains the authoritative view.
 - Present Job, model, Skill read, validation, artifact, project, and error events in one authoritative list. Provide type filters, local search, newest/chronological ordering, expandable redacted JSON, and copy feedback.
 - Refresh live data in place without showing a page-level loading state, moving the viewport, or dropping keyboard focus. Do not overlap polling requests.
+- While a model tool loop is running, show the current/cumulative round, round limit, tool and Skill-read totals, latest action, and elapsed time in the live status region; persist each round so polling and post-failure audit use the same source.
 - Search no-results must offer a reset action. Errors use text labels as well as color. All filter, expand, sort, and copy targets remain keyboard operable and at least 44px tall.
 - Use two-column metrics at tablet widths and one column below 768px. Event timestamps wrap below summaries on narrow screens; no horizontal page scroll.

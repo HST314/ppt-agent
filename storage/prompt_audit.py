@@ -198,6 +198,167 @@ class PromptAuditMixin:
                 ),
             )
 
+    def append_prompt_call_progress(
+        self,
+        prompt_call_id: str,
+        *,
+        status: str,
+        details: dict[str, Any],
+        traces: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Persist one live, redacted model/tool round without closing the call."""
+
+        if status != "tool_round_completed":
+            raise ValueError("invalid prompt progress status")
+        at = utc_now()
+        tool_calls = [item for item in traces if item.get("type") == "tool_call"]
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT status FROM prompt_calls WHERE prompt_call_id = ?",
+                (prompt_call_id,),
+            ).fetchone()
+            if current is None:
+                raise FileNotFoundError(prompt_call_id)
+            if current["status"] != "started":
+                raise RuntimeError("prompt_call_terminal")
+            connection.execute(
+                """
+                UPDATE prompt_calls
+                SET messages_json = ?, tool_calls_json = ?
+                WHERE prompt_call_id = ?
+                """,
+                (
+                    json_text(redact_for_audit(messages)),
+                    json_text(redact_for_audit(tool_calls)),
+                    prompt_call_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO prompt_call_events(prompt_call_id, at, status, details_json)
+                VALUES(?, ?, ?, ?)
+                """,
+                (
+                    prompt_call_id,
+                    at,
+                    status,
+                    json_text(redact_for_audit(details)),
+                ),
+            )
+
+    def prompt_call_events(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Return bounded live/terminal prompt events for the status console."""
+
+        if limit < 1 or limit > 2000:
+            raise ValueError("prompt event limit out of range")
+        self._ensure_database()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.event_id, e.prompt_call_id, e.at, e.status, e.details_json,
+                       p.state, p.parameters_json
+                FROM prompt_call_events e
+                JOIN prompt_calls p ON p.prompt_call_id = e.prompt_call_id
+                ORDER BY e.event_id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "prompt_call_id": row["prompt_call_id"],
+                "at": row["at"],
+                "status": row["status"],
+                "state": row["state"],
+                "details": json.loads(row["details_json"]) if row["details_json"] else {},
+                "parameters": json.loads(row["parameters_json"]) if row["parameters_json"] else {},
+            }
+            for row in rows
+        ]
+
+    def sample_resume_context(
+        self,
+        prompt_call_id: str,
+        *,
+        checkpoint_id: str,
+    ) -> dict[str, Any]:
+        """Load and validate a persisted leaf checkpoint for sample continuation."""
+
+        self._ensure_database()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM prompt_calls WHERE prompt_call_id = ?",
+                (prompt_call_id,),
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(prompt_call_id)
+            child = connection.execute(
+                "SELECT 1 FROM prompt_calls WHERE parent_prompt_call_id = ? LIMIT 1",
+                (prompt_call_id,),
+            ).fetchone()
+            chain_rows = connection.execute(
+                """
+                WITH RECURSIVE ancestors AS (
+                    SELECT prompt_call_id, parent_prompt_call_id, started_at,
+                           tool_calls_json
+                    FROM prompt_calls WHERE prompt_call_id = ?
+                    UNION ALL
+                    SELECT parent.prompt_call_id, parent.parent_prompt_call_id,
+                           parent.started_at, parent.tool_calls_json
+                    FROM prompt_calls parent
+                    JOIN ancestors child
+                      ON child.parent_prompt_call_id = parent.prompt_call_id
+                )
+                SELECT prompt_call_id, tool_calls_json
+                FROM ancestors ORDER BY started_at, prompt_call_id
+                """,
+                (prompt_call_id,),
+            ).fetchall()
+        error = json.loads(row["error_json"]) if row["error_json"] else {}
+        parameters = json.loads(row["parameters_json"]) if row["parameters_json"] else {}
+        messages = json.loads(row["messages_json"]) if row["messages_json"] else []
+        if row["state"] != "ppt_sample" or row["status"] != "failed":
+            raise RuntimeError("sample_resume_not_available:该尝试不是可续跑的失败样品任务。")
+        if error.get("code") != "max_tool_rounds_exceeded":
+            raise RuntimeError("sample_resume_not_available:只有达到工具轮次上限的任务可以续跑。")
+        if child:
+            raise RuntimeError("sample_resume_superseded:该尝试已有后续，请刷新后继续最新尝试。")
+        if parameters.get("generation_checkpoint_id") != checkpoint_id:
+            raise RuntimeError("sample_resume_stale:工程检查点已变化，不能继续旧生成。")
+        cumulative_rounds = sum(
+            bool(message.get("tool_calls"))
+            for message in messages
+            if message.get("role") == "assistant"
+        )
+        if cumulative_rounds >= 100:
+            raise RuntimeError("sample_resume_limit:整条生成链已达到 100 个工具轮次。")
+        chain_tool_calls = [
+            tool_call
+            for chain_row in chain_rows
+            for tool_call in (
+                json.loads(chain_row["tool_calls_json"])
+                if chain_row["tool_calls_json"] else []
+            )
+        ]
+        return {
+            "prompt_call_id": prompt_call_id,
+            "parent_prompt_call_id": row["parent_prompt_call_id"],
+            "messages": messages,
+            "parameters": parameters,
+            "tool_calls": chain_tool_calls,
+            "cumulative_tool_call_count": len(chain_tool_calls),
+            "cumulative_skill_read_count": sum(
+                item.get("tool") == "read" for item in chain_tool_calls
+            ),
+            "cumulative_tool_rounds": cumulative_rounds,
+            "remaining_tool_rounds": 100 - cumulative_rounds,
+            "prompt_call_ids": [item["prompt_call_id"] for item in chain_rows],
+            "template_id": row["template_id"],
+            "template_hash": row["template_hash"],
+            "skills_hash": row["skills_hash"],
+        }
+
     def update_prompt_call_context(
         self,
         prompt_call_id: str,
@@ -223,33 +384,49 @@ class PromptAuditMixin:
                 (json_text(parameters), prompt_call_id),
             )
 
-    def prompt_calls(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+    def prompt_calls(
+        self,
+        *,
+        limit: int | None = None,
+        include_messages: bool = True,
+    ) -> list[dict[str, Any]]:
         self._ensure_database()
+        columns = "*" if include_messages else """
+            prompt_call_id, parent_prompt_call_id, project_id, state, status,
+            template_id, template_version, template_hash, model_config_hash,
+            runtime_config_hash, skills_hash, parameters_json, tool_calls_json,
+            started_at, completed_at, error_json, output_ref, output_hash
+        """
         with self._connect() as connection:
             if limit is None:
                 rows = connection.execute(
-                    "SELECT * FROM prompt_calls ORDER BY started_at, prompt_call_id"
+                    f"SELECT {columns} FROM prompt_calls "
+                    "ORDER BY started_at, prompt_call_id"
                 ).fetchall()
             else:
                 if limit < 1 or limit > 500:
                     raise ValueError("prompt call limit out of range")
                 rows = connection.execute(
-                    """
-                    SELECT * FROM prompt_calls
-                    ORDER BY started_at DESC, prompt_call_id DESC LIMIT ?
-                    """,
+                    f"SELECT {columns} FROM prompt_calls "
+                    "ORDER BY started_at DESC, prompt_call_id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
         result = []
         for row in rows:
             item = dict(row)
             for key in ("messages_json", "parameters_json", "tool_calls_json", "error_json"):
+                if key not in item:
+                    continue
                 value = item.pop(key)
                 item[key.removesuffix("_json")] = json.loads(value) if value else None
             result.append(item)
         return result
 
-    def sample_attempts(self) -> list[dict[str, Any]]:
+    def sample_attempts(
+        self,
+        *,
+        current_checkpoint_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return a bounded public summary of the newest sample repair chain."""
 
         self._ensure_database()
@@ -267,10 +444,10 @@ class PromptAuditMixin:
                     SELECT child.*, parent.chain_depth + 1 FROM prompt_calls child
                     JOIN newest_sample_chain parent
                       ON child.parent_prompt_call_id = parent.prompt_call_id
-                    WHERE child.state = 'ppt_sample' AND parent.chain_depth < 3
+                    WHERE child.state = 'ppt_sample' AND parent.chain_depth < 100
                 )
                 SELECT * FROM newest_sample_chain
-                ORDER BY started_at, prompt_call_id LIMIT 3
+                ORDER BY started_at, prompt_call_id LIMIT 100
                 """
             ).fetchall()
         result: list[dict[str, Any]] = []
@@ -300,7 +477,7 @@ class PromptAuditMixin:
                 reason = "正在生成，尚未进入发布校验。"
             elif row["status"] == "conflicted":
                 reason = "生成完成时工程版本已变化，因此未发布。"
-            elif error and "maximum tool rounds exceeded" in str(error.get("message", "")):
+            elif error and error.get("code") == "max_tool_rounds_exceeded":
                 reason = "达到最大工具轮次，尚未返回最终包清单。"
             elif error and error.get("code") in {
                 "sample_json_incomplete", "sample_output_invalid", "sample_package_invalid",
@@ -309,6 +486,7 @@ class PromptAuditMixin:
                 reason = " ".join(str(error.get("message") or "生成结果未通过契约校验。").split())[:300]
             else:
                 reason = "生成未完成，因此未发布。"
+            remaining_rounds = max(0, 100 - tool_rounds)
             result.append({
                 "attempt": attempt_number,
                 "prompt_call_id": row["prompt_call_id"],
@@ -323,7 +501,33 @@ class PromptAuditMixin:
                 "completed_at": row["completed_at"],
                 "provider": parameters.get("provider"),
                 "model": parameters.get("model"),
+                "round_limit": parameters.get("round_limit"),
+                "remaining_tool_rounds": remaining_rounds,
+                "resume_available": False,
+                "resume_blocked_reason": None,
+                "resume_options": [
+                    value for value in (5, 10, 20) if value <= remaining_rounds
+                ],
             })
+        if result:
+            latest = result[-1]
+            parameters = json.loads(rows[-1]["parameters_json"]) if rows[-1]["parameters_json"] else {}
+            latest["resume_available"] = bool(
+                latest["status"] == "failed"
+                and latest["failure_code"] == "max_tool_rounds_exceeded"
+                and latest["resume_options"]
+                and current_checkpoint_id is not None
+                and parameters.get("generation_checkpoint_id") == current_checkpoint_id
+            )
+            for item in result:
+                if item["failure_code"] != "max_tool_rounds_exceeded":
+                    continue
+                if item is not latest:
+                    item["resume_blocked_reason"] = "已有后续尝试，请在最新尝试处继续。"
+                elif not item["resume_options"]:
+                    item["resume_blocked_reason"] = "整条生成链剩余不足 5 轮，已达到续跑保护上限。"
+                elif parameters.get("generation_checkpoint_id") != current_checkpoint_id:
+                    item["resume_blocked_reason"] = "工程检查点已变化，不能继续旧生成。"
         return result
 
     def full_deck_attempts(self) -> list[dict[str, Any]]:

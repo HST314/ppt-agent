@@ -39,6 +39,7 @@ from agent_core.models import (
     SampleRevision,
     TaskCard,
 )
+from agent_core.sample_resume import resume_sample as run_sample_resume
 from agent_core.full_deck_composer import (
     FullDeckComposerError,
     normalized_page_content_graph,
@@ -450,11 +451,12 @@ class Workflow:
         audit_context: dict[str, Any] | None = None,
     ) -> str:
         self.gateway.last_messages = None
+        self.gateway.last_traces = []
         binding = self.runtime.models.binding_for(state)
         parameters = dict(binding.parameters)
         if json_mode:
             parameters["response_format"] = {"type": "json_object"}
-        return self.store.start_prompt_call(
+        prompt_call_id = self.store.start_prompt_call(
             state=state,
             messages=[
                 {"role": "system", "content": SYSTEM_MESSAGE},
@@ -474,6 +476,16 @@ class Workflow:
             },
             parent_prompt_call_id=parent_prompt_call_id,
         )
+        self.gateway.progress_callback = lambda status, details, traces, messages: (
+            self.store.append_prompt_call_progress(
+                prompt_call_id,
+                status=status,
+                details=details,
+                traces=traces,
+                messages=messages,
+            )
+        )
+        return prompt_call_id
 
     def _fail_prompt_audit(
         self,
@@ -481,10 +493,11 @@ class Workflow:
         exc: Exception,
         traces: list[dict[str, Any]] | None = None,
     ) -> None:
+        effective_traces = traces or self.gateway.last_traces
         self.store.finish_prompt_call(
             prompt_call_id,
             status="failed",
-            traces=traces,
+            traces=effective_traces,
             messages=self.gateway.last_messages,
             error={
                 "type": type(exc).__name__,
@@ -1004,6 +1017,20 @@ class Workflow:
         successful_prompt_call_id: str | None = None
         package_output: HtmlPptPackage | None = None
         successful_draft: DraftPackage | None = None
+        sample_operation = (
+            "revise_sample" if normalized_feedback
+            else "regenerate_sample" if regenerate
+            else "generate_sample"
+        )
+        sample_request = {
+            "operation": sample_operation,
+            "page_count": page_count,
+            "outline_revision_hash": outline["revision_hash"],
+            "outline_slide_numbers": sorted(outline_slide_numbers),
+            "preserve_source_slide_numbers": preserve_source_slide_numbers,
+            "feedback": normalized_feedback,
+            "parent_sample_revision_hash": current.get("revision_hash") if current else None,
+        }
         for attempt in range(SAMPLE_MAX_REPAIR_ATTEMPTS + 1):
             draft = DraftPackage(self.runtime.skills_root)
             if current and current.get("package"):
@@ -1016,6 +1043,12 @@ class Workflow:
                 skills_hash=stable_hash(skill_index),
                 json_mode=True,
                 parent_prompt_call_id=parent_prompt_call_id,
+                audit_context={
+                    "operation": sample_operation,
+                    "generation_checkpoint_id": checkpoint_id,
+                    "round_limit": self.runtime.policy.max_tool_rounds,
+                    "sample_request": sample_request,
+                },
             )
             prompt_call_ids.append(prompt_call_id)
             attempt_traces: list[dict[str, Any]] = []
@@ -1034,6 +1067,10 @@ class Workflow:
                     )
             except Exception as exc:
                 self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
+                self.store.save_generated_package_attempt(
+                    prompt_call_id,
+                    draft.payload(),
+                )
                 raise
             traces.extend(attempt_traces)
             try:
@@ -1134,6 +1171,22 @@ class Workflow:
             messages=self.gateway.last_messages,
             output_ref=sample.revision_hash,
             output_hash="sha256:" + hashlib.sha256(text.encode()).hexdigest(),
+        )
+
+    def resume_sample(
+        self,
+        checkpoint_id: str,
+        prompt_call_id: str,
+        additional_rounds: int,
+    ) -> dict[str, Any]:
+        return run_sample_resume(
+            self,
+            checkpoint_id,
+            prompt_call_id,
+            additional_rounds,
+            parse_output=_parse_sample_output,
+            validate_output=_validate_package_output,
+            sample_html_char_budget=SAMPLE_HTML_CHAR_BUDGET,
         )
 
     def enter_full_deck(

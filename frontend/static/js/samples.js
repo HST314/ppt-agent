@@ -31,7 +31,14 @@ function attemptsBody(attempts, escapeHtml) {
       : attempt.status === "started"
         ? '<span class="badge badge--info">生成中</span>'
         : '<span class="badge badge--warning">未发布</span>';
-    return `<li class="sample-attempt-card"><div class="sample-attempt-card__head"><strong>尝试 ${attempt.attempt}</strong>${badge}</div><p>${escapeHtml(attempt.reason)}</p><small>${attempt.tool_rounds} 个工具轮次 · ${attempt.tool_call_count} 次工具调用 · ${attempt.skill_read_count} 次 Skill 读取 · ${escapeHtml(revisionDate(attempt.completed_at || attempt.started_at))}</small></li>`;
+    const options = attempt.resume_options || [];
+    const preferredRounds = options.includes(10) ? 10 : options[0];
+    const resume = attempt.resume_available && preferredRounds
+      ? `<div class="sample-attempt-card__resume"><div class="field"><label for="resume-rounds-${escapeHtml(attempt.prompt_call_id)}">追加轮次</label><select class="input" id="resume-rounds-${escapeHtml(attempt.prompt_call_id)}" data-resume-rounds="${escapeHtml(attempt.prompt_call_id)}">${options.map((value) => `<option value="${value}" ${value === preferredRounds ? "selected" : ""}>${value} 轮</option>`).join("")}</select></div><button class="btn btn--primary" type="button" data-action="resume_sample" data-prompt-call-id="${escapeHtml(attempt.prompt_call_id)}">追加 ${preferredRounds} 轮并继续</button><small>从已保存的对话、Skill 读取结果和草稿包继续；整条生成链累计最多 100 轮。</small></div>`
+      : attempt.resume_blocked_reason
+        ? `<div class="callout callout--warning sample-attempt-card__blocked">${escapeHtml(attempt.resume_blocked_reason)}</div>`
+        : "";
+    return `<li class="sample-attempt-card"><div class="sample-attempt-card__head"><strong>尝试 ${attempt.attempt}</strong>${badge}</div><p>${escapeHtml(attempt.reason)}</p><small>${attempt.tool_rounds} 个工具轮次 · ${attempt.tool_call_count} 次工具调用 · ${attempt.skill_read_count} 次 Skill 读取 · ${escapeHtml(revisionDate(attempt.completed_at || attempt.started_at))}</small>${resume}</li>`;
   }).join("");
   return `<section class="sample-attempts" aria-labelledby="sample-attempts-title" aria-live="polite"><div class="sample-history__head"><div><h3 id="sample-attempts-title">本次生成尝试</h3><p>结构与安全问题会阻止发布；视觉质量建议仅用于人工判断，不会淘汰样品。</p></div><span class="badge badge--info">${attempts.length} 次</span></div><ol class="sample-attempt-list">${cards}</ol></section>`;
 }
