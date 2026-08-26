@@ -1,5 +1,7 @@
 import { api } from "./api.js";
 import { fullDeckBody, hydrateFullDeckFrame } from "./full-deck.js";
+import { isStoppedFullDeckSession } from "./full-deck-session.js";
+import { createFullDeckWorkspaceController, isFullDeckSessionJob } from "./full-deck-workspace.js";
 import { renderMarkdown } from "./markdown.js";
 import { hydrateSampleFrame as hydrateFrame, readySampleBody, sampleBody } from "./samples.js";
 import { captureStatusViewport, createStatusSignature, restoreStatusViewport, statusElapsedLabel } from "./status-view.js";
@@ -72,6 +74,7 @@ const EVENT_LABELS = {
 const state = {
   projects: [], project: null, branches: null, runtime: null,
   view: "workspace", busy: false, focusStage: null,
+  fullDeckSession: null,
   statusFilter: "all", statusQuery: "", statusOrder: "newest", expandedEventId: null,
 };
 
@@ -89,6 +92,7 @@ let statusSearchTimer = null;
 let statusPollInFlight = false;
 let statusPollErrorShown = false;
 let statusDataSignature = null;
+let fullDeckWorkspace = null;
 
 const escapeHtml = (value = "") => String(value)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -114,6 +118,13 @@ const ERROR_MESSAGES = {
   full_deck_composition_failed: "全稿组装未通过来源保真校验，请重试。",
   full_deck_package_invalid: "完整全稿包未通过安全或资源校验，请重试。",
   full_deck_incomplete: "全稿仍有未完成页面，请重新生成。",
+  full_deck_session_active: "当前已有全稿生成会话，请继续查看现有进度。",
+  full_deck_session_stale: "工程基线已变化，需要重新开始全稿生成。",
+  full_deck_batch_failed: "当前批未完成，可重试当前批。",
+  full_deck_preview_failed: "页段已保存，部分预览暂时无法组装，请重试当前批。",
+  full_deck_finalization_failed: "页面已完成，正式全稿发布失败，请重试收尾。",
+  full_deck_session_conflict: "会话版本已变化，已刷新到最新状态，请重试。",
+  full_deck_directive_too_late: "全稿已进入最终组装，补充要求无法再进入生成链。",
   stale_revision: "工程已更新，请刷新后再执行此操作。",
   active_job: "当前有后台任务正在运行，请等待任务结束后重试。",
   invalid_model_output: "模型返回的内容格式不正确，请重试。",
@@ -126,6 +137,11 @@ function userErrorMessage(error, fallback = "操作未完成，请稍后重试�
   if (error?.code && ERROR_MESSAGES[error.code]) return ERROR_MESSAGES[error.code];
   const message = typeof error?.message === "string" ? error.message.replace(/\s+/g, " ").trim() : "";
   return message && /[\u3400-\u9fff]/.test(message) && message.length <= 96 ? message : fallback;
+}
+
+function announceWorkspace(message) {
+  const region = document.querySelector("#workspace-status");
+  if (region) region.textContent = message;
 }
 
 function toast(message, error = false) {
@@ -320,6 +336,10 @@ function fullDeckView() {
   const revision = state.project.full_deck_revision;
   if (!revision) return loadingPanel("正在读取全稿页面清单…");
   const capabilities = state.project.capabilities || [];
+  const generationSession = state.fullDeckSession?.published_revision_hash
+    && state.fullDeckSession.published_revision_hash !== revision.revision_hash
+    ? null
+    : state.fullDeckSession;
   const view = fullDeckBody(revision, escapeHtml, {
     history: state.project.full_deck_revisions || [],
     attempts: state.project.full_deck_attempts || [],
@@ -330,6 +350,7 @@ function fullDeckView() {
     canRevise: capabilities.includes("revise_full_deck"),
     canBranch: capabilities.includes("branch_full_deck_revision"),
     canApprove: capabilities.includes("approve_full_deck"),
+    generationSession,
   });
   return `<section class="panel section ia-section stage"><div class="section__head"><div><h2 id="full-deck-title" tabindex="-1">HTML-PPT 全稿</h2><p>浏览完整页面清单、安全预览和不可变修订历史</p></div>${view.status}</div><div class="panel__body">${view.body}</div></section>`;
 }
@@ -362,6 +383,7 @@ function workspaceMarkup() {
   else if (state.focusStage === "slide_outline" && currentDocument("slide_outline")) stage = documentView("slide_outline");
   else if (state.focusStage === "ppt_sample" && headSample()) stage = sampleView();
   else if (state.focusStage === "ppt_full" && state.project.full_deck_revision) stage = fullDeckView();
+  else if (state.fullDeckSession && isFullDeckSessionJob(state.project.active_job)) stage = fullDeckView();
   else if (state.project.active_job) stage = loadingPanel(`正在${jobLabel(state.project.active_job.operation)}…`);
   else if (state.project.state === "intake") stage = intakeView();
   else if (state.project.state === "intake_clarify") stage = clarificationView();
@@ -518,7 +540,7 @@ async function render({ showLoading = true, preserveStatusViewport = false, skip
     content.innerHTML = workspaceMarkup();
     wireWorkspace();
     hydrateSampleFrame();
-    hydrateFullDeckFrame(content, state.project?.full_deck_revision, headSample());
+    hydrateFullDeckFrame(content, state.project?.full_deck_revision, headSample(), state.fullDeckSession);
     return;
   }
   if (showLoading) {
@@ -585,9 +607,11 @@ async function loadProjects() {
 
 async function openProject(id) {
   try {
+    fullDeckWorkspace.stopPolling();
     if (statusPollTimer) { window.clearInterval(statusPollTimer); statusPollTimer = null; }
     const [project, branches] = await Promise.all([api.project(id), api.branches(id)]);
     state.project = project;
+    state.fullDeckSession = await fullDeckWorkspace.load(project);
     state.branches = branches;
     state.focusStage = null;
     state.view = "workspace";
@@ -595,17 +619,27 @@ async function openProject(id) {
     applySidebar(false);
     renderProjectList();
     await render();
-    if (project.active_job) void pollJob(project.active_job.job_id);
+    if (state.fullDeckSession && !isStoppedFullDeckSession(state.fullDeckSession.status)) fullDeckWorkspace.startPolling();
+    else if (project.active_job) void pollJob(project.active_job.job_id);
   } catch (error) { toast(error.message, true); }
 }
 
 async function refreshCurrent() {
   if (!state.project) { await loadProjects(); await render(); return; }
+  fullDeckWorkspace.stopPolling();
   const [project, branches] = await Promise.all([api.project(state.project.project_id), api.branches(state.project.project_id)]);
   state.project = project;
+  state.fullDeckSession = await fullDeckWorkspace.load(project);
   state.branches = branches;
   await loadProjects();
   await render();
+  if (state.fullDeckSession && !isStoppedFullDeckSession(state.fullDeckSession.status)) fullDeckWorkspace.startPolling();
+  else if (project.active_job) void pollJob(project.active_job.job_id);
+}
+
+async function syncFullDeckSessionForCurrentProject() {
+  fullDeckWorkspace.stopPolling();
+  state.fullDeckSession = await fullDeckWorkspace.load(state.project);
 }
 
 async function pollJob(jobId) {
@@ -669,6 +703,7 @@ async function resumeSample(button) {
 }
 
 function wireWorkspace() {
+  fullDeckWorkspace.wire();
   content.querySelectorAll("[data-sample-revision]").forEach((button) => button.addEventListener("click", () => selectSampleRevision(button.dataset.sampleRevision)));
   content.querySelectorAll("[data-full-deck-revision]").forEach((button) => button.addEventListener("click", () => selectFullDeckRevision(button.dataset.fullDeckRevision)));
   content.querySelectorAll("[data-snapshot-stage]").forEach((button) => button.addEventListener("click", () => {
@@ -698,7 +733,7 @@ function wireWorkspace() {
     if (action === "resume_sample") await resumeSample(button);
     if (action === "approve_sample") await approveSample();
     if (action === "branch_sample_revision") await branchFromSampleRevision(button.dataset.revisionHash);
-    if (action === "generate_full_deck") await runJob("generate_full_deck");
+    if (action === "generate_full_deck") await fullDeckWorkspace.startGeneration(button);
     if (action === "approve_full_deck") await approveFullDeck(button);
     if (action === "regenerate_full_deck") {
       const original = button.innerHTML;
@@ -950,6 +985,7 @@ async function branchFromSampleRevision(revisionHash) {
       checkpoint_id: state.project.checkpoint_id,
       name,
     });
+    await syncFullDeckSessionForCurrentProject();
     state.branches = await api.branches(state.project.project_id);
     state.focusStage = "ppt_sample";
     await loadProjects();
@@ -994,6 +1030,7 @@ async function branchFromFullDeckRevision(revisionHash) {
       revisionHash,
       { checkpoint_id: state.project.checkpoint_id, name },
     );
+    await syncFullDeckSessionForCurrentProject();
     state.branches = await api.branches(state.project.project_id);
     state.focusStage = "ppt_full";
     await loadProjects();
@@ -1064,6 +1101,8 @@ async function createProject(event) {
         known_facts: lines, constraints: [], source_refs: [],
       },
     });
+    fullDeckWorkspace.stopPolling();
+    state.fullDeckSession = null;
     state.branches = await api.branches(state.project.project_id);
     state.view = "workspace";
     projectDialog.close();
@@ -1151,6 +1190,7 @@ function openSnapshotDialog(stage) {
         mode: "rerun_stage",
         stage,
       });
+      await syncFullDeckSessionForCurrentProject();
       state.branches = await api.branches(state.project.project_id);
       state.focusStage = null;
       dialog.close();
@@ -1199,6 +1239,7 @@ async function openBranchDialog() {
     button.textContent = "正在切换…";
     try {
       state.project = await api.switchBranch(state.project.project_id, button.dataset.branchSwitch);
+      await syncFullDeckSessionForCurrentProject();
       state.branches = await api.branches(state.project.project_id);
       state.focusStage = null;
       dialog.close();
@@ -1220,9 +1261,11 @@ async function setView(view) {
     statusPollTimer = null;
   }
   statusPollErrorShown = false;
+  if (view !== "workspace") fullDeckWorkspace.stopPolling();
   state.view = view;
   await render();
   document.querySelector("#main").focus();
+  if (view === "workspace") fullDeckWorkspace.startPolling();
   if (view === "status") {
     statusPollTimer = window.setInterval(() => {
       if (state.view !== "status" || document.hidden || document.activeElement?.id === "status-search" || statusPollInFlight) return;
@@ -1233,6 +1276,8 @@ async function setView(view) {
 }
 
 function bindChrome() {
+  window.addEventListener("message", (event) => fullDeckWorkspace.handleMessage(event));
+  document.addEventListener("visibilitychange", () => fullDeckWorkspace.visibilityChanged());
   document.querySelector("#new-button").addEventListener("click", showProjectDialog);
   document.querySelector("#refresh-button").addEventListener("click", async () => {
     if (state.view === "settings") { state.runtime = null; await render(); return; }
@@ -1254,6 +1299,21 @@ function bindChrome() {
 }
 
 async function boot() {
+  fullDeckWorkspace = createFullDeckWorkspaceController({
+    api,
+    root: content,
+    getProject: () => state.project,
+    getSession: () => state.fullDeckSession,
+    setSession: (session) => { state.fullDeckSession = session; },
+    getView: () => state.view,
+    setFocusStage: (stage) => { state.focusStage = stage; },
+    render,
+    refreshProject: refreshCurrent,
+    notify: toast,
+    errorMessage: userErrorMessage,
+    announce: announceWorkspace,
+    escapeHtml,
+  });
   bindChrome();
   await loadProjects();
   await render();

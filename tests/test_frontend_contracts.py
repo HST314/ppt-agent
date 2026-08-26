@@ -151,6 +151,43 @@ def test_full_deck_preview_is_sandboxed_and_uses_package_routes() -> None:
     assert "innerHTML = page.html" not in app + full_deck
 
 
+def test_full_deck_generation_workspace_is_incremental_and_accessible() -> None:
+    html = (ROOT / "frontend/index.html").read_text(encoding="utf-8")
+    app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
+    full_deck = (ROOT / "frontend/static/js/full-deck.js").read_text(encoding="utf-8")
+    workspace = (ROOT / "frontend/static/js/full-deck-workspace.js").read_text(
+        encoding="utf-8"
+    )
+    poller = (ROOT / "frontend/static/js/full-deck-session.js").read_text(
+        encoding="utf-8"
+    )
+    css = (ROOT / "frontend/static/css/main.css").read_text(encoding="utf-8")
+
+    assert 'id="full-deck-generation-workspace"' in full_deck
+    assert 'role="status" aria-live="polite" aria-atomic="true"' in full_deck
+    assert all(label in full_deck for label in (
+        "排队中", "生成中", "已就绪", "生成失败",
+        "暂停生成", "继续生成", "重试当前批", "下一批指令", "批次记录",
+    ))
+    assert 'data-full-deck-slide="${escapeHtml(page.slot_id)}"' in full_deck
+    assert 'frame?.contentWindow?.postMessage(createFullDeckNavigateMessage' in workspace
+    assert 'event.source !== frame.contentWindow' in workspace
+    assert 'event.data.slide_id' in workspace
+    assert 'id="full-deck-directive"' in full_deck
+    assert 'data-session-region="directive-history"' in full_deck
+    assert 'form?.elements?.directive' in full_deck
+    assert "frame.dataset.previewPackageId !== packageId" in full_deck
+    assert "session_version" in poller
+    assert "hidden ? 5000 : 1000" in poller
+    assert 'document.addEventListener("visibilitychange"' in app
+    assert "published_revision_hash !== revision.revision_hash" in app
+    assert "syncFullDeckSessionForCurrentProject" in app
+    assert 'id="workspace-status" role="status" aria-live="polite"' in html
+    assert ".generation-progress" in css
+    assert ".full-deck-page-card.is-navigable" in css
+    assert ".generation-directives__action .btn{width:100%}" in css
+
+
 def test_sample_preview_is_sandboxed_and_never_inserted_into_parent_dom() -> None:
     app = (ROOT / "frontend/static/js/app.js").read_text(encoding="utf-8")
     samples = (ROOT / "frontend/static/js/samples.js").read_text(encoding="utf-8")
