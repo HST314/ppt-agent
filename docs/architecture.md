@@ -47,8 +47,8 @@
 - `full_deck_reference_max_read_chars_per_call`：单次参考文件读取字符数，默认 20,000；
 - `full_deck_reference_max_read_chars_per_batch`：单批所有参考读取总字符数，默认 80,000，且不得小于单次预算；
 - `full_deck_max_files`：草稿/包最大文件数，默认 384；
-- `full_deck_max_file_bytes`：单文件最大字节数，默认 4,000,000；
-- `full_deck_max_total_bytes`：整包最大字节数，默认 50,000,000。
+- `full_deck_max_file_bytes`：单文件最大字节数，默认 10,485,760（10MiB）；
+- `full_deck_max_total_bytes`：整包最大字节数，默认 209,715,200（200MiB）。
 
 这些字段属于部署边界，不在浏览器设置表单中编辑；公开 runtime context 只返回开关状态和数值，不返回凭据。运行配置哈希进入每个 PromptCall 和最终修订 provenance。
 
@@ -76,6 +76,24 @@ v5 迁移是增量迁移：只新增生成会话、批次、页面投影、指�
 ### 审计导出
 
 `GET /api/projects/{project_id}/audit/export` 在既有正式修订、时间线和 PromptCall 之外，增加有界的 `full_deck_generation`：会话锚点与发布修订哈希、批次目标和 PromptCall ID、指令正文及生效批次、页面内容引用、segment/preview 包哈希，以及每个包文件的 artifact ID 与 SHA-256。导出不包含包文件内容或内部磁盘路径；各集合有明确上限，并通过 `truncated` 标记是否截断。
+
+## 本地图片素材
+
+全局素材目录（默认 `frontend/data/images/`，可用环境变量 `PPT_AGENT_IMAGES_ROOT` 覆盖）存放扁平的图片/解读配对：`foo.png` 与 `foo.md` 文件名除后缀外完全相同，图像后缀限 png/jpg/jpeg/gif/webp/avif/ico。每次生成任务启动前，`storage/project_images.py` 的 `sync_project_images()` 把当时的全局快照覆盖式重建到 `<project>/images/`（先清空再拷贝，杜绝陈旧残留），一次生成内快照不再变化；continuation/resume 复用本次生成开始时的拷贝。脏素材——缺配对、子目录嵌套、超过 10MiB、不可读、非 UTF-8 解读、同名多图像后缀——一律跳过，诊断仅以 `[project-images]` 前缀输出到后端控制台，不进入任何 API 响应、不阻塞任务。
+
+模型无视觉能力，仅通过 `.md` 文字解读理解图片：大纲阶段注入完整清单（`PROJECT_IMAGES_JSON`）与全部解读全文（`PROJECT_IMAGE_DESCRIPTIONS`）；样品阶段注入清单与每图截断摘要，全文按需用 `read` 读取；全稿分批/单体按该批目标页配图过滤注入解读，配图为空或与目标页无交集时回退全量注入。解读内容一律按图片的描述性数据处理，不是指令。逐页大纲用「配图：文件名」行规划每页用图；生成阶段只能用 `copy_project_image` 工具把项目 `images/` 内的规划图片复制进草稿包 `img/` 前缀下，再以包内相对路径引用；图片字节不进提示词，`read` 对 `images/` 前缀仅放行 `.md`。
+
+图片相关限额在五层保持一致（当前值）：
+
+| 层 | 位置 | 值 |
+|---|---|---|
+| 样品草稿默认 | `runtime/package_tool.py` | 128 文件 / 单文件 10MiB / 整包 80MiB |
+| 全稿运行配置 | `runtime.yaml` | 384 / 10MiB / 200MiB |
+| Policy schema 上下界 | `configs/runtime.py` | 单文件 ≤16MiB，整包 ≤256MiB |
+| `PackageFile.content` 硬帽 | `agent_core/models.py` | ≤16,000,000 字符 |
+| 包总字节硬帽 | `agent_core/models.py` | ≤256MiB |
+
+素材目录为空或不存在时，同步为 no-op，提示词、工具面与限额行为与未启用该功能时完全一致（空素材零变化红线）。项目 `images/` 目录不经任何 HTTP 路由暴露，图片只能经 `copy_project_image` 进入草稿包；预览与 ZIP 导出沿用既有包内路由、CSP 与 UTF-8 文件名标志，中文逻辑名可直接服务与导出。
 
 ## 安全
 

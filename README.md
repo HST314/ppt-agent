@@ -58,6 +58,10 @@ python main.py
 
 设置页不会读取、保存或展示密钥值。若配置文件位于受保护目录，需确保启动服务的账号对该文件有写权限。
 
+## 本地图片素材
+
+生成可引用本地图片素材。素材放在全局目录 `frontend/data/images/`（或用环境变量 `PPT_AGENT_IMAGES_ROOT` 指定其他目录）：扁平结构，图片与同名 `.md` 解读文件成对（如 `封面图.png` + `封面图.md`），图像后缀支持 png/jpg/jpeg/gif/webp/avif/ico，单图不超过 10MiB。每次生成任务启动时，当前素材快照会同步到该项目的 `images/` 目录；缺配对、放在子目录、超限或不可读的脏素材会被跳过，诊断只输出到后端控制台。大纲阶段读取全部解读并逐页规划「配图」，生成阶段把规划内的图片复制进 HTML-PPT 包内 `img/` 后以相对路径引用；素材目录为空或不存在时，各阶段提示词与行为与未启用该功能时完全一致。图片相关限额：样品包默认 128 文件/单文件 10MiB/整包 80MiB，全稿包 384 文件/10MiB/200MiB（`runtime.yaml` 可调，单文件上限 16MiB、整包上限 256MiB）。
+
 ## 数据与恢复
 
 项目数据默认保存在 `frontend/data/projects/`。每个工程包含一个启用 WAL 的 `project.db`，在单个事务中更新工程状态、显式父检查点、分支头、修订、事件和 artifact 元数据；PromptCall 使用同库的独立审计状态。HTML-PPT 文件按 SHA-256 写入 `artifacts/_objects/` 作为内部去重与完整性对象；每个已发布全稿修订还会在 `artifacts/full_decks/<revision>/` 留存一份可直接打开的完整项目，包含所有页面、资源、组装清单和 `project.json`。未通过校验的生成尝试保存在 `generated_html/prompt_*/` 受管排查目录，可能只含尚未与样品页合并的模型原始输出，不会进入预览或发布。旧版 `artifacts/html/`、`artifacts/packages/` 仍可读取。后台 Job 存放在 `.jobs/jobs.db`，多 worker 通过 SQLite 写锁协调提交与分支操作。文件格式的既有工程会在首次读取时通过跨进程初始化锁自动导入，源文件仍保留。
