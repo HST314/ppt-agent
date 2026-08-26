@@ -132,6 +132,12 @@ def test_composer_is_deterministic_namespaces_assets_and_traces_each_page() -> N
     )
     assert "ArrowRight" in outer
     assert 'sandbox="allow-scripts"' in outer
+    assert "ppt-agent:navigate" in outer
+    assert "ppt-agent:slidechange" in outer
+    assert "event.source!==parent" in outer
+    assert "slides.findIndex" in outer
+    assert "min-width:44px" in outer
+    assert 'aria-live="polite"' in outer
 
 
 def test_page_content_graph_handles_current_html_ppt_skill_template() -> None:

@@ -13,6 +13,15 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from agent_core.full_deck_batching import (
+    FULL_DECK_BATCH_PLANNER_VERSION,
+    FullDeckBatchPlan,
+    PlannedFullDeckBatch,
+    compose_partial_full_deck_preview,
+    plan_full_deck_batches,
+    project_full_deck_generation_pages,
+    project_succeeded_full_deck_batch_pages,
+)
 from agent_core.full_deck_composer import (
     COMPOSER_VERSION,
     ComposerPage,
