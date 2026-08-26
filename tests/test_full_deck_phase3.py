@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -239,6 +240,39 @@ def test_full_deck_generation_targets_only_pending_segments_and_publishes_r2(
     assert [item["target_slide_numbers"] for item in attempts] == dispatched
     assert all(item["published"] for item in attempts)
     assert workflow.store.events()[-1]["event"] == "full_deck_generated"
+
+    retained = workflow.store.retained_full_deck_dir(revision["revision_hash"])
+    retained_files = {
+        path.relative_to(retained).as_posix()
+        for path in retained.rglob("*")
+        if path.is_file()
+    }
+    assert retained_files == {
+        item["path"] for item in revision["package"]["files"]
+    } | {"project.json"}
+    retained_project = json.loads((retained / "project.json").read_text(encoding="utf-8"))
+    assert retained_project["format"] == "ppt-agent-retained-project-v1"
+    assert retained_project["full_deck_revision"]["package"]["slide_count"] == 10
+    sample_documents = [
+        slide["document_path"]
+        for slide in retained_project["full_deck_revision"]["package"][
+            "composition_manifest"
+        ]["slides"]
+        if slide["source_id"] == "approved_sample"
+    ]
+    assert len(sample_documents) == 2
+    assert all((retained / path).is_file() for path in sample_documents)
+    assert (workflow.store.artifacts_container_root / "README.md").is_file()
+    assert workflow.store.package_artifacts_root.is_dir()
+
+    shutil.rmtree(retained)
+    ProjectStore._initialized_databases.pop(
+        str(workflow.store.database_path),
+        None,
+    )
+    restarted_store = ProjectStore(tmp_path / "projects", "phase3-deck")
+    restarted_store.read(include_sample_html=False)
+    assert restarted_store.retained_full_deck_dir(revision["revision_hash"]).is_dir()
 
     refreshed = ProjectStore(tmp_path / "projects", "phase3-deck").read(
         include_sample_html=False

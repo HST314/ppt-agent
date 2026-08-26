@@ -114,6 +114,8 @@ def test_phase5_acceptance_workspace_is_accessible_and_auditable() -> None:
     assert "已确认版本保持只读" in full_deck
     assert "创建后续全稿修订" in full_deck
     assert "导出验收审计" in full_deck
+    assert "后台完整项目" in full_deck
+    assert "retained_project_path" in server
     assert 'stage === "ppt_full" || stage === "acceptance"' in app
     assert "已确认为验收基线" in app
     assert "approveFullDeck:" in api

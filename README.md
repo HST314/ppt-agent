@@ -60,7 +60,7 @@ python main.py
 
 ## 数据与恢复
 
-项目数据默认保存在 `frontend/data/projects/`。每个工程包含一个启用 WAL 的 `project.db`，在单个事务中更新工程状态、显式父检查点、分支头、修订、事件和 artifact 元数据；PromptCall 使用同库的独立审计状态。HTML-PPT 文件按 SHA-256 写入 `artifacts/packages/` 并在修订中保存整包清单、入口、幻灯片元数据与内容哈希；相同内容自动复用。未通过校验的生成尝试也会保存到受管排查目录，但不会进入预览或发布。旧版独立 HTML 页面仍可读取和迁移。后台 Job 存放在 `.jobs/jobs.db`，多 worker 通过 SQLite 写锁协调提交与分支操作。文件格式的既有工程会在首次读取时通过跨进程初始化锁自动导入，源文件仍保留。
+项目数据默认保存在 `frontend/data/projects/`。每个工程包含一个启用 WAL 的 `project.db`，在单个事务中更新工程状态、显式父检查点、分支头、修订、事件和 artifact 元数据；PromptCall 使用同库的独立审计状态。HTML-PPT 文件按 SHA-256 写入 `artifacts/_objects/` 作为内部去重与完整性对象；每个已发布全稿修订还会在 `artifacts/full_decks/<revision>/` 留存一份可直接打开的完整项目，包含所有页面、资源、组装清单和 `project.json`。未通过校验的生成尝试保存在 `generated_html/prompt_*/` 受管排查目录，可能只含尚未与样品页合并的模型原始输出，不会进入预览或发布。旧版 `artifacts/html/`、`artifacts/packages/` 仍可读取。后台 Job 存放在 `.jobs/jobs.db`，多 worker 通过 SQLite 写锁协调提交与分支操作。文件格式的既有工程会在首次读取时通过跨进程初始化锁自动导入，源文件仍保留。
 
 PromptCall 审计记录保存脱敏后的输入消息、模板/配置/Skill 哈希、模型参数、工具调用、终态和产物引用。产物提交成功后才写入 `completed`；并发 CAS 落败会写入不带产物引用的 `conflicted`。样品工作区会将最新自动修复链展示为“尝试 1/2/3”，并列出工具轮次、Skill 读取次数和未发布原因。可通过 `GET /api/projects/<project_id>/audit/prompt-calls` 查询完整审计，或从 `GET /api/projects/<project_id>/audit/prompt-calls.jsonl` 导出 JSONL。
 

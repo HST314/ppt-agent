@@ -126,7 +126,7 @@ export function fullDeckBody(
     ? `<div><span>${packageInfo.slide_count} 页</span><strong>${escapeHtml(packageInfo.title)}</strong></div><div class="button-row"><span class="badge badge--info">HTML-PPT 全稿 · ${packageInfo.files?.length || 0} 文件</span><a class="btn btn--secondary" href="${escapeHtml(revision.export_url)}" download>导出 ZIP</a></div>`
     : `<div><span>${pages.length} 页清单</span><strong>样品来源页预览</strong></div><span class="badge badge--warning">完整包待生成</span>`;
   const preview = packageInfo || sample?.preview_url
-    ? `<div class="sample-preview full-deck-preview"><div class="sample-preview__toolbar">${toolbar}</div><div class="sample-canvas"><iframe id="full-deck-preview-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="${escapeHtml(previewTitle)} HTML-PPT 预览"></iframe></div><p class="sample-preview__hint">${packageInfo ? "翻页与总览由完整 HTML-PPT 自身提供。" : "这里安全加载已确认样品包；下方页面清单显示它在全稿中的对应位置。"}</p></div>`
+    ? `<div class="sample-preview full-deck-preview"><div class="sample-preview__toolbar">${toolbar}</div><div class="sample-canvas"><iframe id="full-deck-preview-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="${escapeHtml(previewTitle)} HTML-PPT 预览"></iframe></div><p class="sample-preview__hint">${packageInfo ? `翻页与总览由完整 HTML-PPT 自身提供。后台完整项目：${escapeHtml(revision.retained_project_path || "artifacts/full_decks/")}` : "这里安全加载已确认样品包；下方页面清单显示它在全稿中的对应位置。"}</p></div>`
     : "";
   const callout = revision.status === "approved"
     ? '<div class="callout"><strong>当前全稿已确认。</strong> 历史版本仍可查看、切换和创建工程分支。</div>'

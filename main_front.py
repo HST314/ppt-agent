@@ -339,6 +339,10 @@ def _public_full_deck_revision(
     base = f"/api/projects/{project_id}/full-deck/revisions/{revision_hash}"
     value["preview_url"] = f"{base}/preview/{package['entrypoint']}"
     value["export_url"] = f"{base}/export"
+    value["retained_project_path"] = (
+        "artifacts/full_decks/"
+        f"{revision_hash.removeprefix('sha256:')}"
+    )
     return value
 
 

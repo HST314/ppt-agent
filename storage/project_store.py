@@ -18,6 +18,12 @@ from agent_core.sample_html import SANITIZER_VERSION
 from runtime.package_tool import TEXT_SUFFIXES, normalize_package_path, package_media_type
 from storage.persistence import atomic_bytes, exclusive_file_lock, json_text
 from storage.prompt_audit import PromptAuditMixin
+from storage.retained_project import (
+    RetainedProjectError,
+    materialize_full_deck_revision,
+    retained_full_deck_dir as resolve_retained_full_deck_dir,
+    write_artifacts_readme,
+)
 from storage.sqlite_schema import PROJECT_SCHEMA
 
 
@@ -82,10 +88,30 @@ class ProjectStore(PromptAuditMixin):
         self.database_path = self.root / "project.db"
         self.initialization_lock_path = self.root / ".project-db-init.lock"
         self.manifest_path = self.root / "manifest.json"
-        self.artifacts_root = self.root / "artifacts" / "html"
-        self.package_artifacts_root = self.root / "artifacts" / "packages"
+        self.artifacts_container_root = self.root / "artifacts"
+        self.artifacts_root = self.artifacts_container_root / "_objects" / "html"
+        self.package_artifacts_root = (
+            self.artifacts_container_root / "_objects" / "packages"
+        )
+        self.legacy_artifacts_root = self.artifacts_container_root / "html"
+        self.legacy_package_artifacts_root = self.artifacts_container_root / "packages"
+        self.full_deck_artifacts_root = self.artifacts_container_root / "full_decks"
         self.generated_html_root = self.root / "generated_html"
         self.lock = self._locks.setdefault(str(self.root), threading.RLock())
+
+    @staticmethod
+    def _inside(path: Path, roots: tuple[Path, ...]) -> bool:
+        resolved = path.resolve()
+        return any(resolved.is_relative_to(root.resolve()) for root in roots)
+
+    def _is_sample_artifact_path(self, path: Path) -> bool:
+        return self._inside(path, (self.artifacts_root, self.legacy_artifacts_root))
+
+    def _is_package_artifact_path(self, path: Path) -> bool:
+        return self._inside(
+            path,
+            (self.package_artifacts_root, self.legacy_package_artifacts_root),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -166,7 +192,24 @@ class ProjectStore(PromptAuditMixin):
                     connection.close()
                 if self.manifest_path.is_file():
                     self._migrate_legacy_files()
+                self._backfill_retained_full_decks()
             self._initialized_databases[database_key] = process_id
+
+    def _backfill_retained_full_decks(self) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM project_state WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                return
+            manifest = self._hydrate_manifest(
+                json.loads(row["payload_json"]),
+                connection,
+                include_sample_html=False,
+            )
+        write_artifacts_readme(self.artifacts_container_root)
+        for revision in manifest.get("full_deck_revisions", []):
+            self._materialize_full_deck_revision(manifest, revision)
 
     def exists(self) -> bool:
         if self.database_path.is_file():
@@ -207,7 +250,13 @@ class ProjectStore(PromptAuditMixin):
     def _artifact_record(self, content: bytes) -> dict[str, Any]:
         hexadecimal = hashlib.sha256(content).hexdigest()
         artifact_id = f"sha256:{hexadecimal}"
-        relative_path = f"artifacts/html/{hexadecimal}.html"
+        legacy_relative_path = f"artifacts/html/{hexadecimal}.html"
+        legacy_path = self.root / legacy_relative_path
+        relative_path = (
+            legacy_relative_path
+            if legacy_path.is_file()
+            else f"artifacts/_objects/html/{hexadecimal}.html"
+        )
         path = self.root / relative_path
         if path.is_file():
             existing = path.read_bytes()
@@ -238,9 +287,20 @@ class ProjectStore(PromptAuditMixin):
             path.encode("utf-8") + b"\0" + content
         ).hexdigest()
         suffix = Path(path).suffix.lower()
-        relative_path = f"artifacts/packages/{artifact_id.removeprefix('sha256:')}{suffix}"
+        preferred_relative_path = (
+            "artifacts/_objects/packages/"
+            f"{artifact_id.removeprefix('sha256:')}{suffix}"
+        )
+        legacy_relative_path = (
+            f"artifacts/packages/{artifact_id.removeprefix('sha256:')}{suffix}"
+        )
+        relative_path = (
+            legacy_relative_path
+            if (self.root / legacy_relative_path).is_file()
+            else preferred_relative_path
+        )
         artifact_path = (self.root / relative_path).resolve()
-        if not artifact_path.is_relative_to(self.package_artifacts_root.resolve()):
+        if not self._is_package_artifact_path(artifact_path):
             raise ValueError("invalid package artifact path")
         if artifact_path.is_file():
             if artifact_path.read_bytes() != content:
@@ -257,6 +317,30 @@ class ProjectStore(PromptAuditMixin):
             "sanitizer_version": "sandbox-csp-v1",
             "created_at": utc_now(),
         }
+
+    def _materialize_full_deck_revision(
+        self,
+        manifest: dict[str, Any],
+        revision: dict[str, Any],
+    ) -> None:
+        try:
+            materialize_full_deck_revision(
+                manifest,
+                revision,
+                full_deck_root=self.full_deck_artifacts_root,
+                package_artifact_roots=(
+                    self.package_artifacts_root,
+                    self.legacy_package_artifacts_root,
+                ),
+            )
+        except RetainedProjectError as exc:
+            raise ConflictError(str(exc)) from exc
+
+    def retained_full_deck_dir(self, revision_hash: str) -> Path:
+        return resolve_retained_full_deck_dir(
+            self.full_deck_artifacts_root,
+            revision_hash,
+        )
 
     def save_generated_html_attempt(
         self,
@@ -323,6 +407,7 @@ class ProjectStore(PromptAuditMixin):
         self,
         manifest: dict[str, Any],
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        write_artifacts_readme(self.artifacts_container_root)
         projection = deepcopy(manifest)
         if projection.get("samples") and not projection.get("current_sample_revision_hash"):
             projection["current_sample_revision_hash"] = projection["samples"][-1]["revision_hash"]
@@ -408,6 +493,7 @@ class ProjectStore(PromptAuditMixin):
                     })
                 elif not ARTIFACT_ID.fullmatch(str(item.get("artifact_id", ""))):
                     raise ConflictError("package_artifact_missing")
+            self._materialize_full_deck_revision(projection, revision)
         payload = deepcopy(projection)
         payload["documents"] = {
             document_type: [
@@ -433,6 +519,11 @@ class ProjectStore(PromptAuditMixin):
     ) -> dict[str, Any]:
         value = deepcopy(payload)
         value["format_version"] = SCHEMA_VERSION
+        value.setdefault("clarification_history", [])
+        value.setdefault(
+            "clarification_completed",
+            value.get("state") not in {"intake", "intake_clarify"},
+        )
         value.setdefault("storage", {
             "engine": "sqlite-wal",
             "database": "project.db",
@@ -633,7 +724,7 @@ class ProjectStore(PromptAuditMixin):
                     if row is None:
                         raise ConflictError("package_artifact_missing")
                     path = (self.root / row["relative_path"]).resolve()
-                    if not path.is_relative_to(self.package_artifacts_root.resolve()) or not path.is_file():
+                    if not self._is_package_artifact_path(path) or not path.is_file():
                         raise ConflictError("package_artifact_missing")
                     content = path.read_bytes()
                     checksum = "sha256:" + hashlib.sha256(content).hexdigest()
@@ -662,7 +753,7 @@ class ProjectStore(PromptAuditMixin):
                 if row is None:
                     raise ConflictError("sample_artifact_missing")
                 path = (self.root / row["relative_path"]).resolve()
-                if not path.is_relative_to(self.artifacts_root.resolve()) or not path.is_file():
+                if not self._is_sample_artifact_path(path) or not path.is_file():
                     raise ConflictError("sample_artifact_missing")
                 content = path.read_bytes()
                 checksum = f"sha256:{hashlib.sha256(content).hexdigest()}"
@@ -957,6 +1048,8 @@ class ProjectStore(PromptAuditMixin):
                 "phase": "ready_for_clarification",
                 "task_card": task,
                 "clarification_answers": {},
+                "clarification_history": [],
+                "clarification_completed": False,
                 "question_card": None,
                 "documents": {"narrative_structure": [], "slide_outline": []},
                 "samples": [],
@@ -1208,7 +1301,10 @@ class ProjectStore(PromptAuditMixin):
                     item for item in lineage
                     if item.get("state") == "narrative_structure"
                     and item.get("phase") == "ready_to_generate"
-                    and bool(item.get("clarification_answers"))
+                    and (
+                        item.get("clarification_completed")
+                        or bool(item.get("clarification_answers"))
+                    )
                 ]
                 return matches[-1] if matches else None
             if stage == "narrative_structure":
@@ -1336,14 +1432,19 @@ class ProjectStore(PromptAuditMixin):
         if stage in {"intake", "intake_clarify"}:
             value.update(
                 state="intake", phase="ready_for_clarification", question_card=None,
-                clarification_answers={}, documents={"narrative_structure": [], "slide_outline": []},
+                clarification_answers={}, clarification_history=[],
+                clarification_completed=False,
+                documents={"narrative_structure": [], "slide_outline": []},
                 samples=[],
                 current_sample_revision_hash=None,
                 full_deck=None,
                 full_deck_revisions=[],
             )
         elif stage == "narrative_structure":
-            if not value.get("clarification_answers"):
+            if not (
+                value.get("clarification_completed")
+                or value.get("clarification_answers")
+            ):
                 raise ValueError("narrative rerun requires clarification answers")
             value.update(
                 state="narrative_structure", phase="ready_to_generate",
@@ -1688,7 +1789,7 @@ class ProjectStore(PromptAuditMixin):
             if row is None:
                 raise FileNotFoundError(path)
         artifact_path = (self.root / row["relative_path"]).resolve()
-        if not artifact_path.is_relative_to(self.package_artifacts_root.resolve()) or not artifact_path.is_file():
+        if not self._is_package_artifact_path(artifact_path) or not artifact_path.is_file():
             raise ConflictError("package_artifact_missing")
         content = artifact_path.read_bytes()
         if (
@@ -1906,7 +2007,7 @@ class ProjectStore(PromptAuditMixin):
                 raise FileNotFoundError(path)
         artifact_path = (self.root / row["relative_path"]).resolve()
         if (
-            not artifact_path.is_relative_to(self.package_artifacts_root.resolve())
+            not self._is_package_artifact_path(artifact_path)
             or not artifact_path.is_file()
         ):
             raise ConflictError("package_artifact_missing")
@@ -1969,7 +2070,7 @@ class ProjectStore(PromptAuditMixin):
         for row in rows:
             path = (self.root / row["relative_path"]).resolve()
             if (
-                not path.is_relative_to(self.package_artifacts_root.resolve())
+                not self._is_package_artifact_path(path)
                 or not path.is_file()
             ):
                 raise ConflictError("package_artifact_missing")
