@@ -39,6 +39,7 @@ from agent_core.models import (
 )
 from agent_core.workflow_support import (
     current_full_deck_revision,
+    generate_with_legacy_gateway,
     generation_provenance,
     outline_slide_catalog,
     package_model,
@@ -400,19 +401,16 @@ def create_full_deck_revision(
         prompt_call_ids.append(prompt_call_id)
         attempt_traces: list[dict[str, Any]] = []
         try:
-            try:
-                text, attempt_traces = workflow.gateway.generate(
-                    "ppt_full",
-                    current_prompt,
-                    json_mode=True,
-                    package_draft=draft,
-                )
-            except TypeError as exc:
-                if "package_draft" not in str(exc):
-                    raise
-                text, attempt_traces = workflow.gateway.generate(
-                    "ppt_full", current_prompt, json_mode=True
-                )
+            # Custom/legacy gateway adapters may reject newer generate()
+            # capabilities (package_draft, images_root) with a TypeError;
+            # generate_with_legacy_gateway retries without just those.
+            text, attempt_traces = generate_with_legacy_gateway(
+                workflow.gateway,
+                "ppt_full",
+                current_prompt,
+                json_mode=True,
+                package_draft=draft,
+            )
         except Exception as exc:
             workflow._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
             raise

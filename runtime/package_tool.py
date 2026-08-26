@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import mimetypes
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -20,6 +21,17 @@ STATIC_SUFFIXES = TEXT_SUFFIXES | {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
     ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".webm", ".wav",
 }
+PROJECT_IMAGE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico"}
+)
+IMAGES_SOURCE_PREFIX = "images/"
+IMAGE_DESTINATION_PREFIX = "img/"
+
+# Default sample-draft budget: sized so every project image (capped at 10MiB
+# per file by the sync layer) plus normal text output fits comfortably.
+SAMPLE_MAX_FILES = 128
+SAMPLE_MAX_FILE_BYTES = 10_485_760  # 10MiB
+SAMPLE_MAX_TOTAL_BYTES = 83_886_080  # 80MiB
 
 
 def normalize_package_path(logical_path: str) -> str:
@@ -58,11 +70,15 @@ class DraftPackage:
         self,
         skills_root: Path,
         *,
-        max_files: int = 96,
-        max_file_bytes: int = 2_000_000,
-        max_total_bytes: int = 15_000_000,
+        images_root: Path | None = None,
+        max_files: int = SAMPLE_MAX_FILES,
+        max_file_bytes: int = SAMPLE_MAX_FILE_BYTES,
+        max_total_bytes: int = SAMPLE_MAX_TOTAL_BYTES,
     ):
         self.reader = SkillReader(skills_root, per_call=1, per_job=1)
+        self.images_root = (
+            images_root.resolve() if images_root is not None else None
+        )
         self.max_files = max_files
         self.max_file_bytes = max_file_bytes
         self.max_total_bytes = max_total_bytes
@@ -106,6 +122,51 @@ class DraftPackage:
             raise PackageToolError("skill asset type is not allowed in a package")
         record = self._put(destination_path, source.read_bytes(), f"skill:{source_path}")
         return {**record, "source_path": PurePosixPath(source_path).as_posix()}
+
+    def copy_project_image(self, source_path: str, destination_path: str) -> dict[str, Any]:
+        source = self._resolve_project_image(source_path)
+        destination = normalize_package_path(destination_path)
+        if not destination.startswith(IMAGE_DESTINATION_PREFIX):
+            raise PackageToolError("project images must be copied under img/")
+        record = self._put(
+            destination,
+            source.read_bytes(),
+            f"project_image:{PurePosixPath(source_path).as_posix()}",
+        )
+        return {**record, "source_path": PurePosixPath(source_path).as_posix()}
+
+    def _resolve_project_image(self, source_path: str) -> Path:
+        """Resolve ``images/<name>.<ext>`` inside the project images root."""
+
+        if self.images_root is None:
+            raise PackageToolError("project images are not available for this draft")
+        if not isinstance(source_path, str) or not source_path or "\x00" in source_path:
+            raise PackageToolError("source path is empty or contains NUL")
+        if not source_path.startswith(IMAGES_SOURCE_PREFIX):
+            raise PackageToolError("source path must stay inside the project images directory")
+        rest = source_path[len(IMAGES_SOURCE_PREFIX):]
+        posix = PurePosixPath(rest)
+        if (
+            not rest
+            or posix.is_absolute()
+            or ".." in posix.parts
+            or len(posix.parts) != 1
+        ):
+            raise PackageToolError("source path must stay inside the project images directory")
+        if posix.suffix.lower() not in PROJECT_IMAGE_SUFFIXES:
+            raise PackageToolError("project image type is not allowed")
+        try:
+            candidate = (self.images_root / Path(*posix.parts)).resolve(strict=True)
+            is_regular = stat.S_ISREG(candidate.stat().st_mode)
+        except (OSError, RuntimeError):
+            raise PackageToolError(
+                "project image is outside the images directory or does not exist"
+            ) from None
+        if not candidate.is_relative_to(self.images_root) or not is_regular:
+            raise PackageToolError(
+                "project image is outside the images directory or does not exist"
+            )
+        return candidate
 
     def replace_text(
         self,

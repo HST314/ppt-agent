@@ -285,3 +285,60 @@ def test_full_deck_read_restore_branch_preview_and_export_apis(
         f"/api/projects/full-deck-history/full-deck/revisions/{r2_hash}"
     ).status_code == 404
     assert client.get(detail.json()["preview_url"]).status_code == 404
+
+
+def test_generate_with_legacy_gateway_drops_only_rejected_capabilities() -> None:
+    from agent_core.workflow_support import generate_with_legacy_gateway
+
+    class LegacyGateway:
+        def __init__(self, supported: set[str]):
+            self.supported = supported
+            self.calls: list[dict] = []
+
+        def generate(self, state, prompt, **kwargs):
+            unsupported = set(kwargs) - self.supported
+            if unsupported:
+                raise TypeError(
+                    "generate() got an unexpected keyword argument "
+                    + ", ".join(sorted(unsupported))
+                )
+            self.calls.append(kwargs)
+            return "ok", []
+
+    modern = LegacyGateway({"json_mode", "package_draft", "images_root"})
+    output, traces = generate_with_legacy_gateway(
+        modern, "ppt_sample", "prompt", json_mode=True,
+        package_draft="draft", images_root="images",
+    )
+    assert output == "ok"
+    assert modern.calls == [
+        {"json_mode": True, "package_draft": "draft", "images_root": "images"}
+    ]
+
+    # Rejects images_root but supports package_draft: retry keeps the draft.
+    draft_only = LegacyGateway({"json_mode", "package_draft"})
+    output, _ = generate_with_legacy_gateway(
+        draft_only, "ppt_sample", "prompt", json_mode=True,
+        package_draft="draft", images_root="images",
+    )
+    assert output == "ok"
+    assert draft_only.calls == [
+        {"json_mode": True, "package_draft": "draft"}
+    ]
+
+    # Rejects everything: retry runs bare.
+    bare = LegacyGateway({"json_mode"})
+    output, _ = generate_with_legacy_gateway(
+        bare, "ppt_sample", "prompt", json_mode=True,
+        package_draft="draft", images_root="images",
+    )
+    assert output == "ok"
+    assert bare.calls == [{"json_mode": True}]
+
+    # Unrelated TypeErrors propagate untouched.
+    class ExplodingGateway:
+        def generate(self, state, prompt, **kwargs):
+            raise TypeError("cannot unpack non-sequence object")
+
+    with pytest.raises(TypeError, match="non-sequence"):
+        generate_with_legacy_gateway(ExplodingGateway(), "ppt_sample", "prompt")

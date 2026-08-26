@@ -49,6 +49,32 @@ def stable_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode()).hexdigest()
 
 
+# generate() capabilities a custom/legacy gateway adapter may not know about.
+# When such an adapter rejects one of them with a TypeError, the retry drops
+# only the rejected capabilities and keeps the rest.
+_LEGACY_GATEWAY_CAPABILITIES = ("package_draft", "images_root")
+
+
+def generate_with_legacy_gateway(gateway: Any, state: str, prompt: str, **kwargs: Any):
+    """Call gateway.generate, retrying without capabilities a legacy adapter rejects."""
+
+    try:
+        return gateway.generate(state, prompt, **kwargs)
+    except TypeError as exc:
+        message = str(exc)
+        unsupported = {
+            name for name in _LEGACY_GATEWAY_CAPABILITIES
+            if name in kwargs and name in message
+        }
+        if not unsupported:
+            raise
+        return gateway.generate(
+            state, prompt, **{
+                key: value for key, value in kwargs.items() if key not in unsupported
+            }
+        )
+
+
 def package_model(package: dict[str, Any]) -> HtmlPptPackage:
     """Discard storage-only file metadata at the immutable package boundary."""
 

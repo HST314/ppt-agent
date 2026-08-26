@@ -53,6 +53,7 @@ from agent_core.full_deck_composer import (
 )
 from agent_core.workflow_support import (
     current_full_deck_revision as _current_full_deck_revision,
+    generate_with_legacy_gateway,
     generation_provenance,
     outline_slide_catalog as _outline_slide_catalog,
     package_model as _package_model,
@@ -1060,18 +1061,16 @@ class Workflow:
             prompt_call_ids.append(prompt_call_id)
             attempt_traces: list[dict[str, Any]] = []
             try:
-                try:
-                    text, attempt_traces = self.gateway.generate(
-                        "ppt_sample", current_prompt, json_mode=True, package_draft=draft,
-                    )
-                except TypeError as exc:
-                    # Keep custom/legacy gateway adapters usable while the built-in
-                    # gateway exposes the isolated package draft capability.
-                    if "package_draft" not in str(exc):
-                        raise
-                    text, attempt_traces = self.gateway.generate(
-                        "ppt_sample", current_prompt, json_mode=True,
-                    )
+                # Custom/legacy gateway adapters may reject newer generate()
+                # capabilities (package_draft, images_root) with a TypeError;
+                # generate_with_legacy_gateway retries without just those.
+                text, attempt_traces = generate_with_legacy_gateway(
+                    self.gateway,
+                    "ppt_sample",
+                    current_prompt,
+                    json_mode=True,
+                    package_draft=draft,
+                )
             except Exception as exc:
                 self._fail_prompt_audit(prompt_call_id, exc, attempt_traces)
                 self.store.save_generated_package_attempt(

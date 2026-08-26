@@ -7,6 +7,7 @@ import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape
+from pathlib import Path
 from typing import Any, Callable
 
 from openai import OpenAI
@@ -74,6 +75,7 @@ class ModelGateway:
         json_mode: bool = False,
         package_draft: DraftPackage | None = None,
         package_references: PackageReferenceTool | None = None,
+        images_root: Path | None = None,
         resume_messages: list[dict[str, Any]] | None = None,
         max_tool_rounds: int | None = None,
         prior_tool_rounds: int = 0,
@@ -103,6 +105,7 @@ class ModelGateway:
             self.managed.skills_root,
             per_call=self.managed.policy.max_read_chars_per_call,
             per_job=self.managed.policy.max_read_chars_per_job,
+            images_root=images_root,
         )
         tools = [{
             "type": "function",
@@ -191,6 +194,27 @@ class ModelGateway:
                     },
                 },
             ])
+        if package_draft is not None and package_draft.images_root is not None:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "copy_project_image",
+                    "description": (
+                        "Copy one project image asset from the project images directory "
+                        "into the img/ folder of the current isolated HTML-PPT draft "
+                        "package, then reference it with its in-package relative path."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "required": ["source_path", "destination_path"],
+                        "properties": {
+                            "source_path": {"type": "string"},
+                            "destination_path": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            })
         if package_references is not None:
             tools.extend([
                 {
@@ -342,6 +366,16 @@ class ModelGateway:
                             arguments.get("destination_path", ""),
                         )
                         trace = {"type": "tool_call", "tool": "copy_skill_asset", **output}
+                    elif (
+                        call.function.name == "copy_project_image"
+                        and package_draft is not None
+                        and package_draft.images_root is not None
+                    ):
+                        output = package_draft.copy_project_image(
+                            arguments.get("source_path", ""),
+                            arguments.get("destination_path", ""),
+                        )
+                        trace = {"type": "tool_call", "tool": "copy_project_image", **output}
                     else:
                         raise ModelOutputError("unsupported tool call")
                 except (

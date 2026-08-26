@@ -15,7 +15,14 @@ from uuid import uuid4
 
 from agent_core.models import utc_now
 from agent_core.sample_html import SANITIZER_VERSION
-from runtime.package_tool import TEXT_SUFFIXES, normalize_package_path, package_media_type
+from runtime.package_tool import (
+    SAMPLE_MAX_FILE_BYTES,
+    SAMPLE_MAX_FILES,
+    SAMPLE_MAX_TOTAL_BYTES,
+    TEXT_SUFFIXES,
+    normalize_package_path,
+    package_media_type,
+)
 from storage.errors import ConflictError
 from storage.full_deck_generation_store import FullDeckGenerationStoreMixin
 from storage.persistence import atomic_bytes, exclusive_file_lock, json_text
@@ -390,7 +397,7 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
             raise ValueError("invalid prompt call id")
         relative_paths: list[str] = []
         total = 0
-        for item in files[:96]:
+        for item in files[:SAMPLE_MAX_FILES]:
             path = normalize_package_path(str(item.get("path", "")))
             content_value = item.get("content")
             if not isinstance(content_value, str):
@@ -403,7 +410,11 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
             else:
                 content = content_value.encode("utf-8")
             total += len(content)
-            if not content or len(content) > 2_000_000 or total > 15_000_000:
+            if (
+                not content
+                or len(content) > SAMPLE_MAX_FILE_BYTES
+                or total > SAMPLE_MAX_TOTAL_BYTES
+            ):
                 continue
             relative_path = f"generated_html/{prompt_call_id}/package/{path}"
             candidate = (self.root / relative_path).resolve()
@@ -436,7 +447,11 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
                 continue
             content = resolved.read_bytes()
             total += len(content)
-            if not content or len(content) > 2_000_000 or total > 15_000_000:
+            if (
+                not content
+                or len(content) > SAMPLE_MAX_FILE_BYTES
+                or total > SAMPLE_MAX_TOTAL_BYTES
+            ):
                 continue
             logical_path = resolved.relative_to(package_root).as_posix()
             if resolved.suffix.lower() in TEXT_SUFFIXES:

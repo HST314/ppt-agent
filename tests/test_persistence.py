@@ -137,3 +137,25 @@ def test_generation_models_enforce_transitions_and_trimmed_directive_limit() -> 
             "status": "completed",
             "completed_batches": 1,
         })
+
+
+def test_generated_package_attempt_round_trips_ten_mib_image(tmp_path: Path) -> None:
+    import base64
+
+    from storage.project_store import ProjectStore
+
+    store = ProjectStore(tmp_path / "projects", "image-persistence")
+    prompt_call_id = "prompt_" + "a" * 32
+    image_bytes = b"\x89PNG" + b"x" * (3 * 1024 * 1024)  # above the former 2MB bound
+    files = [{
+        "path": "img/cover.png",
+        "content": base64.b64encode(image_bytes).decode("ascii"),
+        "encoding": "base64",
+    }]
+
+    saved = store.save_generated_package_attempt(prompt_call_id, files)
+    loaded = store.load_generated_package_attempt(prompt_call_id)
+
+    assert saved == [f"generated_html/{prompt_call_id}/package/img/cover.png"]
+    assert loaded[0]["path"] == "img/cover.png"
+    assert base64.b64decode(loaded[0]["content"]) == image_bytes

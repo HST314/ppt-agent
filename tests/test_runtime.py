@@ -25,8 +25,8 @@ def test_default_runtime_is_valid() -> None:
     assert runtime.models.binding_for("ppt_sample").parameters == {"max_tokens": 16_384}
     assert runtime.models.binding_for("ppt_full").parameters == {"max_tokens": 32_768}
     assert runtime.policy.full_deck_max_files == 384
-    assert runtime.policy.full_deck_max_file_bytes == 4_000_000
-    assert runtime.policy.full_deck_max_total_bytes == 50_000_000
+    assert runtime.policy.full_deck_max_file_bytes == 10_485_760
+    assert runtime.policy.full_deck_max_total_bytes == 209_715_200
     assert runtime.policy.full_deck_batched_generation_enabled is True
     assert runtime.policy.full_deck_reference_max_read_chars_per_call == 20_000
     assert runtime.policy.full_deck_reference_max_read_chars_per_batch == 80_000
@@ -37,8 +37,8 @@ def test_default_runtime_is_valid() -> None:
         "full_deck_reference_max_read_chars_per_call": 20_000,
         "full_deck_reference_max_read_chars_per_batch": 80_000,
         "full_deck_max_files": 384,
-        "full_deck_max_file_bytes": 4_000_000,
-        "full_deck_max_total_bytes": 50_000_000,
+        "full_deck_max_file_bytes": 10_485_760,
+        "full_deck_max_total_bytes": 209_715_200,
     }
     assert "api_key_env" not in runtime.public_context()["model_bindings"][0]
 
@@ -64,6 +64,25 @@ def test_runtime_allows_tool_round_limit_up_to_one_hundred() -> None:
     assert RuntimePolicy(max_tool_rounds=100).max_tool_rounds == 100
     with pytest.raises(ValueError):
         RuntimePolicy(max_tool_rounds=101)
+
+
+def test_full_deck_package_limits_accept_new_bounds_and_reject_above() -> None:
+    # 10MiB per file / 200MiB total are the deployed values; the schema keeps
+    # headroom up to 16MiB / 256MiB and rejects anything beyond.
+    assert RuntimePolicy(
+        full_deck_max_file_bytes=10_485_760,
+        full_deck_max_total_bytes=209_715_200,
+    ).full_deck_max_file_bytes == 10_485_760
+
+    assert RuntimePolicy(
+        full_deck_max_file_bytes=16_777_216,
+        full_deck_max_total_bytes=268_435_456,
+    ).full_deck_max_total_bytes == 268_435_456
+
+    with pytest.raises(ValueError):
+        RuntimePolicy(full_deck_max_file_bytes=16_777_217)
+    with pytest.raises(ValueError):
+        RuntimePolicy(full_deck_max_total_bytes=268_435_457)
 
 
 def test_model_binding_rejects_non_whitelisted_parameters() -> None:

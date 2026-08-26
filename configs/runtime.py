@@ -79,8 +79,12 @@ class RuntimePolicy(BaseModel):
         default=80_000, ge=100, le=500_000
     )
     full_deck_max_files: int = Field(default=384, ge=16, le=512)
-    full_deck_max_file_bytes: int = Field(default=4_000_000, ge=100_000, le=8_000_000)
-    full_deck_max_total_bytes: int = Field(default=50_000_000, ge=1_000_000, le=64_000_000)
+    full_deck_max_file_bytes: int = Field(
+        default=10_485_760, ge=100_000, le=16_777_216
+    )
+    full_deck_max_total_bytes: int = Field(
+        default=209_715_200, ge=1_000_000, le=268_435_456
+    )
     skills_root: str = "skills"
     offline_mode: bool = False
     source_config_revision: str | None = None

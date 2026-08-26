@@ -62,6 +62,125 @@ def test_draft_package_rejects_executable_and_oversized_files(tmp_path: Path) ->
         draft.write("index.html", "123456789")
 
 
+def test_draft_package_default_limits_fit_project_images() -> None:
+    draft = DraftPackage(Path("skills"))
+
+    assert draft.max_files == 128
+    assert draft.max_file_bytes == 10_485_760
+    assert draft.max_total_bytes == 83_886_080
+
+
+def test_copy_project_image_copies_paired_image_under_img_prefix(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    images = tmp_path / "project" / "images"
+    images.mkdir(parents=True)
+    (images / "封面图.png").write_bytes(b"\x89PNG fake bytes")
+    draft = DraftPackage(root, images_root=images)
+
+    record = draft.copy_project_image("images/封面图.png", "img/封面图.png")
+
+    assert record["path"] == "img/封面图.png"
+    assert record["source_path"] == "images/封面图.png"
+    payload = draft.payload()
+    entry = next(item for item in payload if item["path"] == "img/封面图.png")
+    assert entry["origin"] == "project_image:images/封面图.png"
+    assert entry["encoding"] == "base64"
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    [
+        "封面图.png",
+        "../封面图.png",
+        "images/../封面图.png",
+        "images/封面图.md",
+        "images/封面图.txt",
+        "images/missing.png",
+        "images/sub/封面图.png",
+        "images/",
+        "",
+    ],
+)
+def test_copy_project_image_rejects_out_of_bounds_or_wrong_suffix_sources(
+    tmp_path: Path, source_path: str
+) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    images = tmp_path / "project" / "images"
+    images.mkdir(parents=True)
+    (images / "封面图.png").write_bytes(b"\x89PNG fake bytes")
+    (images / "封面图.md").write_text("描述", encoding="utf-8")
+    (images / "sub").mkdir()
+    (images / "sub" / "封面图.png").write_bytes(b"\x89PNG nested")
+    draft = DraftPackage(root, images_root=images)
+
+    with pytest.raises(PackageToolError):
+        draft.copy_project_image(source_path, "img/封面图.png")
+
+
+@pytest.mark.parametrize(
+    "destination_path",
+    [
+        "assets/封面图.png",
+        "封面图.png",
+        "img/../封面图.png",
+        "imgx/封面图.png",
+        "img",
+        "img/封面图.exe",
+    ],
+)
+def test_copy_project_image_forces_img_destination_prefix(
+    tmp_path: Path, destination_path: str
+) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    images = tmp_path / "project" / "images"
+    images.mkdir(parents=True)
+    (images / "封面图.png").write_bytes(b"\x89PNG fake bytes")
+    draft = DraftPackage(root, images_root=images)
+
+    with pytest.raises(PackageToolError):
+        draft.copy_project_image("images/封面图.png", destination_path)
+
+
+def test_copy_project_image_rejects_oversized_image_via_shared_limits(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    images = tmp_path / "project" / "images"
+    images.mkdir(parents=True)
+    (images / "big.png").write_bytes(b"x" * 16)
+    draft = DraftPackage(root, images_root=images, max_file_bytes=8)
+
+    with pytest.raises(PackageToolError, match="per-file"):
+        draft.copy_project_image("images/big.png", "img/big.png")
+
+
+def test_copy_project_image_rejects_symlink_escape(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    images = tmp_path / "project" / "images"
+    images.mkdir(parents=True)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG secret")
+    (images / "linked.png").symlink_to(outside)
+    draft = DraftPackage(root, images_root=images)
+
+    with pytest.raises(PackageToolError):
+        draft.copy_project_image("images/linked.png", "img/linked.png")
+
+
+def test_copy_project_image_unavailable_without_images_root(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir()
+    draft = DraftPackage(root)
+
+    with pytest.raises(PackageToolError, match="not available"):
+        draft.copy_project_image("images/封面图.png", "img/封面图.png")
+
+
 def test_sample_revision_identity_includes_parent_revision() -> None:
     package = HtmlPptPackage.model_validate({
         "title": "身份测试",
@@ -101,3 +220,44 @@ def test_sample_revision_identity_includes_outline_page_mapping() -> None:
 
     assert left.package_hash == right.package_hash
     assert left_revision.revision_hash != right_revision.revision_hash
+
+
+def test_package_file_content_hard_cap_covers_ten_mib_base64() -> None:
+    from pydantic import ValidationError
+
+    from agent_core.models import PackageFile
+
+    # 12.5M characters sat above the old 12M ceiling and below the new one;
+    # a 10MiB binary file base64-encodes to roughly 13.4M characters.
+    oversized_but_valid = PackageFile.model_validate({
+        "path": "img/big.jpg",
+        "content": "x" * 12_500_000,
+    })
+    assert len(oversized_but_valid.content) == 12_500_000
+
+    with pytest.raises(ValidationError):
+        PackageFile.model_validate({
+            "path": "img/big.jpg",
+            "content": "x" * 16_000_001,
+        })
+
+
+def test_package_total_bytes_hard_cap_allows_full_deck_sized_packages() -> None:
+    from agent_core.models import HtmlPptPackage
+
+    # 75MB of decoded content: above the former 64MB ceiling, far below the
+    # new 256MiB ceiling that composed full decks need.
+    files = [{"path": "index.html", "content": "<main>deck</main>"}]
+    files.extend(
+        {"path": f"img/big-{index}.txt", "content": "x" * 15_000_000}
+        for index in range(5)
+    )
+    package = HtmlPptPackage.model_validate({
+        "title": "大包测试",
+        "slide_count": 1,
+        "slides": [{"slide_id": "cover", "title": "封面"}],
+        "files": files,
+    })
+
+    assert len(package.files) == 6
+    assert sum(len(item.content_bytes()) for item in package.files) > 64_000_000

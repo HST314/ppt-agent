@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 import model_router.client as client_module
 from model_router.client import MaxToolRoundsExceeded, ModelGateway
 from runtime.package_reference_tool import PackageReferenceSource, PackageReferenceTool
+from runtime.package_tool import DraftPackage
 
 
 class FakeMessage:
@@ -210,3 +212,124 @@ def test_gateway_exposes_allowlisted_reference_listing_and_read_audit(
     assert read_trace["offset"] == 0
     assert read_trace["end"] == 12
     assert read_trace["content_hash"].startswith("sha256:")
+
+
+def test_gateway_read_routes_images_prefix_when_images_root_passed(
+    mock_runtime,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    gateway, requests = real_gateway(
+        mock_runtime,
+        monkeypatch,
+        [
+            named_tool_message("read_desc", "read", {"path": "images/封面图.md"}),
+            FakeMessage(content="{}"),
+        ],
+    )
+    images_root = tmp_path / "images"
+    images_root.mkdir()
+    (images_root / "封面图.md").write_text("描述：封面主视觉", encoding="utf-8")
+
+    output, traces = gateway.generate(
+        "ppt_sample", "generate", json_mode=True, images_root=images_root,
+    )
+
+    assert output == "{}"
+    read_trace = next(trace for trace in traces if trace.get("tool") == "read")
+    assert read_trace["path"] == "images/封面图.md"
+
+
+def test_gateway_dispatches_copy_project_image_for_image_backed_drafts(
+    mock_runtime,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    gateway, requests = real_gateway(
+        mock_runtime,
+        monkeypatch,
+        [
+            named_tool_message(
+                "copy_image",
+                "copy_project_image",
+                {"source_path": "images/cover.png", "destination_path": "img/cover.png"},
+            ),
+            FakeMessage(content="{}"),
+        ],
+    )
+    images_root = tmp_path / "images"
+    images_root.mkdir()
+    (images_root / "cover.png").write_bytes(b"\x89PNG fake bytes")
+    draft = DraftPackage(mock_runtime.skills_root, images_root=images_root)
+
+    output, traces = gateway.generate(
+        "ppt_sample", "generate", json_mode=True, package_draft=draft,
+    )
+
+    assert output == "{}"
+    tool_names = {tool["function"]["name"] for tool in requests[0]["tools"]}
+    assert "copy_project_image" in tool_names
+    copy_trace = next(
+        trace for trace in traces if trace.get("tool") == "copy_project_image"
+    )
+    assert copy_trace["path"] == "img/cover.png"
+    assert copy_trace["source_path"] == "images/cover.png"
+    assert draft.has("img/cover.png")
+
+
+def test_gateway_hides_copy_project_image_when_draft_has_no_images_root(
+    mock_runtime,
+    monkeypatch,
+) -> None:
+    gateway, requests = real_gateway(
+        mock_runtime,
+        monkeypatch,
+        [FakeMessage(content="{}")],
+    )
+    draft = DraftPackage(mock_runtime.skills_root)
+
+    output, _ = gateway.generate(
+        "ppt_sample", "generate", json_mode=True, package_draft=draft,
+    )
+
+    assert output == "{}"
+    tool_names = {tool["function"]["name"] for tool in requests[0]["tools"]}
+    assert "copy_project_image" not in tool_names
+
+
+def test_gateway_reports_copy_project_image_errors_as_tool_output(
+    mock_runtime,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    gateway, _requests = real_gateway(
+        mock_runtime,
+        monkeypatch,
+        [
+            named_tool_message(
+                "copy_bad",
+                "copy_project_image",
+                {"source_path": "images/cover.png", "destination_path": "assets/cover.png"},
+            ),
+            FakeMessage(content="{}"),
+        ],
+    )
+    images_root = tmp_path / "images"
+    images_root.mkdir()
+    (images_root / "cover.png").write_bytes(b"\x89PNG fake bytes")
+    draft = DraftPackage(mock_runtime.skills_root, images_root=images_root)
+
+    output, traces = gateway.generate(
+        "ppt_sample", "generate", json_mode=True, package_draft=draft,
+    )
+
+    assert output == "{}"
+    copy_trace = next(
+        trace for trace in traces if trace.get("tool") == "copy_project_image"
+    )
+    assert "img/" in copy_trace["error"]
+    tool_messages = [
+        message for message in gateway.last_messages if message["role"] == "tool"
+    ]
+    assert "error" in json.loads(tool_messages[-1]["content"])
+    assert not draft.has("assets/cover.png")

@@ -10,6 +10,9 @@ class ReadToolError(ValueError):
     pass
 
 
+IMAGES_PREFIX = "images/"
+
+
 @dataclass
 class ReadResult:
     path: str
@@ -25,8 +28,18 @@ class SkillReader:
         ".json", ".yaml", ".yml", ".svg", ".xml",
     }
 
-    def __init__(self, root: Path, *, per_call: int, per_job: int):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        per_call: int,
+        per_job: int,
+        images_root: Path | None = None,
+    ):
         self.root = root.resolve()
+        self.images_root = (
+            images_root.resolve() if images_root is not None else None
+        )
         self.per_call = per_call
         self.per_job = per_job
         self.consumed = 0
@@ -62,6 +75,8 @@ class SkillReader:
     def _resolve_file(self, logical_path: str) -> Path:
         if not logical_path or "\x00" in logical_path:
             raise ReadToolError("path is empty or contains NUL")
+        if self.images_root is not None and logical_path.startswith(IMAGES_PREFIX):
+            return self._resolve_images_file(logical_path)
         posix = PurePosixPath(logical_path)
         if posix.is_absolute() or ".." in posix.parts:
             raise ReadToolError("only relative paths inside skills_root are allowed")
@@ -74,6 +89,34 @@ class SkillReader:
             raise ReadToolError("file is outside skills_root or does not exist") from None
         if not candidate.is_relative_to(self.root) or not is_regular:
             raise ReadToolError("file is outside skills_root or does not exist")
+        return candidate
+
+    def _resolve_images_file(self, logical_path: str) -> Path:
+        """Resolve ``images/<name>.md`` against the project images root.
+
+        The synced images directory is flat, so exactly one path segment is
+        accepted; only Markdown description files are readable there and
+        image bytes never pass through the text read tool.
+        """
+
+        rest = logical_path[len(IMAGES_PREFIX):]
+        posix = PurePosixPath(rest)
+        if (
+            not rest
+            or posix.is_absolute()
+            or ".." in posix.parts
+            or len(posix.parts) != 1
+        ):
+            raise ReadToolError("only flat relative paths inside the images directory are allowed")
+        if posix.suffix.lower() != ".md":
+            raise ReadToolError("only Markdown description files are readable inside images/")
+        try:
+            candidate = (self.images_root / Path(*posix.parts)).resolve(strict=True)
+            is_regular = stat.S_ISREG(candidate.stat().st_mode)
+        except (OSError, RuntimeError):
+            raise ReadToolError("file is outside the images directory or does not exist") from None
+        if not candidate.is_relative_to(self.images_root) or not is_regular:
+            raise ReadToolError("file is outside the images directory or does not exist")
         return candidate
 
     def resolve_asset(self, logical_path: str) -> Path:
