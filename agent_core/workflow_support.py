@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from collections.abc import Collection
+from pathlib import PurePosixPath
 from typing import Any
 
 from agent_core.models import HtmlPptPackage
@@ -100,6 +101,61 @@ def outline_page_image_map(
         if names:
             result[number] = names
     return result
+
+
+def full_deck_image_description_paths(
+    outline_markdown: str,
+    images_manifest: list[dict[str, Any]],
+    target_numbers: Collection[int],
+) -> list[str]:
+    """Pick the description files a full-deck call should inject (plan D-11).
+
+    The manifest itself is always injected in full; only the full-text
+    descriptions are filtered to the images planned on the target pages.
+    When the outline carries no usable image plans at all, or when none of
+    them intersect the target pages, every description is injected — an
+    empty intersection means "fall back to full injection", never "inject
+    nothing". Returns deterministic (deduplicated) project-relative paths.
+    """
+
+    if not images_manifest:
+        return []
+    description_by_name = {
+        PurePosixPath(entry["image_path"]).name: entry["description_path"]
+        for entry in images_manifest
+    }
+    page_map = outline_page_image_map(outline_markdown, description_by_name)
+    if not page_map:
+        return [entry["description_path"] for entry in images_manifest]
+    planned: list[str] = []
+    seen: set[str] = set()
+    for number in target_numbers:
+        for name in page_map.get(int(number), []):
+            path = description_by_name[name]
+            if path not in seen:
+                seen.add(path)
+                planned.append(path)
+    if not planned:
+        return [entry["description_path"] for entry in images_manifest]
+    return planned
+
+
+def full_deck_images_prompt_section(
+    images_template: str,
+    images_manifest: list[dict[str, Any]],
+    descriptions: dict[str, str],
+) -> str:
+    """Append-only full-deck block: usage rules plus full description texts."""
+
+    description_blocks = [
+        f"[{path}]\n{text}" for path, text in sorted(descriptions.items())
+    ]
+    return (
+        f"\n\n{images_template.strip()}\n\n"
+        f"PROJECT_IMAGES_JSON: {json.dumps(images_manifest, ensure_ascii=False)}\n"
+        "PROJECT_IMAGE_DESCRIPTIONS:\n"
+        + "\n".join(description_blocks)
+    )
 
 
 def stable_hash(value: Any) -> str:

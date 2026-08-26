@@ -6,7 +6,7 @@ import posixpath
 import re
 from copy import deepcopy
 from html.parser import HTMLParser
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal, NoReturn, Protocol
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
@@ -42,6 +42,8 @@ from agent_core.models import (
 )
 from agent_core.workflow_support import (
     current_full_deck_revision as _current_full_deck_revision,
+    full_deck_image_description_paths,
+    full_deck_images_prompt_section,
     generation_provenance,
     outline_slide_catalog as _outline_slide_catalog,
     package_model as _package_model,
@@ -52,6 +54,11 @@ from model_router.client import ModelGateway, ModelOutputError
 from runtime.package_reference_tool import PackageReferenceTool
 from runtime.package_tool import DraftPackage, PackageToolError
 from runtime.read_tool import SkillReader
+from storage.project_images import (
+    IMAGES_DIR_NAME,
+    project_image_manifest,
+    read_image_descriptions,
+)
 from storage.project_store import ConflictError, ProjectStore
 
 
@@ -108,6 +115,7 @@ def _generate_segment_attempt(
     prompt: str,
     draft: DraftPackage,
     references: PackageReferenceTool,
+    images_root: Path | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Preserve existing gateways that support only one optional package tool."""
 
@@ -116,6 +124,8 @@ def _generate_segment_attempt(
         "package_draft": draft,
         "package_references": references,
     }
+    if images_root is not None:
+        kwargs["images_root"] = images_root
     while True:
         try:
             return gateway.generate("ppt_full", prompt, **kwargs)
@@ -123,7 +133,7 @@ def _generate_segment_attempt(
             unsupported = next(
                 (
                     name
-                    for name in ("package_references", "package_draft")
+                    for name in ("package_references", "package_draft", "images_root")
                     if name in kwargs and name in str(exc)
                 ),
                 None,
@@ -457,6 +467,16 @@ def generate_full_deck(
     ).index()
     skills_hash = stable_hash(skill_index)
     template, template_hash = workflow._template("ppt_full.md")
+    images_manifest = project_image_manifest(workflow.store.root)
+    images_root: Path | None = None
+    images_template = ""
+    if images_manifest:
+        # With materials every segment prompt gains an append-only section
+        # (full manifest, segment-target-filtered description texts) and the
+        # draft/gateway gain the project images root; with an empty manifest
+        # the prompts and every call stay byte-for-byte identical.
+        images_root = (workflow.store.root / IMAGES_DIR_NAME).resolve()
+        images_template, _ = workflow._template("ppt_full_images.md")
     generation_id = "fullgen_" + uuid4().hex
     sample_reference = {
         "source_id": "approved_sample",
@@ -592,6 +612,17 @@ def generate_full_deck(
             + f"Approved slide outline:\n{outline['markdown_body']}\n"
             + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
         )
+        if images_manifest:
+            base_prompt += full_deck_images_prompt_section(
+                images_template,
+                images_manifest,
+                read_image_descriptions(
+                    workflow.store.root,
+                    full_deck_image_description_paths(
+                        outline["markdown_body"], images_manifest, target_numbers
+                    ),
+                ),
+            )
         current_prompt = base_prompt
         parent_prompt_call_id: str | None = None
         package_output: HtmlPptPackage | None = None
@@ -605,6 +636,7 @@ def generate_full_deck(
                 raise JobCancelled("full-deck generation cancelled before segment attempt")
             draft = DraftPackage(
                 workflow.runtime.skills_root,
+                images_root=images_root,
                 max_files=workflow.runtime.policy.full_deck_max_files,
                 max_file_bytes=workflow.runtime.policy.full_deck_max_file_bytes,
                 max_total_bytes=workflow.runtime.policy.full_deck_max_total_bytes,
@@ -635,6 +667,7 @@ def generate_full_deck(
                     current_prompt,
                     draft,
                     package_references,
+                    images_root=images_root,
                 )
             except Exception as exc:
                 workflow._fail_prompt_audit(prompt_call_id, exc, attempt_traces)

@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 from copy import deepcopy
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
@@ -39,6 +39,8 @@ from agent_core.models import (
 )
 from agent_core.workflow_support import (
     current_full_deck_revision,
+    full_deck_image_description_paths,
+    full_deck_images_prompt_section,
     generate_with_legacy_gateway,
     generation_provenance,
     outline_slide_catalog,
@@ -47,6 +49,11 @@ from agent_core.workflow_support import (
 )
 from runtime.package_tool import DraftPackage, TEXT_SUFFIXES
 from runtime.read_tool import SkillReader
+from storage.project_images import (
+    IMAGES_DIR_NAME,
+    project_image_manifest,
+    read_image_descriptions,
+)
 from storage.project_store import ConflictError
 
 
@@ -360,6 +367,29 @@ def create_full_deck_revision(
         + f"Approved slide outline:\n{outline['markdown_body']}\n"
         + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
     )
+    images_manifest = project_image_manifest(workflow.store.root)
+    images_root: Path | None = None
+    if images_manifest:
+        # With materials the revision prompt gains an append-only section: the
+        # full manifest plus descriptions filtered to the known target pages.
+        # A regenerate operation knows its expected pages; a revise operation
+        # declares its targets in the response, so the filter set is empty and
+        # the helper falls back to injecting every description text. With an
+        # empty manifest the prompt and every call stay byte-for-byte identical.
+        images_root = (workflow.store.root / IMAGES_DIR_NAME).resolve()
+        images_template, _ = workflow._template("ppt_full_images.md")
+        base_prompt += full_deck_images_prompt_section(
+            images_template,
+            images_manifest,
+            read_image_descriptions(
+                workflow.store.root,
+                full_deck_image_description_paths(
+                    outline["markdown_body"],
+                    images_manifest,
+                    expected_numbers or [],
+                ),
+            ),
+        )
 
     current_prompt = base_prompt
     parent_prompt_call_id: str | None = None
@@ -375,6 +405,7 @@ def create_full_deck_revision(
             raise JobCancelled("full-deck revision cancelled before replacement attempt")
         draft = DraftPackage(
             workflow.runtime.skills_root,
+            images_root=images_root,
             max_files=workflow.runtime.policy.full_deck_max_files,
             max_file_bytes=workflow.runtime.policy.full_deck_max_file_bytes,
             max_total_bytes=workflow.runtime.policy.full_deck_max_total_bytes,
@@ -404,12 +435,17 @@ def create_full_deck_revision(
             # Custom/legacy gateway adapters may reject newer generate()
             # capabilities (package_draft, images_root) with a TypeError;
             # generate_with_legacy_gateway retries without just those.
+            generate_kwargs: dict[str, Any] = {
+                "json_mode": True,
+                "package_draft": draft,
+            }
+            if images_root is not None:
+                generate_kwargs["images_root"] = images_root
             text, attempt_traces = generate_with_legacy_gateway(
                 workflow.gateway,
                 "ppt_full",
                 current_prompt,
-                json_mode=True,
-                package_draft=draft,
+                **generate_kwargs,
             )
         except Exception as exc:
             workflow._fail_prompt_audit(prompt_call_id, exc, attempt_traces)

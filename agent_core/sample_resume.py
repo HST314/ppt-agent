@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from agent_core.models import HtmlPptPackage, SampleRevision
@@ -10,6 +11,7 @@ from configs.runtime import ManagedRuntime
 from model_router.client import ModelGateway
 from runtime.package_tool import DraftPackage
 from runtime.read_tool import SkillReader
+from storage.project_images import IMAGES_DIR_NAME, project_image_manifest
 from storage.project_store import ConflictError, ProjectStore, mark_full_deck_stale
 
 
@@ -124,7 +126,16 @@ def resume_sample(
     ):
         raise ConflictError("sample_resume_stale:当前样品版本已变化，不能继续旧生成。")
 
-    draft = DraftPackage(workflow.runtime.skills_root)
+    # The resumed prompt is the persisted original (it already carries
+    # whatever project-images section the first attempt was built with), so
+    # resume only re-arms the tool surface: with materials the reconstructed
+    # draft and the gateway call regain the project images root, keeping
+    # copy_project_image and images/*.md reads available for the extra
+    # rounds. With an empty manifest both stay exactly as before.
+    images_root: Path | None = None
+    if project_image_manifest(workflow.store.root):
+        images_root = (workflow.store.root / IMAGES_DIR_NAME).resolve()
+    draft = DraftPackage(workflow.runtime.skills_root, images_root=images_root)
     draft.ingest(workflow.store.load_generated_package_attempt(prompt_call_id))
     messages = resume["messages"]
     prompt = next(
@@ -161,16 +172,21 @@ def resume_sample(
     )
     attempt_traces: list[dict[str, Any]] = []
     try:
+        generate_kwargs: dict[str, Any] = {
+            "json_mode": True,
+            "package_draft": draft,
+            "resume_messages": messages,
+            "max_tool_rounds": additional_rounds,
+            "prior_tool_rounds": cumulative_rounds,
+            "prior_tool_call_count": resume["cumulative_tool_call_count"],
+            "prior_skill_read_count": resume["cumulative_skill_read_count"],
+        }
+        if images_root is not None:
+            generate_kwargs["images_root"] = images_root
         text, attempt_traces = workflow.gateway.generate(
             "ppt_sample",
             prompt,
-            json_mode=True,
-            package_draft=draft,
-            resume_messages=messages,
-            max_tool_rounds=additional_rounds,
-            prior_tool_rounds=cumulative_rounds,
-            prior_tool_call_count=resume["cumulative_tool_call_count"],
-            prior_skill_read_count=resume["cumulative_skill_read_count"],
+            **generate_kwargs,
         )
     except Exception as exc:
         workflow._fail_prompt_audit(next_prompt_call_id, exc, attempt_traces)

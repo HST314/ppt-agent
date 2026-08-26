@@ -4,6 +4,7 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from agent_core.full_deck_composer import COMPOSER_VERSION
@@ -19,12 +20,19 @@ from agent_core.full_deck_reference_context import full_deck_package_reference_t
 from agent_core.models import HtmlPptPackage
 from agent_core.workflow_support import (
     current_full_deck_revision,
+    full_deck_image_description_paths,
+    full_deck_images_prompt_section,
     outline_slide_catalog,
     package_model,
     stable_hash,
 )
 from runtime.package_tool import DraftPackage
 from runtime.read_tool import SkillReader
+from storage.project_images import (
+    IMAGES_DIR_NAME,
+    project_image_manifest,
+    read_image_descriptions,
+)
 from storage.project_store import ConflictError
 
 
@@ -168,12 +176,32 @@ def generate_full_deck_batch(
         + f"Approved slide outline:\n{outline['markdown_body']}\n"
         + f"Skill index:\n{json.dumps(skill_index, ensure_ascii=False)}"
     )
+    images_manifest = project_image_manifest(workflow.store.root)
+    images_root: Path | None = None
+    if images_manifest:
+        # With materials the batch prompt gains an append-only section (full
+        # manifest, target-page-filtered description texts) and the
+        # draft/gateway gain the project images root; with an empty manifest
+        # the prompt and every call stay byte-for-byte identical.
+        images_root = (workflow.store.root / IMAGES_DIR_NAME).resolve()
+        images_template, _ = workflow._template("ppt_full_images.md")
+        base_prompt += full_deck_images_prompt_section(
+            images_template,
+            images_manifest,
+            read_image_descriptions(
+                workflow.store.root,
+                full_deck_image_description_paths(
+                    outline["markdown_body"], images_manifest, target_numbers
+                ),
+            ),
+        )
     current_prompt = base_prompt
     parent_prompt_call_id: str | None = None
     prompt_call_ids: list[str] = []
     for attempt in range(FULL_DECK_MAX_REPAIR_ATTEMPTS + 1):
         draft = DraftPackage(
             workflow.runtime.skills_root,
+            images_root=images_root,
             max_files=workflow.runtime.policy.full_deck_max_files,
             max_file_bytes=workflow.runtime.policy.full_deck_max_file_bytes,
             max_total_bytes=workflow.runtime.policy.full_deck_max_total_bytes,
@@ -205,6 +233,7 @@ def generate_full_deck_batch(
                 current_prompt,
                 draft,
                 package_references,
+                images_root=images_root,
             )
             payload = _parse_full_deck_segment_output(text)
             package = _validate_full_deck_segment_output(
