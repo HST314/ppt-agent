@@ -305,7 +305,7 @@ def _outer_index(spec: FullDeckComposerInput, slides: list[CompositionSlide]) ->
         f"<title>{html.escape(spec.title)}</title>",
         "<style>",
         "*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#111}",
-        ".slide{position:absolute;inset:0}.slide[hidden]{display:none}.slide iframe{width:100%;height:100%;border:0;background:#fff}",
+        ".slide{position:absolute;inset:0}.slide[hidden]{display:block;visibility:hidden;pointer-events:none}.slide iframe{width:100%;height:100%;border:0;background:#fff}",
         ".deck-nav{position:fixed;z-index:10;right:16px;bottom:14px;display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:999px;background:rgba(17,17,17,.78);color:#fff;font:13px/1.2 system-ui,sans-serif}",
         ".deck-nav button{min-width:44px;min-height:44px;border:1px solid rgba(255,255,255,.35);border-radius:999px;background:#fff;color:#111;font:700 18px/1 system-ui;cursor:pointer}",
         ".deck-nav button:focus-visible{outline:3px solid #6ee7ff;outline-offset:2px}",
