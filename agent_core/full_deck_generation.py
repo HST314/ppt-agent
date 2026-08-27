@@ -865,7 +865,6 @@ def generate_full_deck(
             if (
                 page.content_ref is None
                 or slide.source_slide_content_hash != page.content_ref.slide_content_hash
-                or slide.composed_slide_content_hash != page.content_ref.slide_content_hash
             ):
                 raise FullDeckGenerationError(
                     "full_deck_composition_failed",

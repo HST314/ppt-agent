@@ -672,10 +672,7 @@ def _final_plan_and_composition(
         session["pages"], composition.manifest.slides, strict=True
     ):
         expected_hash = projected["content_ref"]["slide_content_hash"]
-        if (
-            slide.source_slide_content_hash != expected_hash
-            or slide.composed_slide_content_hash != expected_hash
-        ):
+        if slide.source_slide_content_hash != expected_hash:
             raise ValueError("final Composer changed a page content graph")
     _validate_offline_package(composition.package)
     _validate_full_deck_package_limits(composition.package, workflow.runtime)

@@ -226,8 +226,12 @@ def test_full_deck_generation_targets_only_pending_segments_and_publishes_r2(
     assert [slide["slot_id"] for slide in composition["slides"]] == [
         page["slot_id"] for page in revision["plan"]["pages"]
     ]
+    ref_by_slot = {
+        page["slot_id"]: page["content_ref"]["slide_content_hash"]
+        for page in revision["plan"]["pages"]
+    }
     assert all(
-        slide["source_slide_content_hash"] == slide["composed_slide_content_hash"]
+        slide["source_slide_content_hash"] == ref_by_slot[slide["slot_id"]]
         for slide in composition["slides"]
     )
     assert {slide["source_id"] for slide in composition["slides"]} == {

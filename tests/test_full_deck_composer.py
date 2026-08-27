@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import main_front
+from agent_core.full_deck_batching import compose_partial_full_deck_preview
 from agent_core.full_deck_composer import (
     COMPOSER_VERSION,
     PAGE_CONTENT_GRAPH_VERSION,
@@ -17,7 +18,13 @@ from agent_core.full_deck_composer import (
     compose_full_deck,
     normalized_page_content_graph,
 )
-from agent_core.models import HtmlPptPackage, SampleRevision, TaskCard
+from agent_core.models import (
+    FullDeckGenerationContentRef,
+    FullDeckGenerationPage,
+    HtmlPptPackage,
+    SampleRevision,
+    TaskCard,
+)
 from storage.project_store import ProjectStore
 
 
@@ -120,8 +127,19 @@ def test_composer_is_deterministic_namespaces_assets_and_traces_each_page() -> N
         b".slide{width:100vw;height:100vh;color:#9b2c2c}",
     }
 
+    package_by_source = {source.source_id: source.package for source in spec.sources}
     assert all(
-        slide.source_slide_content_hash == slide.composed_slide_content_hash
+        slide.source_slide_content_hash
+        == normalized_page_content_graph(
+            package_by_source[slide.source_id],
+            slide.source_slide_id,
+        ).content_hash
+        for slide in first.manifest.slides
+    )
+    # Composed pages are self-contained (package-local refs inlined), so the
+    # composed-bytes graph differs from the pre-transform source graph.
+    assert all(
+        slide.composed_slide_content_hash != slide.source_slide_content_hash
         for slide in first.manifest.slides
     )
     manifest_bytes = files["composition_manifest.json"]
@@ -181,7 +199,6 @@ def test_content_graph_is_independent_of_source_file_order() -> None:
     for number, slide in enumerate(composition.manifest.slides, start=1):
         expected = normalized_page_content_graph(backward, f"gamma-{number}")
         assert slide.source_slide_content_hash == expected.content_hash
-        assert slide.composed_slide_content_hash == expected.content_hash
     for source in composition.manifest.sources:
         paths = [resource.source_path for resource in source.resources]
         assert paths == sorted(paths)
@@ -354,3 +371,78 @@ def test_single_slide_document_strips_source_pager_and_inlines_resources() -> No
     assert ".slide{color:#111}" in page
     assert "addEventListener('keydown',()=>{});" in page
     assert not re.findall(r'(?:src|href)="assets/[^"]+"', page)
+
+
+def test_partial_preview_keeps_refs_recorded_before_self_contained_composition() -> None:
+    """Content refs hashed from the untransformed slide stay valid.
+
+    Durable content refs predate self-contained composition: they hash the
+    slide document before pager stripping and resource inlining. Partial
+    previews must keep accepting those refs while still emitting transformed
+    page bytes (pager stripped, local resources inlined).
+    """
+
+    index = (
+        '<!doctype html><html><head><meta charset="utf-8"></head><body>'
+        '<main>'
+        '<section class="slide" data-slide-id="one">'
+        '<h1>第一页</h1><img src="assets/pic.png" alt="图">'
+        '</section>'
+        '</main>'
+        '<div class="chrome"><div class="bar">'
+        '<button class="navbtn" id="prev">‹</button>'
+        '<div class="count"><span id="pagenow">1</span> / 1 · 原稿第 1 – 1 页</div>'
+        '</div></div>'
+        '<script>var pagenow=document.getElementById("pagenow");</script>'
+        '</body></html>'
+    )
+    package = HtmlPptPackage.model_validate({
+        "title": "旧哈希兼容验证",
+        "slide_count": 1,
+        "slides": [
+            {"slide_id": "one", "title": "第一页", "source_slide_number": 1},
+        ],
+        "files": [
+            {"path": "index.html", "content": index},
+            {"path": "assets/pic.png", "content": "aGVsbG8=", "encoding": "base64"},
+        ],
+    })
+    session_id = "fullsession_" + "0" * 32
+    sample_revision = "sha256:" + "1" * 64
+    legacy_ref = normalized_page_content_graph(package, "one").content_hash
+
+    preview = compose_partial_full_deck_preview(
+        session_id=session_id,
+        batch_index=1,
+        title="旧哈希兼容验证",
+        pages=[
+            FullDeckGenerationPage(
+                session_id=session_id,
+                position=0,
+                slot_id="slot_" + "0" * 24,
+                source_slide_number=1,
+                title="第一页",
+                generation_status="sample_ready",
+                source_type="approved_sample",
+                content_ref=FullDeckGenerationContentRef(
+                    revision_hash=sample_revision,
+                    package_hash=package.package_hash,
+                    slide_id="one",
+                    slide_content_hash=legacy_ref,
+                ),
+            )
+        ],
+        source_packages={sample_revision: package},
+    )
+
+    slide = preview.composition_manifest["slides"][0]
+    assert slide["source_slide_content_hash"] == legacy_ref
+    # The composed page bytes really are transformed, so their graph differs.
+    assert slide["composed_slide_content_hash"] != legacy_ref
+    page = next(
+        item.content_bytes().decode("utf-8")
+        for item in preview.files
+        if item.path == slide["document_path"]
+    )
+    assert "pagenow" not in page
+    assert 'src="data:image/png;base64,aGVsbG8="' in page

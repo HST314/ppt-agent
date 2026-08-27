@@ -351,10 +351,7 @@ def compose_partial_full_deck_preview(
         expected_hashes,
         strict=True,
     ):
-        if (
-            slide.source_slide_content_hash != expected_hash
-            or slide.composed_slide_content_hash != expected_hash
-        ):
+        if slide.source_slide_content_hash != expected_hash:
             raise FullDeckComposerError(
                 f"partial preview page content graph changed: {slide.slot_id}"
             )

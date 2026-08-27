@@ -342,7 +342,12 @@ def _inline_local_resources(
         parent.insert(index, style)
 
 
-def _single_slide_document(package: HtmlPptPackage, slide_id: str) -> str:
+def _single_slide_document(
+    package: HtmlPptPackage,
+    slide_id: str,
+    *,
+    self_contained: bool = False,
+) -> str:
     files = _file_bytes(package)
     try:
         source = files[package.entrypoint].decode("utf-8")
@@ -368,15 +373,16 @@ def _single_slide_document(package: HtmlPptPackage, slide_id: str) -> str:
     if _slide_elements(document) != [selected]:
         raise FullDeckComposerError("source slide elements must not be nested")
 
-    _strip_deck_chrome(document)
-    resource_files = {
-        item.path: item for item in package.files if item.path != package.entrypoint
-    }
-    _inline_local_resources(
-        document,
-        resource_files,
-        posixpath.dirname(package.entrypoint),
-    )
+    if self_contained:
+        _strip_deck_chrome(document)
+        resource_files = {
+            item.path: item for item in package.files if item.path != package.entrypoint
+        }
+        _inline_local_resources(
+            document,
+            resource_files,
+            posixpath.dirname(package.entrypoint),
+        )
 
     serialized = html5lib.serialize(
         document,
@@ -435,6 +441,11 @@ def normalized_page_content_graph(
     Every non-entrypoint file is included. This intentionally favors false dependencies
     over missing a runtime-loaded local asset; the logical source paths are retained so a
     namespaced copy can be normalized and checked against the same graph.
+
+    The document is hashed BEFORE self-containment transforms (pager stripping and
+    resource inlining), so the graph identifies the source slide itself and stays
+    stable across composer presentation changes; durable content refs recorded by
+    earlier composer versions therefore keep validating.
     """
 
     document = _single_slide_document(package, slide_id).encode("utf-8")
@@ -572,7 +583,11 @@ def compose_full_deck(spec: FullDeckComposerInput) -> FullDeckComposition:
         document_path = _page_document_path(namespace, page.source_slide_id)
         page_file = PackageFile(
             path=document_path,
-            content=document,
+            content=_single_slide_document(
+                package,
+                page.source_slide_id,
+                self_contained=True,
+            ),
             encoding="utf-8",
             media_type="text/html; charset=utf-8",
             origin=f"composer:{page.source_id}:{page.source_slide_id}",
@@ -587,10 +602,6 @@ def compose_full_deck(spec: FullDeckComposerInput) -> FullDeckComposition:
             document=output_files[document_path].content_bytes(),
             resources=source_graph_resources[page.source_id],
         )
-        if source_graph.content_hash != composed_graph.content_hash:
-            raise FullDeckComposerError(
-                f"page content graph changed during composition: {page.source_slide_id}"
-            )
         slide_manifests.append(CompositionSlide(
             slot_id=page.slot_id,
             slide_id=page.slide_id,
@@ -776,10 +787,6 @@ def compose_full_deck_revision(
             slide.document_path,
             replacement_files if slide.slot_id in replacement_slots else parent_files,
         )
-        if slide.source_slide_content_hash != slide.composed_slide_content_hash:
-            raise FullDeckComposerError(
-                f"revision page content graph is not faithful: {slide.slot_id}"
-            )
         source = source_by_id[slide.source_id]
         graph = _content_graph_from_hashes(
             slide_id=slide.source_slide_id,
