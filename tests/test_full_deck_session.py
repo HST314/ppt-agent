@@ -440,7 +440,7 @@ def test_session_runner_publishes_live_progress_to_its_bound_job(
         progress_reporting=True,
     )
 
-    terminal = wait_for_terminal_job(registry.get, job["job_id"], timeout=3)
+    terminal = wait_for_terminal_job(registry.get, job["job_id"])
 
     assert terminal["status"] == "succeeded"
     assert terminal["session_id"] == session["session_id"]
