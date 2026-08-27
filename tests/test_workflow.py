@@ -7,10 +7,17 @@ import pytest
 
 from agent_core.models import SampleOutput, SamplePage, TaskCard, digest
 from agent_core.jobs import public_job_error
-from agent_core.workflow import SampleGenerationError, Workflow, capabilities, stable_hash
+from agent_core.workflow import (
+    SampleGenerationError,
+    Workflow,
+    _validate_package_output,
+    capabilities,
+    stable_hash,
+)
 from configs.runtime import ManagedRuntime
 from model_router.client import MaxToolRoundsExceeded
 from storage.project_store import ConflictError, ProjectStore
+from runtime.package_tool import DraftPackage
 
 
 @pytest.fixture
@@ -423,6 +430,103 @@ def test_realistic_package_output_repairs_truncated_json(workflow: Workflow, mon
     assert [item["status"] for item in sample_calls] == ["failed", "completed"]
     assert sample_calls[1]["parent_prompt_call_id"] == sample_calls[0]["prompt_call_id"]
     assert sample_calls[1]["output_ref"] == sample["revision_hash"]
+
+
+def test_sample_repair_inherits_failed_attempt_draft(workflow: Workflow, monkeypatch) -> None:
+    manifest = ready_for_sample(workflow)
+    workflow.gateway.generate = lambda *_args, **_kwargs: (
+        realistic_package_output(),
+        [{"type": "model_call", "provider": "test", "model": "seed", "usage": {}}],
+    )
+    manifest = workflow.generate_sample(manifest["checkpoint_id"])
+    attempts = 0
+
+    def generate(_state: str, _prompt: str, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        draft = kwargs["package_draft"]
+        if attempts == 1:
+            draft.replace_text("index.html", "样品页 2", "已继承的草稿修改")
+            return "", [
+                {"type": "model_call", "provider": "test", "model": "truncated", "usage": {}}
+            ]
+        assert "已继承的草稿修改" in draft.read("index.html")["content"]
+        return json.dumps({
+            "entrypoint": "index.html",
+            "title": "继承草稿后的样品",
+            "slide_count": 2,
+            "slides": [
+                {"slide_id": "sample_1", "title": "结论先行", "source_slide_number": 1},
+                {"slide_id": "sample_2", "title": "行动路径", "source_slide_number": 2},
+            ],
+        }, ensure_ascii=False), [
+            {"type": "model_call", "provider": "test", "model": "repaired", "usage": {}}
+        ]
+
+    monkeypatch.setattr(workflow.gateway, "generate", generate)
+
+    revised = workflow.generate_sample(
+        manifest["checkpoint_id"],
+        feedback="只修改第二页",
+    )
+
+    assert attempts == 2
+    package = revised["samples"][-1]["package"]
+    index_html = next(
+        item["content"] for item in package["files"] if item["path"] == "index.html"
+    )
+    assert "已继承的草稿修改" in index_html
+
+
+def test_package_output_accepts_existing_draft_file_references(tmp_path: Path) -> None:
+    draft = DraftPackage(tmp_path)
+    draft.write(
+        "index.html",
+        '<section class="slide" data-slide-id="sample_1">样品</section>',
+    )
+
+    package = _validate_package_output(
+        {
+            "entrypoint": "index.html",
+            "title": "精简清单",
+            "slide_count": 1,
+            "slides": [
+                {"slide_id": "sample_1", "title": "样品", "source_slide_number": 1}
+            ],
+            "files": ["index.html"],
+        },
+        draft,
+        1,
+        {1},
+    )
+
+    assert [item.path for item in package.files] == ["index.html"]
+
+
+def test_package_output_rejects_missing_draft_file_references(tmp_path: Path) -> None:
+    draft = DraftPackage(tmp_path)
+    draft.write(
+        "index.html",
+        '<section class="slide" data-slide-id="sample_1">样品</section>',
+    )
+
+    with pytest.raises(SampleGenerationError) as failure:
+        _validate_package_output(
+            {
+                "entrypoint": "index.html",
+                "title": "错误清单",
+                "slide_count": 1,
+                "slides": [
+                    {"slide_id": "sample_1", "title": "样品", "source_slide_number": 1}
+                ],
+                "files": ["index.html", "assets/missing.css"],
+            },
+            draft,
+            1,
+            {1},
+        )
+
+    assert "assets/missing.css" in failure.value.repair_reason
 
 
 def test_realistic_package_output_repairs_with_exact_path_reason(
