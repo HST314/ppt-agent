@@ -279,7 +279,7 @@ def test_composed_package_uses_safe_preview_and_unzips_as_offline_deck(
     for iframe_path in iframe_paths:
         page = client.get(f"{preview_base}/{iframe_path}")
         assert page.status_code == 200
-        assert page.text.count('class="slide"') == 1
+        assert page.text.count('class="slide active"') == 1
 
     exported = client.get(
         f"/api/projects/{project_id}/samples/revisions/{sample.revision_hash}/export"
@@ -371,6 +371,76 @@ def test_single_slide_document_strips_source_pager_and_inlines_resources() -> No
     assert ".slide{color:#111}" in page
     assert "addEventListener('keydown',()=>{});" in page
     assert not re.findall(r'(?:src|href)="assets/[^"]+"', page)
+
+
+def test_composed_non_first_slide_is_forced_visible() -> None:
+    """Decks hardcode `active` on slide one; extracted pages must still render.
+
+    Model-written decks hide inactive slides via CSS and only mark the first
+    slide `active`. Composing any other slide must normalize its visibility,
+    or the composed page renders blank inside the shell (the "each batch only
+    shows its first page" regression).
+    """
+
+    index = (
+        '<!doctype html><html><head><meta charset="utf-8"><style>'
+        '.slide{position:absolute;inset:0;opacity:0;visibility:hidden;'
+        'transform:translateY(16px);transition:opacity .5s}'
+        '.slide.active{opacity:1;visibility:visible;transform:translateY(0)}'
+        '</style></head><body><main>'
+        '<section class="slide active" data-slide-id="one" aria-hidden="false">'
+        '<h1>第一页</h1></section>'
+        '<section class="slide" data-slide-id="two" aria-hidden="true" '
+        'style="opacity:0;visibility:hidden;color:#123">'
+        '<h1>第二页</h1></section>'
+        '</main></body></html>'
+    )
+    package = HtmlPptPackage.model_validate({
+        "title": "非首页可见性验证",
+        "slide_count": 2,
+        "slides": [
+            {"slide_id": "one", "title": "第一页", "source_slide_number": 1},
+            {"slide_id": "two", "title": "第二页", "source_slide_number": 2},
+        ],
+        "files": [{"path": "index.html", "content": index}],
+    })
+    composition = compose_full_deck(FullDeckComposerInput(
+        title="非首页可见性验证",
+        sources=[ComposerSource(source_id="segment", package=package)],
+        pages=[
+            ComposerPage(
+                slide_id="slide-2",
+                title="第二页",
+                source_slide_number=2,
+                source_id="segment",
+                source_slide_id="two",
+            ),
+        ],
+    ))
+    files = {item.path: item.content_bytes() for item in composition.package.files}
+    page = files[composition.manifest.slides[0].document_path].decode("utf-8")
+
+    section = re.search(r"<section[^>]*>", page)
+    assert section is not None
+    tag = section.group(0)
+    assert 'class="slide active"' in tag
+    assert 'aria-hidden="false"' in tag
+    assert "opacity:1 !important" in tag
+    assert "visibility:visible !important" in tag
+    assert "transform:none !important" in tag
+    # Unrelated inline styles survive; the hiding declarations are gone.
+    assert "color:#123" in tag
+    assert "opacity:0" not in tag
+    assert "visibility:hidden" not in tag
+    # The deck stylesheet itself is kept for the page's own layout.
+    assert ".slide.active{opacity:1" in page
+
+    # Source identity still hashes the untransformed slide: no forced
+    # visibility leaks into the pre-transform document graph.
+    source_graph = normalized_page_content_graph(package, "two")
+    slide = composition.manifest.slides[0]
+    assert slide.source_slide_content_hash == source_graph.content_hash
+    assert slide.composed_slide_content_hash != slide.source_slide_content_hash
 
 
 def test_partial_preview_keeps_refs_recorded_before_self_contained_composition() -> None:

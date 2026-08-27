@@ -245,9 +245,13 @@ def test_projection_and_partial_preview_include_only_ready_pages_in_plan_order()
     assert [
         slide["slot_id"] for slide in preview_one.composition_manifest["slides"]
     ] == [f"slot_{number:024x}" for number in range(1, 7)]
+    # compose_partial_full_deck_preview already rejects recorded refs whose
+    # pre-transform graph no longer matches the source package. Composed pages
+    # are presentation-transformed (visibility forced, resources inlined), so
+    # the composed graph intentionally differs from the durable source ref.
     assert all(
         slide["source_slide_content_hash"]
-        == slide["composed_slide_content_hash"]
+        != slide["composed_slide_content_hash"]
         for slide in preview_one.composition_manifest["slides"]
     )
 

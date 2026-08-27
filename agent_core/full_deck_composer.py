@@ -175,6 +175,46 @@ def _slide_elements(document: Any) -> list[Any]:
 _URL_WITH_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 _CSS_URL = re.compile(r"url\(\s*(['\"]?)([^)'\"]+?)\1\s*\)")
 _DECK_CHROME_MARKERS = ("pagenow", "navbtn")
+_SLIDE_HIDING_STYLE_KEYS = ("display", "opacity", "visibility", "transform")
+
+
+def _force_slide_visible(slide: Any) -> None:
+    """Make the single kept slide render without its source deck's pager script.
+
+    Multi-slide source decks hide inactive slides (`opacity:0`,
+    `visibility:hidden`, off-canvas transforms) and promote one slide at a
+    time, usually by hardcoding `active` on the first slide only. Extraction
+    drops the other slides but keeps the selected slide's attributes, so a
+    non-first slide stays invisible forever inside the composed shell — the
+    "only each batch's first page renders" failure. Normalize the kept slide:
+    ensure the common `active` class is present, clear `hidden` /
+    `aria-hidden`, drop inline hiding declarations, and pin visibility with
+    `!important` inline styles that no leftover class toggle can undo.
+    """
+
+    classes = (slide.attrib.get("class") or "").split()
+    if "active" not in classes:
+        classes.append("active")
+        slide.attrib["class"] = " ".join(classes)
+    slide.attrib.pop("hidden", None)
+    if slide.attrib.get("aria-hidden") == "true":
+        slide.attrib["aria-hidden"] = "false"
+
+    declarations = []
+    for chunk in (slide.attrib.get("style") or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        property_name = chunk.split(":", 1)[0].strip().lower()
+        if property_name in _SLIDE_HIDING_STYLE_KEYS:
+            continue
+        declarations.append(chunk)
+    declarations.extend((
+        "opacity:1 !important",
+        "visibility:visible !important",
+        "transform:none !important",
+    ))
+    slide.attrib["style"] = "; ".join(declarations)
 
 
 def _is_deck_chrome(element: Any) -> bool:
@@ -374,6 +414,7 @@ def _single_slide_document(
         raise FullDeckComposerError("source slide elements must not be nested")
 
     if self_contained:
+        _force_slide_visible(selected)
         _strip_deck_chrome(document)
         resource_files = {
             item.path: item for item in package.files if item.path != package.entrypoint
