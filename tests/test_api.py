@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from shutil import copy2
 from threading import Event
@@ -7,6 +8,8 @@ from fastapi.testclient import TestClient
 
 import main_front
 from agent_core.jobs import JobCancelled, JobRegistry
+from api_support import full_deck_session_routes
+from api_support.full_deck_sessions import session_snapshot
 from agent_core.models import utc_now
 from configs.runtime import ManagedRuntime
 from storage.project_store import ProjectStore
@@ -634,6 +637,185 @@ def test_full_deck_generation_session_api_start_is_idempotent_and_scoped(
         f"/api/projects/session-api-start/full-deck/generation-sessions/{session_id}"
     ).json()
     assert final_session["status"] == "cancelled"
+
+
+def test_full_deck_generation_session_cancel_retry_after_worker_commits(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    registry = JobRegistry(project_root / ".jobs")
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", registry)
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    _, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-api-cancel-race",
+    )
+    release = Event()
+
+    def hold_session(self, session_id, **kwargs):
+        while not release.wait(timeout=0.01):
+            cancel_requested = kwargs.get("cancel_requested")
+            if cancel_requested is not None and cancel_requested():
+                snapshot = self.store.full_deck_generation_session(session_id)
+                self.store.update_full_deck_generation_session(
+                    session_id,
+                    snapshot["session_version"],
+                    status="cancelled",
+                    completed_batches=snapshot["completed_batches"],
+                )
+                raise JobCancelled("cancelled by API test worker")
+        return self.store.full_deck_generation_session(session_id)
+
+    monkeypatch.setattr(
+        main_front.Workflow,
+        "run_full_deck_generation_session",
+        hold_session,
+    )
+    client = TestClient(main_front.app)
+    payload = {
+        "checkpoint_id": entered["checkpoint_id"],
+        "revision_hash": entered["full_deck"]["current_revision_hash"],
+    }
+    started = client.post(
+        "/api/projects/session-api-cancel-race/full-deck/generation-sessions",
+        json=payload,
+    )
+    assert started.status_code == 202
+    session_id = started.json()["session"]["session_id"]
+    store = main_front.store_for("session-api-cancel-race")
+    stale = session_snapshot(store, session_id)
+
+    cancelled = client.post(
+        f"/api/projects/session-api-cancel-race/full-deck/generation-sessions/"
+        f"{session_id}/cancel",
+        json={"session_version": stale["session_version"]},
+    )
+    assert cancelled.status_code == 200
+    terminal = wait_for_terminal_job(
+        lambda job_id: client.get(f"/api/jobs/{job_id}").json(),
+        started.json()["job"]["job_id"],
+    )
+    assert terminal["status"] == "cancelled"
+
+    # Reproduce the CI interleaving: the entry snapshot read still returns the
+    # pre-cancel state while the job is already terminal.
+    real_snapshot = full_deck_session_routes.session_snapshot
+    reads = {"count": 0}
+
+    def stale_once(store_arg, session_id_arg):
+        reads["count"] += 1
+        if reads["count"] == 1:
+            return stale
+        return real_snapshot(store_arg, session_id_arg)
+
+    monkeypatch.setattr(
+        full_deck_session_routes, "session_snapshot", stale_once
+    )
+    repeated = client.post(
+        f"/api/projects/session-api-cancel-race/full-deck/generation-sessions/"
+        f"{session_id}/cancel",
+        json={"session_version": stale["session_version"]},
+    )
+    assert repeated.status_code == 200
+
+
+def test_full_deck_generation_session_cancel_retry_while_running(
+    tmp_path: Path,
+    monkeypatch,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    project_root = tmp_path / "projects"
+    registry = JobRegistry(project_root / ".jobs")
+    monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)
+    monkeypatch.setattr(main_front, "jobs", registry)
+    monkeypatch.setattr(main_front, "runtime", mock_runtime)
+    _, entered = _ready_full_deck(
+        tmp_path,
+        mock_runtime,
+        project_id="session-api-cancel-running",
+    )
+    release = Event()
+
+    def hold_session(self, session_id, **kwargs):
+        snapshot = self.store.full_deck_generation_session(session_id)
+        self.store.update_full_deck_generation_session(
+            session_id,
+            snapshot["session_version"],
+            status="running",
+        )
+        while not release.wait(timeout=0.01):
+            cancel_requested = kwargs.get("cancel_requested")
+            if cancel_requested is not None and cancel_requested():
+                snapshot = self.store.full_deck_generation_session(session_id)
+                self.store.update_full_deck_generation_session(
+                    session_id,
+                    snapshot["session_version"],
+                    status="cancelled",
+                    completed_batches=snapshot["completed_batches"],
+                )
+                raise JobCancelled("cancelled by API test worker")
+        return self.store.full_deck_generation_session(session_id)
+
+    monkeypatch.setattr(
+        main_front.Workflow,
+        "run_full_deck_generation_session",
+        hold_session,
+    )
+    client = TestClient(main_front.app)
+    payload = {
+        "checkpoint_id": entered["checkpoint_id"],
+        "revision_hash": entered["full_deck"]["current_revision_hash"],
+    }
+    started = client.post(
+        "/api/projects/session-api-cancel-running/full-deck/generation-sessions",
+        json=payload,
+    )
+    assert started.status_code == 202
+    session_id = started.json()["session"]["session_id"]
+    store = main_front.store_for("session-api-cancel-running")
+    for _ in range(200):
+        if session_snapshot(store, session_id)["status"] == "running":
+            break
+        time.sleep(0.01)
+    stale = session_snapshot(store, session_id)
+    assert stale["status"] == "running"
+
+    cancelled = client.post(
+        f"/api/projects/session-api-cancel-running/full-deck/generation-sessions/"
+        f"{session_id}/cancel",
+        json={"session_version": stale["session_version"]},
+    )
+    assert cancelled.status_code == 200
+    terminal = wait_for_terminal_job(
+        lambda job_id: client.get(f"/api/jobs/{job_id}").json(),
+        started.json()["job"]["job_id"],
+    )
+    assert terminal["status"] == "cancelled"
+
+    # Same interleaving as above, with the entry snapshot read still showing
+    # the running state: the endpoint must refresh instead of rejecting.
+    real_snapshot = full_deck_session_routes.session_snapshot
+    reads = {"count": 0}
+
+    def stale_once(store_arg, session_id_arg):
+        reads["count"] += 1
+        if reads["count"] == 1:
+            return stale
+        return real_snapshot(store_arg, session_id_arg)
+
+    monkeypatch.setattr(
+        full_deck_session_routes, "session_snapshot", stale_once
+    )
+    repeated = client.post(
+        f"/api/projects/session-api-cancel-running/full-deck/generation-sessions/"
+        f"{session_id}/cancel",
+        json={"session_version": stale["session_version"]},
+    )
+    assert repeated.status_code == 200
 
 
 def test_full_deck_generation_feature_rollback_preserves_session_evidence(

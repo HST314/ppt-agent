@@ -77,6 +77,22 @@ def _session_job_key_prefix(
     return f"full_deck_session:{operation}:{session_id}:{session_version}:"
 
 
+def _landed_cancellation(
+    store: ProjectStore,
+    project_id: str,
+    session_id: str,
+    session_version: int,
+) -> dict[str, Any] | None:
+    """Re-read after a raced cancel; return the session if it already landed."""
+    refreshed = session_snapshot(store, session_id)
+    if (
+        refreshed["status"] == "cancelled"
+        and refreshed["session_version"] == session_version + 1
+    ):
+        return public_session(store, project_id, refreshed)
+    return None
+
+
 def submit_full_deck_session_job(
     context: FullDeckSessionRouteContext,
     project_id: str,
@@ -390,6 +406,14 @@ def build_full_deck_session_router(
                 result["cancel_requested"] = True
                 return result
         elif snapshot["status"] in {"running", "pause_requested"}:
+            # The entry snapshot may predate the worker committing the
+            # cancellation: a terminal job implies that update already
+            # landed, so treat an idempotent retry as success.
+            landed = _landed_cancellation(
+                store, project_id, session_id, request.session_version
+            )
+            if landed is not None:
+                return landed
             raise FullDeckSessionAPIError(
                 409,
                 "full_deck_session_conflict",
@@ -402,6 +426,13 @@ def build_full_deck_session_router(
                 status="cancelled",
                 completed_batches=snapshot["completed_batches"],
             )
+        except ConflictError as exc:
+            landed = _landed_cancellation(
+                store, project_id, session_id, request.session_version
+            )
+            if landed is not None:
+                return landed
+            raise_session_api_error(exc)
         except Exception as exc:
             raise_session_api_error(exc)
         return public_session(store, project_id, updated)
