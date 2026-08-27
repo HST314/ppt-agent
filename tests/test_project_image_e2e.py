@@ -244,6 +244,10 @@ def _all_references_close(files: dict[str, bytes]) -> None:
         if not path.endswith(".html"):
             continue
         for reference in re.findall(r'src="([^"]+)"', content.decode("utf-8")):
+            # Composed pages inline package-local resources as data URIs;
+            # they are self-contained and need no file to close against.
+            if reference.startswith("data:"):
+                continue
             target = posixpath.normpath(
                 str(PurePosixPath(path).parent / PurePosixPath(unquote(reference)))
             )

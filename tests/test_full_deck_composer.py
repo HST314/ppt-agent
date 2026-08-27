@@ -279,5 +279,78 @@ def test_composed_package_uses_safe_preview_and_unzips_as_offline_deck(
         page_path = offline_root / iframe_path
         assert page_path.is_file()
         page_html = page_path.read_text(encoding="utf-8")
-        for asset_path in re.findall(r'(?:src|href)="(assets/[^"]+)"', page_html):
-            assert (page_path.parent / asset_path).is_file()
+        # Pages are self-contained: package-local resources are inlined, so the
+        # exported deck renders from file:// inside its sandboxed shell.
+        assert 'src="data:image/svg+xml;base64,' in page_html
+        assert not re.findall(r'(?:src|href)="assets/[^"]+"', page_html)
+
+
+def test_single_slide_document_strips_source_pager_and_inlines_resources() -> None:
+    index = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<link rel="stylesheet" href="assets/deck.css" media="screen"></head><body>'
+        '<main>'
+        '<section class="slide" data-slide-id="one">'
+        '<div class="chrome"><div class="left"><span>第一幕</span></div>'
+        '<div class="right"><span>01 / 02</span></div></div>'
+        '<h1>第一页</h1><img src="assets/pic.png" alt="图">'
+        '<div style="background:url(assets/pic.png)"></div>'
+        '</section>'
+        '<section class="slide" data-slide-id="two"><h1>第二页</h1></section>'
+        '</main>'
+        '<div aria-hidden="false" class="chrome"><div class="bar">'
+        '<button class="navbtn" id="prev">‹</button>'
+        '<button class="navbtn" id="next">›</button>'
+        '<div class="count"><span id="pagenow">1</span> / 2 · 原稿第 1 – 2 页</div>'
+        '</div></div>'
+        '<script src="assets/deck.js"></script>'
+        '<script>var pagenow=document.getElementById("pagenow");</script>'
+        '<script>window.pageOwnScript=true;</script>'
+        '</body></html>'
+    )
+    package = HtmlPptPackage.model_validate({
+        "title": "翻页条剥离验证",
+        "slide_count": 2,
+        "slides": [
+            {"slide_id": "one", "title": "第一页", "source_slide_number": 1},
+            {"slide_id": "two", "title": "第二页", "source_slide_number": 2},
+        ],
+        "files": [
+            {"path": "index.html", "content": index},
+            {"path": "assets/deck.css", "content": ".slide{color:#111}"},
+            {"path": "assets/deck.js", "content": "addEventListener('keydown',()=>{});"},
+            {"path": "assets/pic.png", "content": "aGVsbG8=", "encoding": "base64"},
+        ],
+    })
+    composition = compose_full_deck(FullDeckComposerInput(
+        title="翻页条剥离验证",
+        sources=[ComposerSource(source_id="segment", package=package)],
+        pages=[
+            ComposerPage(
+                slide_id="slide-1",
+                title="第一页",
+                source_slide_number=1,
+                source_id="segment",
+                source_slide_id="one",
+            ),
+        ],
+    ))
+    files = {item.path: item.content_bytes() for item in composition.package.files}
+    page_path = composition.manifest.slides[0].document_path
+    page = files[page_path].decode("utf-8")
+
+    # The source deck pager and its script are gone; page-level chrome stays.
+    assert "pagenow" not in page
+    assert "navbtn" not in page
+    assert "原稿第" not in page
+    assert "第一幕" in page
+    assert "01 / 02" in page
+    assert "window.pageOwnScript" in page
+
+    # Package-local resources are inlined; nothing package-relative remains.
+    assert 'src="data:image/png;base64,aGVsbG8="' in page
+    assert 'url("data:image/png;base64,aGVsbG8=")' in page
+    assert "url(assets/pic.png)" not in page
+    assert ".slide{color:#111}" in page
+    assert "addEventListener('keydown',()=>{});" in page
+    assert not re.findall(r'(?:src|href)="assets/[^"]+"', page)

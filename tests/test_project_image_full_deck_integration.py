@@ -1206,12 +1206,15 @@ def test_full_deck_with_images_end_to_end_corresponds_to_outline_plans(
     }
     assert img_paths == {"封面图.png", "团队照.png"}
 
-    # Every image reference in every composed HTML document closes, in both
-    # the bare and the percent-encoded form.
+    # Composed documents inline image references as data URIs (the sandboxed
+    # shell cannot load file:// subresources); any remaining package-relative
+    # reference must still close, in both the bare and percent-encoded form.
     for path, content in stored_files.items():
         if not path.endswith(".html"):
             continue
         for reference in re.findall(r'src="([^"]+)"', content.decode("utf-8")):
+            if reference.startswith("data:"):
+                continue
             target = posixpath.normpath(
                 str(PurePosixPath(path).parent / PurePosixPath(unquote(reference)))
             )

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import base64
 import html
 import json
+import posixpath
+import re
+import xml.etree.ElementTree as ET
 from copy import deepcopy
 from hashlib import sha256
 from typing import Any, Literal
+from urllib.parse import unquote
 
 import html5lib
 from pydantic import Field, model_validator
@@ -167,6 +172,176 @@ def _slide_elements(document: Any) -> list[Any]:
     ]
 
 
+_URL_WITH_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+_CSS_URL = re.compile(r"url\(\s*(['\"]?)([^)'\"]+?)\1\s*\)")
+_DECK_CHROME_MARKERS = ("pagenow", "navbtn")
+
+
+def _is_deck_chrome(element: Any) -> bool:
+    """The source deck's own pager, not the per-slide header that shares its class."""
+
+    for node in element.iter():
+        if node.attrib.get("id") in _DECK_CHROME_MARKERS:
+            return True
+        classes = set((node.attrib.get("class") or "").split())
+        if classes.intersection(_DECK_CHROME_MARKERS):
+            return True
+    return False
+
+
+def _strip_deck_chrome(document: Any) -> None:
+    """Remove the source deck's pager bar and its navigation script.
+
+    A composed page lives inside the full-deck shell, which provides its own
+    navigation. The source deck's pager (`1 / N · 原稿第 x – y 页`) and its
+    key/touch handlers are dead weight there, so they are stripped from every
+    single-slide document. Page headers that reuse the `chrome` class but
+    contain no pager markers are kept.
+    """
+
+    parent_by_child = {child: parent for parent in document.iter() for child in parent}
+    removals = []
+    for element in document.iter():
+        if element.tag == "script":
+            text = "".join(element.itertext())
+            if any(marker in text for marker in _DECK_CHROME_MARKERS):
+                removals.append(element)
+            continue
+        classes = set((element.attrib.get("class") or "").split())
+        if "chrome" in classes and _is_deck_chrome(element):
+            removals.append(element)
+    for element in removals:
+        parent = parent_by_child.get(element)
+        if parent is not None:
+            parent.remove(element)
+
+
+def _inline_local_resources(
+    document: Any,
+    files: dict[str, PackageFile],
+    base_dir: str,
+) -> None:
+    """Inline package-local references so the page is a self-contained file.
+
+    Composed pages render inside sandboxed iframes (`sandbox="allow-scripts"`).
+    Opened from `file://`, a sandboxed document has an opaque origin and the
+    browser refuses to load its `file://` subresources, so `<img src="img/...">`
+    breaks in the exported deck even though the same page works when opened
+    directly. Rewriting every package-local reference (binary resources as
+    `data:` URIs, scripts and stylesheets as inline blocks) removes the
+    dependency on subresource loads under any protocol or sandbox policy.
+    """
+
+    def resolve(ref: str) -> PackageFile | None:
+        target = ref.strip()
+        if (
+            not target
+            or target.startswith(("/", "#", "//"))
+            or _URL_WITH_SCHEME.match(target)
+            or "?" in target
+            or "#" in target
+        ):
+            return None
+        # References may be raw UTF-8 or percent-encoded; try both forms.
+        for candidate in (target, unquote(target)):
+            path = posixpath.normpath(posixpath.join(base_dir, candidate))
+            if path.startswith("../"):
+                continue
+            item = files.get(path)
+            if item is not None:
+                return item
+        return None
+
+    def data_uri(ref: str) -> str | None:
+        item = resolve(ref)
+        if item is None:
+            return None
+        encoded = base64.b64encode(item.content_bytes()).decode("ascii")
+        return f"data:{item.media_type};base64,{encoded}"
+
+    def inline_text(ref: str) -> str | None:
+        item = resolve(ref)
+        if item is None:
+            return None
+        try:
+            return item.content_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def rewrite_srcset(value: str) -> str:
+        candidates = []
+        changed = False
+        for candidate in value.split(","):
+            parts = candidate.strip().split(None, 1)
+            if not parts:
+                continue
+            url = parts[0]
+            descriptor = f" {parts[1]}" if len(parts) == 2 else ""
+            inlined = data_uri(url)
+            if inlined is not None:
+                changed = True
+            candidates.append(f"{inlined or url}{descriptor}")
+        return ", ".join(candidates) if changed else value
+
+    def rewrite_css(text: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            url = match.group(2)
+            inlined = data_uri(url)
+            if inlined is None:
+                return match.group(0)
+            return f'url("{inlined}")'
+
+        return _CSS_URL.sub(replace, text)
+
+    parent_by_child = {child: parent for parent in document.iter() for child in parent}
+    stylesheet_links: list[tuple[Any, str]] = []
+    for element in document.iter():
+        if element.tag in ("img", "source", "video", "audio", "track"):
+            src = element.attrib.get("src")
+            if src is not None:
+                inlined = data_uri(src)
+                if inlined is not None:
+                    element.attrib["src"] = inlined
+            srcset = element.attrib.get("srcset")
+            if srcset is not None:
+                element.attrib["srcset"] = rewrite_srcset(srcset)
+            poster = element.attrib.get("poster")
+            if poster is not None:
+                inlined = data_uri(poster)
+                if inlined is not None:
+                    element.attrib["poster"] = inlined
+        elif element.tag == "script":
+            src = element.attrib.get("src")
+            if src is not None:
+                text = inline_text(src)
+                if text is not None:
+                    element.text = text
+                    del element.attrib["src"]
+        elif element.tag == "link":
+            rel = set((element.attrib.get("rel") or "").split())
+            href = element.attrib.get("href")
+            if "stylesheet" in rel and href is not None:
+                text = inline_text(href)
+                if text is not None:
+                    stylesheet_links.append((element, text))
+        if element.tag == "style" and element.text:
+            element.text = rewrite_css(element.text)
+        style_attr = element.attrib.get("style")
+        if style_attr and "url(" in style_attr:
+            element.attrib["style"] = rewrite_css(style_attr)
+    for element, text in stylesheet_links:
+        parent = parent_by_child.get(element)
+        if parent is None:
+            continue
+        style = ET.Element("style")
+        if element.attrib.get("media"):
+            style.attrib["media"] = element.attrib["media"]
+        style.text = text
+        index = list(parent).index(element)
+        parent.remove(element)
+        parent.insert(index, style)
+
+
 def _single_slide_document(package: HtmlPptPackage, slide_id: str) -> str:
     files = _file_bytes(package)
     try:
@@ -192,6 +367,16 @@ def _single_slide_document(package: HtmlPptPackage, slide_id: str) -> str:
         parent.remove(element)
     if _slide_elements(document) != [selected]:
         raise FullDeckComposerError("source slide elements must not be nested")
+
+    _strip_deck_chrome(document)
+    resource_files = {
+        item.path: item for item in package.files if item.path != package.entrypoint
+    }
+    _inline_local_resources(
+        document,
+        resource_files,
+        posixpath.dirname(package.entrypoint),
+    )
 
     serialized = html5lib.serialize(
         document,
