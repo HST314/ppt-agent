@@ -37,6 +37,7 @@ from agent_core.workflow import Workflow, capabilities
 from agent_core.workflow_support import stable_hash
 from configs.runtime import ManagedRuntime, RuntimeConfigUpdate
 from runtime.read_tool import SkillReader
+from storage.persistence import os_level_path, read_bytes
 from storage.project_images import SyncReport, sync_project_images
 from storage.project_store import ConflictError, ProjectStore, list_projects
 
@@ -844,7 +845,7 @@ PACKAGE_CSP = (
 
 def package_file_response(path: Path, media_type: str) -> FileResponse:
     return FileResponse(
-        path,
+        os_level_path(path),
         media_type=media_type,
         headers={
             "Content-Security-Policy": PACKAGE_CSP,
@@ -865,7 +866,7 @@ def package_export_response(
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for logical_path, path in files:
-            archive.writestr(logical_path, path.read_bytes())
+            archive.writestr(logical_path, read_bytes(path))
     return Response(
         output.getvalue(),
         media_type="application/zip",

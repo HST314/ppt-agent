@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from runtime.package_tool import normalize_package_path
-from storage.persistence import atomic_bytes
+from storage.persistence import atomic_bytes, path_is_file, read_bytes
 
 
 REVISION_HASH = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -41,7 +41,7 @@ def write_artifacts_readme(artifacts_root: Path) -> None:
         "for diagnostics and may omit sample pages before composition.\n"
     ).encode("utf-8")
     path = artifacts_root / "README.md"
-    if path.is_file() and path.read_bytes() == content:
+    if path_is_file(path) and read_bytes(path) == content:
         return
     atomic_bytes(path, content)
 
@@ -86,14 +86,14 @@ def _package_reference_content(
         (
             root / filename
             for root in package_artifact_roots
-            if (root / filename).is_file()
+            if path_is_file(root / filename)
             and (root / filename).resolve().is_relative_to(root.resolve())
         ),
         None,
     )
     if artifact_path is None:
         raise RetainedProjectError("package_artifact_missing")
-    content = artifact_path.read_bytes()
+    content = read_bytes(artifact_path)
     if (
         "sha256:" + hashlib.sha256(content).hexdigest() != item.get("sha256")
         or len(content) != item.get("size")

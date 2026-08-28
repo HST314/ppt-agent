@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
-
 if os.name == "nt":
     import errno
     import msvcrt
@@ -76,7 +75,7 @@ def _windows_extended_length_text(text: str) -> str:
     return "\\\\?\\" + text
 
 
-def _os_level_path(path: Path) -> str:
+def os_level_path(path: Path) -> str:
     """Return an OS-level path string, extended-length safe on Windows."""
 
     text = os.fspath(path)
@@ -85,8 +84,21 @@ def _os_level_path(path: Path) -> str:
     return text
 
 
+def path_is_file(path: Path) -> bool:
+    """Return whether *path* is a regular file, including long Windows paths."""
+
+    return os.path.isfile(os_level_path(path))
+
+
+def read_bytes(path: Path) -> bytes:
+    """Read *path* without reintroducing the classic Windows MAX_PATH limit."""
+
+    with open(os_level_path(path), "rb") as stream:
+        return stream.read()
+
+
 def atomic_bytes(path: Path, content: bytes) -> None:
-    target = _os_level_path(path)
+    target = os_level_path(path)
     parent = os.path.dirname(target) or "."
     os.makedirs(parent, exist_ok=True)
     fd, temporary = tempfile.mkstemp(

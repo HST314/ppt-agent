@@ -25,7 +25,13 @@ from runtime.package_tool import (
 )
 from storage.errors import ConflictError
 from storage.full_deck_generation_store import FullDeckGenerationStoreMixin
-from storage.persistence import atomic_bytes, exclusive_file_lock, json_text
+from storage.persistence import (
+    atomic_bytes,
+    exclusive_file_lock,
+    json_text,
+    path_is_file,
+    read_bytes,
+)
 from storage.prompt_audit import PromptAuditMixin
 from storage.retained_project import (
     RetainedProjectError,
@@ -271,12 +277,12 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
         legacy_path = self.root / legacy_relative_path
         relative_path = (
             legacy_relative_path
-            if legacy_path.is_file()
+            if path_is_file(legacy_path)
             else f"artifacts/_objects/html/{hexadecimal}.html"
         )
         path = self.root / relative_path
-        if path.is_file():
-            existing = path.read_bytes()
+        if path_is_file(path):
+            existing = read_bytes(path)
             if hashlib.sha256(existing).hexdigest() != hexadecimal:
                 raise ConflictError("artifact_corrupt")
         else:
@@ -313,14 +319,14 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
         )
         relative_path = (
             legacy_relative_path
-            if (self.root / legacy_relative_path).is_file()
+            if path_is_file(self.root / legacy_relative_path)
             else preferred_relative_path
         )
         artifact_path = (self.root / relative_path).resolve()
         if not self._is_package_artifact_path(artifact_path):
             raise ValueError("invalid package artifact path")
-        if artifact_path.is_file():
-            if artifact_path.read_bytes() != content:
+        if path_is_file(artifact_path):
+            if read_bytes(artifact_path) != content:
                 raise ConflictError("artifact_corrupt")
         else:
             atomic_bytes(artifact_path, content)
@@ -441,11 +447,13 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
             return []
         result: list[dict[str, Any]] = []
         total = 0
-        for candidate in sorted(path for path in package_root.rglob("*") if path.is_file()):
+        for candidate in sorted(
+            path for path in package_root.rglob("*") if path_is_file(path)
+        ):
             resolved = candidate.resolve()
             if not resolved.is_relative_to(package_root):
                 continue
-            content = resolved.read_bytes()
+            content = read_bytes(resolved)
             total += len(content)
             if (
                 not content
@@ -792,9 +800,12 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
                     if row is None:
                         raise ConflictError("package_artifact_missing")
                     path = (self.root / row["relative_path"]).resolve()
-                    if not self._is_package_artifact_path(path) or not path.is_file():
+                    if (
+                        not self._is_package_artifact_path(path)
+                        or not path_is_file(path)
+                    ):
                         raise ConflictError("package_artifact_missing")
-                    content = path.read_bytes()
+                    content = read_bytes(path)
                     checksum = "sha256:" + hashlib.sha256(content).hexdigest()
                     if checksum != row["sha256"] or len(content) != row["size_bytes"]:
                         raise ConflictError("artifact_corrupt")
@@ -821,9 +832,12 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
                 if row is None:
                     raise ConflictError("sample_artifact_missing")
                 path = (self.root / row["relative_path"]).resolve()
-                if not self._is_sample_artifact_path(path) or not path.is_file():
+                if (
+                    not self._is_sample_artifact_path(path)
+                    or not path_is_file(path)
+                ):
                     raise ConflictError("sample_artifact_missing")
-                content = path.read_bytes()
+                content = read_bytes(path)
                 checksum = f"sha256:{hashlib.sha256(content).hexdigest()}"
                 if checksum != row["sha256"] or len(content) != row["size_bytes"]:
                     raise ConflictError("artifact_corrupt")
@@ -1857,9 +1871,12 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
             if row is None:
                 raise FileNotFoundError(path)
         artifact_path = (self.root / row["relative_path"]).resolve()
-        if not self._is_package_artifact_path(artifact_path) or not artifact_path.is_file():
+        if (
+            not self._is_package_artifact_path(artifact_path)
+            or not path_is_file(artifact_path)
+        ):
             raise ConflictError("package_artifact_missing")
-        content = artifact_path.read_bytes()
+        content = read_bytes(artifact_path)
         if (
             "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
             or len(content) != row["size_bytes"]
@@ -2076,10 +2093,10 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
         artifact_path = (self.root / row["relative_path"]).resolve()
         if (
             not self._is_package_artifact_path(artifact_path)
-            or not artifact_path.is_file()
+            or not path_is_file(artifact_path)
         ):
             raise ConflictError("package_artifact_missing")
-        content = artifact_path.read_bytes()
+        content = read_bytes(artifact_path)
         if (
             "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
             or len(content) != row["size_bytes"]
@@ -2139,10 +2156,10 @@ class ProjectStore(FullDeckGenerationStoreMixin, PromptAuditMixin):
             path = (self.root / row["relative_path"]).resolve()
             if (
                 not self._is_package_artifact_path(path)
-                or not path.is_file()
+                or not path_is_file(path)
             ):
                 raise ConflictError("package_artifact_missing")
-            content = path.read_bytes()
+            content = read_bytes(path)
             if (
                 "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
                 or len(content) != row["size_bytes"]

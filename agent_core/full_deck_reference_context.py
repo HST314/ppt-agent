@@ -9,6 +9,7 @@ from runtime.package_reference_tool import (
     PackageReferenceSource,
     PackageReferenceTool,
 )
+from storage.persistence import read_bytes
 from storage.project_store import ProjectStore
 
 
@@ -32,7 +33,7 @@ def _sample_source(
         artifact_path, _media_type = store.sample_package_file(
             revision_hash, logical_path
         )
-        return artifact_path.read_bytes()
+        return read_bytes(artifact_path)
 
     return PackageReferenceSource(
         source_id="approved_sample",
@@ -83,7 +84,7 @@ def stored_generation_package_reference_source(
         artifact_path, _media_type = store.full_deck_generation_package_file(
             package_id, logical_path
         )
-        return artifact_path.read_bytes()
+        return read_bytes(artifact_path)
 
     return PackageReferenceSource(
         source_id=f"segment_batch_{int(package['batch_index'])}",

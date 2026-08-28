@@ -224,6 +224,51 @@ def test_project_store_persists_and_hydrates_complete_html_ppt_package(
     )
 
 
+def test_project_store_hydrates_package_from_long_absolute_path(
+    tmp_path: Path,
+    mock_runtime: ManagedRuntime,
+) -> None:
+    root = tmp_path
+    while len(os.fspath(root / "project" / "project.sqlite3")) <= 180:
+        root /= "nested-segment"
+    store = ProjectStore(root, "project")
+    manifest = store.create(
+        TaskCard(title="长路径包", objective="验证 Windows 产物回读").model_dump(),
+        mock_runtime.snapshot(),
+    )
+    package = HtmlPptPackage.model_validate({
+        "entrypoint": "index.html",
+        "title": "长路径样品",
+        "slide_count": 1,
+        "slides": [{"slide_id": "cover", "title": "封面"}],
+        "files": [{"path": "index.html", "content": "<main>ok</main>"}],
+    })
+    sample = SampleRevision.create_package(
+        package,
+        revision=1,
+        parent=None,
+        feedback=None,
+    )
+
+    stored = store.update(
+        lambda value: value | {
+            "samples": [sample.model_dump()],
+            "current_sample_revision_hash": sample.revision_hash,
+        },
+        "sample_generated",
+        {"revision_hash": sample.revision_hash},
+        expected_checkpoint_id=manifest["checkpoint_id"],
+    )
+
+    artifact_id = stored["samples"][0]["package"]["files"][0]["artifact_id"]
+    artifact_path, _ = store.sample_package_file(sample.revision_hash, "index.html")
+    assert len(os.fspath(artifact_path)) > 260
+    assert artifact_id.startswith("sha256:")
+    assert store.read()["samples"][0]["package"]["files"][0]["content"] == (
+        "<main>ok</main>"
+    )
+
+
 def test_legacy_file_project_is_imported_without_removing_source_files(
     tmp_path: Path,
     mock_runtime: ManagedRuntime,

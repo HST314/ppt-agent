@@ -11,10 +11,12 @@ from agent_core.models import (
     FullDeckGenerationSession,
 )
 from storage.persistence import (
-    _os_level_path,
     _windows_extended_length_text,
     atomic_bytes,
     exclusive_file_lock,
+    os_level_path,
+    path_is_file,
+    read_bytes,
 )
 from storage.retained_project import (
     STAGING_NAME_MAX_LENGTH,
@@ -37,9 +39,9 @@ def test_windows_extended_length_text_prefixes_drive_unc_and_passthrough() -> No
 def test_os_level_path_is_identity_off_windows(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "file.html"
     if os.name == "nt":
-        assert _os_level_path(path).startswith("\\\\?\\")
+        assert os_level_path(path).startswith("\\\\?\\")
     else:
-        assert _os_level_path(path) == str(path)
+        assert os_level_path(path) == str(path)
 
 
 def test_atomic_bytes_writes_target_and_cleans_temporary_files(
@@ -51,6 +53,18 @@ def test_atomic_bytes_writes_target_and_cleans_temporary_files(
     atomic_bytes(target, b"<html>replaced</html>")
     assert target.read_bytes() == b"<html>replaced</html>"
     assert [entry.name for entry in target.parent.iterdir()] == ["page.html"]
+
+
+def test_long_path_safe_read_round_trip(tmp_path: Path) -> None:
+    target = tmp_path
+    while len(os.fspath(target / "page.html")) <= 280:
+        target /= "nested-segment"
+    target /= "page.html"
+
+    atomic_bytes(target, b"<html>long path</html>")
+
+    assert path_is_file(target)
+    assert read_bytes(target) == b"<html>long path</html>"
 
 
 def test_staging_dir_name_stays_short_unique_and_hidden() -> None:

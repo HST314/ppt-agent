@@ -15,7 +15,7 @@ from agent_core.models import (
 )
 from runtime.package_tool import normalize_package_path
 from storage.errors import ConflictError
-from storage.persistence import json_text
+from storage.persistence import json_text, path_is_file, read_bytes
 
 
 class FullDeckGenerationPackageStoreMixin:
@@ -383,10 +383,10 @@ class FullDeckGenerationPackageStoreMixin:
         artifact_path = (self.root / row["relative_path"]).resolve()
         if (
             not self._is_package_artifact_path(artifact_path)
-            or not artifact_path.is_file()
+            or not path_is_file(artifact_path)
         ):
             raise ConflictError("package_artifact_missing")
-        content = artifact_path.read_bytes()
+        content = read_bytes(artifact_path)
         if (
             "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
             or len(content) != row["size_bytes"]
@@ -424,10 +424,10 @@ class FullDeckGenerationPackageStoreMixin:
             artifact_path = (self.root / row["relative_path"]).resolve()
             if (
                 not self._is_package_artifact_path(artifact_path)
-                or not artifact_path.is_file()
+                or not path_is_file(artifact_path)
             ):
                 raise ConflictError("package_artifact_missing")
-            content = artifact_path.read_bytes()
+            content = read_bytes(artifact_path)
             if (
                 "sha256:" + hashlib.sha256(content).hexdigest() != row["sha256"]
                 or len(content) != row["size_bytes"]
