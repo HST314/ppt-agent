@@ -29,12 +29,13 @@
         <button class="btn btn--secondary" id="refresh-button" type="button" aria-label="刷新">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.5 9A7 7 0 0 0 6 6.5L4 11m16 2-2 4.5A7 7 0 0 1 5.5 15"/></svg><span>刷新</span>
         </button>
-        <button class="btn btn--primary" id="new-button" type="button" aria-label="新建工程">
+        <!-- standalone-create-action-start --><button class="btn btn--primary" id="new-button" type="button" aria-label="新建工程">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>新建工程</span>
-        </button>
+        </button><!-- standalone-create-action-end -->
       </div>
     </header>
     <div class="app-body">
+      <!-- standalone-create-sidebar-start -->
       <aside class="sidebar" id="sidebar" aria-label="工程导航">
         <button class="sidebar__toggle" id="sidebar-toggle" type="button" aria-expanded="false" aria-label="展开或收起工程目录">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
@@ -43,13 +44,14 @@
         <nav class="project-list" id="project-list" aria-label="工程列表"><div class="sidebar__empty">正在读取工程…</div></nav>
         <div class="sidebar__footer"><div class="system-state"><span class="dot" id="health-dot"></span><span id="health-text">正在连接服务</span></div></div>
       </aside>
+      <!-- standalone-create-sidebar-end -->
       <main class="main" id="main" tabindex="-1"><div class="content" id="content" aria-live="polite"></div></main>
     </div>
   </div>
   <div class="sr-only" id="workspace-status" role="status" aria-live="polite" aria-atomic="true"></div>
   <div class="toast-region" id="toasts" aria-live="polite" aria-atomic="true"></div>
 
-  <dialog class="dialog" id="project-dialog" aria-labelledby="dialog-title">
+  <!-- standalone-create-dialog-start --><dialog class="dialog" id="project-dialog" aria-labelledby="dialog-title">
     <form id="project-form">
       <div class="dialog__head">
         <div><p class="eyebrow">新任务</p><h2 id="dialog-title">创建 PPT 工程</h2></div>
@@ -71,7 +73,7 @@
       </div>
       <div class="dialog__foot"><button class="btn btn--secondary" type="button" data-close>取消</button><button class="btn btn--primary" id="create-button" type="submit">创建工程</button></div>
     </form>
-  </dialog>
+  </dialog><!-- standalone-create-dialog-end -->
 
   <dialog class="editor-dialog" id="editor-dialog" aria-labelledby="editor-title">
     <div class="editor-dialog__head">

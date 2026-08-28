@@ -12,7 +12,13 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -39,6 +45,10 @@ APP_ROOT = Path(__file__).resolve().parent
 FRONTEND_ROOT = APP_ROOT / "frontend"
 PROJECTS_ROOT = Path(os.getenv("PPT_AGENT_PROJECTS_ROOT", FRONTEND_ROOT / "data" / "projects")).resolve()
 IMAGES_ROOT = Path(os.getenv("PPT_AGENT_IMAGES_ROOT", FRONTEND_ROOT / "data" / "images")).resolve()
+MANAGED_PROJECT_ID = os.getenv("PPT_AGENT_MANAGED_PROJECT_ID") or None
+HARNESS_TASK_ID = os.getenv("HARNESS_TASK_ID") or None
+HARNESS_INSTANCE_ID = os.getenv("HARNESS_INSTANCE_ID") or None
+MANAGED_MODE = MANAGED_PROJECT_ID is not None
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 MAX_REQUEST_BYTES = 512 * 1024
 
@@ -439,7 +449,15 @@ def runtime_context() -> dict[str, Any]:
     with runtime_config_lock:
         current = runtime
         reader = SkillReader(current.skills_root, per_call=1000, per_job=1000)
-        return {**current.public_context(), "skills": reader.index()}
+        return {
+            **current.public_context(),
+            "skills": reader.index(),
+            "managed_by_harness": MANAGED_MODE,
+            "navigation_mode": "harness" if MANAGED_MODE else "standalone",
+            "project_id": MANAGED_PROJECT_ID,
+            "task_id": HARNESS_TASK_ID,
+            "instance_id": HARNESS_INSTANCE_ID,
+        }
 
 
 @app.put("/api/runtime-context")
@@ -1251,5 +1269,17 @@ app.mount("/static", StaticFiles(directory=FRONTEND_ROOT / "static"), name="stat
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(FRONTEND_ROOT / "index.html")
+def index() -> Response:
+    if not MANAGED_MODE:
+        return FileResponse(FRONTEND_ROOT / "index.html")
+    html = (FRONTEND_ROOT / "index.html").read_text(encoding="utf-8")
+    for name in ("action", "dialog", "sidebar"):
+        start = f"<!-- standalone-create-{name}-start -->"
+        end = f"<!-- standalone-create-{name}-end -->"
+        before, marker, remainder = html.partition(start)
+        if not marker:
+            continue
+        _, closing, after = remainder.partition(end)
+        if closing:
+            html = before + after
+    return HTMLResponse(html)

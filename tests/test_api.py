@@ -108,6 +108,29 @@ def test_api_rejects_unknown_request_fields(tmp_path: Path, monkeypatch) -> None
     assert response.status_code == 422
 
 
+def test_managed_frontend_opens_the_harness_project_without_duplicate_navigation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(main_front, "MANAGED_MODE", True)
+    monkeypatch.setattr(main_front, "MANAGED_PROJECT_ID", "managed-ppt")
+    monkeypatch.setattr(main_front, "HARNESS_TASK_ID", "task-managed-ppt")
+    monkeypatch.setattr(main_front, "HARNESS_INSTANCE_ID", "managed-ppt")
+    client = TestClient(main_front.app)
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert 'id="new-button"' not in page.text
+    assert 'id="project-form"' not in page.text
+    assert 'id="sidebar"' not in page.text
+
+    context = client.get("/api/runtime-context").json()
+    assert context["managed_by_harness"] is True
+    assert context["navigation_mode"] == "harness"
+    assert context["project_id"] == "managed-ppt"
+    assert context["task_id"] == "task-managed-ppt"
+    assert context["instance_id"] == "managed-ppt"
+
+
 def test_api_requires_feedback_only_for_sample_revision(tmp_path: Path, monkeypatch) -> None:
     project_root = tmp_path / "projects"
     monkeypatch.setattr(main_front, "PROJECTS_ROOT", project_root)

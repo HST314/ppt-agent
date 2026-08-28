@@ -76,6 +76,7 @@ const state = {
   view: "workspace", busy: false, focusStage: null,
   fullDeckSession: null,
   statusFilter: "all", statusQuery: "", statusOrder: "newest", expandedEventId: null,
+  managedByHarness: false, managedProjectId: null,
 };
 
 const content = document.querySelector("#content");
@@ -217,6 +218,7 @@ function markActiveTab() {
 }
 
 function applySidebar(hover = false) {
+  if (!document.querySelector("#sidebar")) return;
   const expanded = sidebarPinned || hover;
   document.querySelector("#app").classList.toggle("sidebar-expanded", expanded);
   document.querySelector("#sidebar-toggle").setAttribute("aria-expanded", String(expanded));
@@ -587,6 +589,7 @@ async function render({ showLoading = true, preserveStatusViewport = false, skip
 }
 
 function renderProjectList() {
+  if (!projectList) return;
   if (!state.projects.length) {
     projectList.innerHTML = '<div class="sidebar__empty">还没有工程。创建第一个 PPT 任务开始工作。</div>';
     return;
@@ -597,13 +600,19 @@ function renderProjectList() {
 
 async function loadProjects() {
   try {
+    if (state.managedByHarness) {
+      const health = await api.health();
+      return health;
+    }
     const [health, projects] = await Promise.all([api.health(), api.projects()]);
     state.projects = projects;
     document.querySelector("#health-text").textContent = health.status === "ok" ? "服务已就绪" : "服务部分降级";
     document.querySelector("#health-dot").style.background = health.status === "ok" ? "var(--success)" : "var(--warning)";
   } catch (error) {
-    document.querySelector("#health-text").textContent = "服务未连接";
-    document.querySelector("#health-dot").style.background = "var(--danger)";
+    const healthText = document.querySelector("#health-text");
+    const healthDot = document.querySelector("#health-dot");
+    if (healthText) healthText.textContent = "服务未连接";
+    if (healthDot) healthDot.style.background = "var(--danger)";
     toast(error.message, true);
   }
   renderProjectList();
@@ -1282,24 +1291,24 @@ async function setView(view) {
 function bindChrome() {
   window.addEventListener("message", (event) => fullDeckWorkspace.handleMessage(event));
   document.addEventListener("visibilitychange", () => fullDeckWorkspace.visibilityChanged());
-  document.querySelector("#new-button").addEventListener("click", showProjectDialog);
+  document.querySelector("#new-button")?.addEventListener("click", showProjectDialog);
   document.querySelector("#refresh-button").addEventListener("click", async () => {
     if (state.view === "settings") { state.runtime = null; await render(); return; }
     await refreshCurrent();
   });
   document.querySelector("#topnav-branch").addEventListener("click", openBranchDialog);
   document.querySelectorAll(".topnav__tab").forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
-  document.querySelector("#project-form").addEventListener("submit", createProject);
-  document.querySelectorAll("#project-dialog [data-close]").forEach((button) => button.addEventListener("click", () => projectDialog.close()));
-  projectDialog.addEventListener("cancel", (event) => { event.preventDefault(); projectDialog.close(); });
+  document.querySelector("#project-form")?.addEventListener("submit", createProject);
+  document.querySelectorAll("#project-dialog [data-close]").forEach((button) => button.addEventListener("click", () => projectDialog?.close()));
+  projectDialog?.addEventListener("cancel", (event) => { event.preventDefault(); projectDialog.close(); });
   document.querySelector("#editor-close").addEventListener("click", closeEditor);
   document.querySelector("#editor-cancel").addEventListener("click", closeEditor);
   document.querySelector("#editor-save").addEventListener("click", saveEditor);
   editor.addEventListener("input", () => { if (editorContext) { storageSet(editorContext.key, editor.value); document.querySelector("#draft-state").textContent = "草稿已保存"; } });
   const sidebar = document.querySelector("#sidebar");
-  sidebar.addEventListener("mouseenter", () => applySidebar(true));
-  sidebar.addEventListener("mouseleave", () => applySidebar(false));
-  document.querySelector("#sidebar-toggle").addEventListener("click", () => { sidebarPinned = !sidebarPinned; applySidebar(false); });
+  sidebar?.addEventListener("mouseenter", () => applySidebar(true));
+  sidebar?.addEventListener("mouseleave", () => applySidebar(false));
+  document.querySelector("#sidebar-toggle")?.addEventListener("click", () => { sidebarPinned = !sidebarPinned; applySidebar(false); });
 }
 
 async function boot() {
@@ -1318,9 +1327,22 @@ async function boot() {
     announce: announceWorkspace,
     escapeHtml,
   });
+  try {
+    const context = await api.runtime();
+    state.runtime = context;
+    state.managedByHarness = context.managed_by_harness === true;
+    state.managedProjectId = context.project_id || null;
+    if (state.managedByHarness) document.querySelector("#app").classList.add("app--managed");
+  } catch (error) {
+    toast(error.message, true);
+  }
   bindChrome();
   await loadProjects();
-  await render();
+  if (state.managedByHarness && state.managedProjectId) {
+    await openProject(state.managedProjectId);
+  } else {
+    await render();
+  }
 }
 
 void boot();
