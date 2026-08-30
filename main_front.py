@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -49,6 +50,7 @@ IMAGES_ROOT = Path(os.getenv("PPT_AGENT_IMAGES_ROOT", FRONTEND_ROOT / "data" / "
 MANAGED_PROJECT_ID = os.getenv("PPT_AGENT_MANAGED_PROJECT_ID") or None
 HARNESS_TASK_ID = os.getenv("HARNESS_TASK_ID") or None
 HARNESS_INSTANCE_ID = os.getenv("HARNESS_INSTANCE_ID") or None
+WORK_ADMISSION_FILE = os.getenv("HARNESS_WORK_ADMISSION_FILE") or None
 MANAGED_MODE = MANAGED_PROJECT_ID is not None
 PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$")
 MAX_REQUEST_BYTES = 512 * 1024
@@ -57,6 +59,18 @@ app = FastAPI(title="PPT Agent Studio", version="0.3.0")
 runtime = ManagedRuntime(APP_ROOT)
 runtime_config_lock = threading.RLock()
 jobs = JobRegistry(PROJECTS_ROOT / ".jobs")
+
+
+def _work_admission_quiesced() -> bool:
+    if not MANAGED_MODE:
+        return False
+    if not WORK_ADMISSION_FILE:
+        return True
+    try:
+        value = json.loads(Path(WORK_ADMISSION_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not isinstance(value, dict) or value.get("quiesced") is not False
 
 
 class StrictRequest(BaseModel):
@@ -178,6 +192,21 @@ class FullDeckRevisionBranchRequest(FullDeckRevisionRequest):
 
 @app.middleware("http")
 async def request_size_limit(request: Request, call_next):
+    if (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and _work_admission_quiesced()
+        and not request.url.path.endswith("/cancel")
+    ):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "agent_quiesced",
+                    "message": "当前 Agent 正在安全归档 暂不接收新任务",
+                    "retryable": True,
+                }
+            },
+        )
     length = request.headers.get("content-length")
     if length:
         try:
@@ -194,6 +223,11 @@ async def request_size_limit(request: Request, call_next):
         chunks.append(chunk)
     request._body = b"".join(chunks)
     return await call_next(request)
+
+
+@app.get("/api/managed/work-admission")
+async def managed_work_admission() -> dict[str, bool]:
+    return {"quiesced": _work_admission_quiesced()}
 
 
 @app.exception_handler(ConflictError)
